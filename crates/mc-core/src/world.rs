@@ -26,6 +26,31 @@ pub struct Dimension {
     pub region_dir: PathBuf,
 }
 
+impl Dimension {
+    /// All region files of this dimension, parsed as
+    /// `(x, z, path)` and sorted by coordinates.
+    pub fn region_files(&self) -> Result<Vec<(i32, i32, PathBuf)>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&self.region_dir).map_err(|source| Error::Io {
+            path: self.region_dir.clone().into(),
+            source,
+        })? {
+            let entry = entry.map_err(|source| Error::Io {
+                path: self.region_dir.clone().into(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("mca") {
+                if let Some((x, z)) = parse_region_name(&path) {
+                    out.push((x, z, path));
+                }
+            }
+        }
+        out.sort_by_key(|(x, z, _)| (*x, *z));
+        Ok(out)
+    }
+}
+
 /// Opened world: the save folder plus the dimensions that were found.
 #[derive(Debug, Clone)]
 pub struct World {
@@ -133,26 +158,7 @@ impl World {
     /// All region files of a dimension, parsed as
     /// `(x, z, path)` and sorted by coordinates.
     pub fn region_files(&self, dimension: &Dimension) -> Result<Vec<(i32, i32, PathBuf)>> {
-        let mut out = Vec::new();
-        for entry in std::fs::read_dir(&dimension.region_dir).map_err(|source| {
-            Error::Io {
-                path: dimension.region_dir.clone().into(),
-                source,
-            }
-        })? {
-            let entry = entry.map_err(|source| Error::Io {
-                path: dimension.region_dir.clone().into(),
-                source,
-            })?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("mca") {
-                if let Some((x, z)) = parse_region_name(&path) {
-                    out.push((x, z, path));
-                }
-            }
-        }
-        out.sort_by_key(|(x, z, _)| (*x, *z));
-        Ok(out)
+        dimension.region_files()
     }
 
     /// Scan every region file of a dimension in parallel, mapping `f` over

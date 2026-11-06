@@ -1,0 +1,17 @@
+[package]
+name = "mca-selector"
+description = "Minecraft region/chunk map editor UI (mca-selector-rs)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mc-core = { path = "../mc-core" }
+gpui = "0.2.2"
+anyhow.workspace = true
+rayon.workspace = true
+image = "0.25"
+
+[[bin]]
+name = "mca-selector"
+path = "src/main.rs"
