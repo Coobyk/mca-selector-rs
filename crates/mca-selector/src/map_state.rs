@@ -167,6 +167,11 @@ pub struct MapState {
     /// Per-chunk tiles for the zoomed-in view, capped to bound memory.
     pub tiles: HashMap<ChunkCoord, Arc<TileEntry>>,
     pub pending: std::collections::HashSet<ChunkCoord>,
+    /// Nearest-neighbor upscaled copies of chunk tiles, keyed by
+    /// `(chunk, factor)`. gpui samples all images with a linear filter;
+    /// painting a pre-replicated image keeps block edges crisp at high
+    /// zoom. Only touched on the main thread.
+    pub upscaled: std::cell::RefCell<HashMap<(ChunkCoord, u32), Arc<gpui::RenderImage>>>,
     pub selection: std::collections::HashSet<ChunkCoord>,
     pub view: ViewState,
     pub select_drag: Option<SelectDrag>,

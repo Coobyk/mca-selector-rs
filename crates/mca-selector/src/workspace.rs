@@ -106,6 +106,7 @@ impl Workspace {
                     building_regions: Default::default(),
                     tiles: HashMap::new(),
                     pending: Default::default(),
+                    upscaled: Default::default(),
                     selection: Default::default(),
                     view: ViewState::new(),
                     select_drag: None,
@@ -259,6 +260,7 @@ impl Workspace {
         let _ = gen;
         self.map.tiles.clear();
         self.map.pending.clear();
+        self.map.upscaled.borrow_mut().clear();
         self.map.region_base.clear();
         self.map.region_detail.clear();
         self.map.building_regions.clear();
@@ -668,10 +670,20 @@ impl Workspace {
                                 continue;
                             }
                             if let Some(tile) = self.map.tiles.get(&(cxw, czw)) {
+                                // Pre-replicate the 16x16 tile so the
+                                // GPU's linear sampler interpolates between
+                                // identical pixels: crisp block edges.
+                                let factor = next_pow2_scale(chunk_px);
+                                let img = upscaled_image(
+                                    &self.map.upscaled,
+                                    (cxw, czw),
+                                    &tile.image,
+                                    factor,
+                                );
                                 let _ = window.paint_image(
                                     chunk_bounds,
                                     Corners::default(),
-                                    tile.image.clone(),
+                                    img,
                                     0,
                                     false,
                                 );
@@ -916,6 +928,55 @@ impl Workspace {
             window_pos.y.to_f64() - MENU_HEIGHT - TOOLBAR_HEIGHT,
         )
     }
+}
+
+/// Smallest power-of-two replication factor that covers the on-screen
+/// chunk size (chunk_px / 16 rounded up).
+fn next_pow2_scale(chunk_px: f64) -> u32 {
+    ((chunk_px / 16.0).ceil() as usize)
+        .max(1)
+        .next_power_of_two()
+        .clamp(1, 32) as u32
+}
+
+/// Nearest-neighbor `factor`x upscale of a 16x16 tile image, cached per
+/// (chunk, factor). Linear sampling inside the replicated runs of identical
+/// pixels cannot blur block edges.
+fn upscaled_image(
+    cache: &std::cell::RefCell<
+        HashMap<(ChunkCoord, u32), Arc<gpui::RenderImage>>,
+    >,
+    coord: ChunkCoord,
+    tile: &gpui::RenderImage,
+    factor: u32,
+) -> Arc<gpui::RenderImage> {
+    let key = (coord, factor);
+    if let Some(img) = cache.borrow().get(&key) {
+        return img.clone();
+    }
+    let n = 16usize;
+    let f = factor as usize;
+    let shift = f.trailing_zeros();
+    let src = tile.as_bytes(0).unwrap_or(&[]).to_vec();
+    let mut out = vec![0u8; n * f * n * f * 4];
+    for y in 0..n * f {
+        let sy = (y >> shift) * n * 4;
+        for x in 0..n * f {
+            let sx = (x >> shift) * 4;
+            let di = (y * n * f + x) * 4;
+            out[di..di + 4].copy_from_slice(&src[sy + sx..sy + sx + 4]);
+        }
+    }
+    let img = Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+        image::RgbaImage::from_raw((n * f) as u32, (n * f) as u32, out)
+            .expect("upscaled tile size mismatch"),
+    )]));
+    let mut c = cache.borrow_mut();
+    if c.len() > 400 {
+        c.clear();
+    }
+    c.insert(key, img.clone());
+    img
 }
 
 /// Bounds at device coordinates `x, y` with size `w, h` in pixels.
