@@ -113,7 +113,7 @@ impl Workspace {
                     pan_drag: None,
                     mouse: None,
                     viewport: (800.0, 600.0),
-                    show_chunk_grid: false,
+                    show_chunk_grid: true,
                     show_region_grid: true,
                     needs_fit: false,
                     load_started: std::time::Instant::now(),
@@ -731,21 +731,6 @@ impl Workspace {
                             }
                         }
                     }
-                    // Subtle 1px chunk boundaries at deep zoom — thinner
-                    // cousins of the region borders.
-                    let line = gpui::rgba(0x00000040);
-                    for i in 0..=32i32 {
-                        let gx = ox + region_origin.0 + (i as f64) * chunk_px;
-                        window.paint_quad(fill(
-                            bounds_at(gx, oy + region_origin.1, 1.0, region_px),
-                            line,
-                        ));
-                        let gy = oy + region_origin.1 + (i as f64) * chunk_px;
-                        window.paint_quad(fill(
-                            bounds_at(ox + region_origin.0, gy, region_px, 1.0),
-                            line,
-                        ));
-                    }
                 } else {
                     // Zoomed-out: one image per region. The 512px detail
                     // image is used once a region is painted larger than
@@ -774,9 +759,10 @@ impl Workspace {
                     }
                 }
 
-                // Chunk grid.
+                // Chunk grid: thin 1px lines, the smaller cousins of the
+                // region borders.
                 if self.map.show_chunk_grid && chunk_px >= 8.0 {
-                    let grid = gpui::rgba(0xFFFFFF28);
+                    let grid = gpui::rgba(0x00000040);
                     for i in 0..=32i32 {
                         let gx = ox + region_origin.0 + (i as f64) * chunk_px;
                         window.paint_quad(fill(
