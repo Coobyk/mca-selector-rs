@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use mc_core::chunk_fast::parse_chunk;
-use mc_core::map::{render_tile_rgba, TILE_SIZE};
+use mc_core::map::{render_tile_raw, shade_tile, TILE_SIZE};
 use rayon::prelude::*;
 
 fn main() -> anyhow::Result<()> {
@@ -38,8 +38,11 @@ fn main() -> anyhow::Result<()> {
                 for cx in 0..32u8 {
                     let tile = match region.chunk_data(cx, cz) {
                         Ok(bytes) => parse_chunk(&bytes)
-                            .and_then(|c| render_tile_rgba(&c))
-                            .map(|t| (t.rgba.to_vec(), t.avg))
+                            .and_then(|c| render_tile_raw(&c))
+                            .map(|raw| {
+                                let rgba = shade_tile(&raw, &|_, _| None);
+                                (rgba.to_vec(), raw.avg)
+                            })
                             .unwrap_or((vec![0; 1024], [0, 0, 0])),
                         Err(_) => (vec![0; 1024], [0, 0, 0]),
                     };

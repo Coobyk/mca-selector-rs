@@ -472,18 +472,53 @@ impl Workspace {
         self.map.pending.insert(coord);
         let io = cx.background_spawn(async move {
             let tile = (|| -> Option<Arc<TileEntry>> {
+                let lx = coord.0.rem_euclid(32);
+                let lz = coord.1.rem_euclid(32);
                 let region = Region::open(&path).ok()?;
-                let bytes = region
-                    .chunk_data(coord.0.rem_euclid(32) as u8, coord.1.rem_euclid(32) as u8)
-                    .ok()?;
+                let bytes = region.chunk_data(lx as u8, lz as u8).ok()?;
                 let chunk = parse_chunk(&bytes)?;
-                let tile = mc_core::map::render_tile_rgba(&chunk)?;
-                let img = image::RgbaImage::from_raw(16, 16, tile.rgba.to_vec())?;
+                let raw = mc_core::map::render_tile_raw(&chunk)?;
+                // Neighbor heightmaps from the same region file so shading
+                // crosses chunk borders seamlessly.
+                let neighbor = |nx: i32, nz: i32| -> Option<Vec<i64>> {
+                    if nx > 31 || nz > 31 {
+                        return None;
+                    }
+                    region
+                        .chunk_data(nx as u8, nz as u8)
+                        .ok()
+                        .and_then(|b| parse_chunk(&b))
+                        .and_then(|c| c.motion_blocking)
+                };
+                let east = neighbor(lx + 1, lz);
+                let south = neighbor(lx, lz + 1);
+                let se = neighbor(lx + 1, lz + 1);
+                let rgba = mc_core::map::shade_tile(&raw, &|dx, dz| {
+                    if dx < 16 && dz < 16 {
+                        let h = raw.heights[dz as usize * 16 + dx as usize];
+                        if h == i32::MIN {
+                            None
+                        } else {
+                            Some(h)
+                        }
+                    } else if dx == 16 && dz < 16 {
+                        east
+                            .as_ref()
+                            .map(|m| mc_core::map::height_at(m, 0, dz as usize))
+                    } else if dz == 16 && dx < 16 {
+                        south
+                            .as_ref()
+                            .map(|m| mc_core::map::height_at(m, dx as usize, 0))
+                    } else {
+                        se.as_ref().map(|m| mc_core::map::height_at(m, 0, 0))
+                    }
+                });
+                let img = image::RgbaImage::from_raw(16, 16, rgba.to_vec())?;
                 let render_image = gpui::RenderImage::new(vec![image::Frame::new(img)]);
                 Some(Arc::new(TileEntry {
                     image: Arc::new(render_image),
-                    avg: [tile.avg[0], tile.avg[1], tile.avg[2], 255],
-                    height: tile.max_height,
+                    avg: [raw.avg[0], raw.avg[1], raw.avg[2], 255],
+                    height: raw.max_height,
                 }))
             })()
             .unwrap_or_else(|| {
@@ -691,6 +726,21 @@ impl Workspace {
                                 window.paint_quad(fill(chunk_bounds, rgb(UNLOADED)));
                             }
                         }
+                    }
+                    // Subtle 1px chunk boundaries at deep zoom — thinner
+                    // cousins of the region borders.
+                    let line = gpui::rgba(0x00000040);
+                    for i in 0..=32i32 {
+                        let gx = ox + region_origin.0 + (i as f64) * chunk_px;
+                        window.paint_quad(fill(
+                            bounds_at(gx, oy + region_origin.1, 1.0, region_px),
+                            line,
+                        ));
+                        let gy = oy + region_origin.1 + (i as f64) * chunk_px;
+                        window.paint_quad(fill(
+                            bounds_at(ox + region_origin.0, gy, region_px, 1.0),
+                            line,
+                        ));
                     }
                 } else {
                     // Zoomed-out: one image per region. The 512px detail

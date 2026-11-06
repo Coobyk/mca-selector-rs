@@ -5,6 +5,7 @@
 use std::time::Instant;
 
 use mc_core::chunk_fast::parse_chunk;
+use mc_core::map::{render_tile_raw, shade_tile};
 use mc_core::region::Region;
 
 fn main() -> anyhow::Result<()> {
@@ -42,7 +43,8 @@ fn main() -> anyhow::Result<()> {
     let started = Instant::now();
     let mut rendered = 0usize;
     for c in parsed.iter().flatten() {
-        if mc_core::map::render_tile_rgba(c).is_some() {
+        if let Some(raw) = render_tile_raw(c) {
+            let _ = shade_tile(&raw, &|_, _| None);
             rendered += 1;
         }
     }
