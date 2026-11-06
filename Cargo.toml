@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/mc-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+fastnbt = "2.6"
+flate2 = "1"
+anyhow = "1"
+thiserror = "2"
+rayon = "1"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }

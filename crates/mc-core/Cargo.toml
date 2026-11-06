@@ -1,0 +1,21 @@
+[package]
+name = "mc-core"
+description = "Minecraft Anvil region parsing and map rendering core for mca-selector-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fastnbt.workspace = true
+flate2.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+memmap2.workspace = true
+serde.workspace = true
+
+[[example]]
+name = "scan"
+
+[[example]]
+name = "dbgchunk"
