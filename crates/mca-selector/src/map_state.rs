@@ -146,4 +146,7 @@ pub struct MapState {
     pub viewport: (f64, f64),
     pub show_chunk_grid: bool,
     pub show_region_grid: bool,
+    /// Set when regions were loaded and the view should fit them once the
+    /// real viewport size is known.
+    pub needs_fit: bool,
 }

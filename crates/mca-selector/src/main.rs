@@ -6,6 +6,7 @@ mod workspace;
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};
 
 fn main() {
+    env_logger::init();
     let world_path = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: mca-selector <world-folder>");
         std::process::exit(2);
@@ -24,7 +25,9 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some(format!("mca-selector-rs — {}", world.root.display()).into()),
+                    title: Some(
+                        format!("mca-selector-rs - {}", world.root.display()).into(),
+                    ),
                     ..Default::default()
                 }),
                 ..Default::default()

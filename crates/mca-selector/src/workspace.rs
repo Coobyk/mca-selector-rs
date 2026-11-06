@@ -61,9 +61,20 @@ impl Workspace {
                     viewport: (800.0, 600.0),
                     show_chunk_grid: false,
                     show_region_grid: true,
+                    needs_fit: false,
                 },
                 _tasks: Vec::new(),
             };
+            // Prefer the overworld as the initial dimension.
+            if let Some(i) = ws
+                .map
+                .world
+                .dimensions
+                .iter()
+                .position(|d| d.name == "Overworld")
+            {
+                ws.map.dimension = i;
+            }
             ws.load_dimension(cx);
             ws
         })
@@ -111,6 +122,7 @@ impl Workspace {
                 for (coord, info) in infos {
                     ws.map.regions.insert(coord, info);
                 }
+                ws.map.needs_fit = true;
                 cx.notify();
             });
         });
@@ -124,16 +136,48 @@ impl Workspace {
         }
     }
 
+    /// Center the view on the loaded regions and pick a zoom that shows all
+    /// of them.
+    fn fit_view(&mut self) {
+        let Some(((min_rx, min_rz), (max_rx, max_rz))) = self
+            .map
+            .regions
+            .keys()
+            .copied()
+            .fold(None, |acc: Option<((i32, i32), (i32, i32))>, c| match acc {
+                None => Some((c, c)),
+                Some((lo, hi)) => Some((
+                    (c.0.min(lo.0), c.1.min(lo.1)),
+                    (c.0.max(hi.0), c.1.max(hi.1)),
+                )),
+            })
+        else {
+            return;
+        };
+        let width_blocks = ((max_rx - min_rx + 1) * 512) as f64;
+        let height_blocks = ((max_rz - min_rz + 1) * 512) as f64;
+        let (vw, vh) = self.map.viewport;
+        // Leave some margin.
+        let zoom = ((vw - 40.0) / width_blocks)
+            .min((vh - 40.0) / height_blocks)
+            .clamp(1.0 / 512.0, 32.0);
+        self.map.view.zoom = zoom;
+        self.map.view.center = (
+            (min_rx * 512) as f64 + width_blocks / 2.0,
+            (min_rz * 512) as f64 + height_blocks / 2.0,
+        );
+    }
+
     /// Region coordinate range currently visible.
     fn visible_regions(&self) -> (i32, i32, i32, i32) {
         let vp = self.map.viewport;
         let tl = self.map.view.screen_to_block((0.0, 0.0), vp);
         let br = self.map.view.screen_to_block((vp.0, vp.1), vp);
         (
-            (tl.0.floor() as i32).div_euclid(32) - 1,
-            (br.0.floor() as i32).div_euclid(32) + 1,
-            (tl.1.floor() as i32).div_euclid(32) - 1,
-            (br.1.floor() as i32).div_euclid(32) + 1,
+            (tl.0.floor() as i32).div_euclid(512) - 1,
+            (br.0.floor() as i32).div_euclid(512) + 1,
+            (tl.1.floor() as i32).div_euclid(512) - 1,
+            (br.1.floor() as i32).div_euclid(512) + 1,
         )
     }
 
@@ -161,8 +205,8 @@ impl Workspace {
                         {
                             continue;
                         }
-                        let dx = coord.0 as f64 + 0.5 - self.map.view.center.0;
-                        let dz = coord.1 as f64 + 0.5 - self.map.view.center.1;
+                        let dx = (coord.0 * 16 + 8) as f64 - self.map.view.center.0;
+                        let dz = (coord.1 * 16 + 8) as f64 - self.map.view.center.1;
                         missing.push((coord, dx * dx + dz * dz));
                     }
                 }
@@ -308,6 +352,10 @@ impl Workspace {
             vs.width.to_f64(),
             vs.height.to_f64() - MENU_HEIGHT - TOOLBAR_HEIGHT - STATUS_HEIGHT,
         );
+        if self.map.needs_fit {
+            self.map.needs_fit = false;
+            self.fit_view();
+        }
         self.request_tiles(cx);
         let entity = cx.entity();
         div()
@@ -330,11 +378,13 @@ impl Workspace {
                     let ws = entity.read(cx);
                     ws.paint_map(bounds, window);
                 },
-            ))
+            )
+            .size_full())
     }
 
     fn paint_map(&self, bounds: Bounds<gpui::Pixels>, window: &mut gpui::Window) {
-        let vp = self.map.viewport;
+        // The canvas bounds are the paint viewport.
+        let vp = (bounds.size.width.to_f64(), bounds.size.height.to_f64());
         let view = self.map.view;
         let ox = bounds.origin.x.to_f64();
         let oy = bounds.origin.y.to_f64();
@@ -349,7 +399,7 @@ impl Workspace {
         for rz in min_rz..=max_rz {
             for rx in min_rx..=max_rx {
                 let region_origin =
-                    view.block_to_screen(((rx * 32) as f64, (rz * 32) as f64), vp);
+                    view.block_to_screen(((rx * 512) as f64, (rz * 512) as f64), vp);
                 let region_bounds = bounds_at(
                     ox + region_origin.0,
                     oy + region_origin.1,
@@ -392,13 +442,16 @@ impl Workspace {
                         }
                         if chunk_px >= 4.0 {
                             if let Some(tile) = self.map.tiles.get(&(cxw, czw)) {
-                                let _ = window.paint_image(
+                                if let Err(e) = window.paint_image(
                                     chunk_bounds,
                                     Corners::default(),
                                     tile.image.clone(),
                                     0,
                                     false,
-                                );
+                                ) {
+                                    static ONCE: std::sync::Once = std::sync::Once::new();
+                                    ONCE.call_once(|| eprintln!("paint_image error: {e}"));
+                                }
                             } else {
                                 // Not yet rendered: neutral placeholder.
                                 window.paint_quad(fill(chunk_bounds, rgb(UNLOADED)));
@@ -450,7 +503,7 @@ impl Workspace {
                         continue;
                     }
                     let origin =
-                        view.block_to_screen(((rx * 32) as f64, (rz * 32) as f64), vp);
+                        view.block_to_screen(((rx * 512) as f64, (rz * 512) as f64), vp);
                     let x = ox + origin.0 - thickness / 2.0;
                     let y = oy + origin.1 - thickness / 2.0;
                     window.paint_quad(fill(
@@ -787,9 +840,11 @@ impl gpui::Render for Workspace {
                     .text_size(px(12.0))
                     .text_color(rgb(0x888888))
                     .child(SharedString::from(format!(
-                        "{} · {} regions",
+                        "{} · {} regions · {} tiles ({} pending)",
                         dim.name,
-                        self.map.regions.len()
+                        self.map.regions.len(),
+                        self.map.tiles.len(),
+                        self.map.pending.len()
                     ))),
             );
 

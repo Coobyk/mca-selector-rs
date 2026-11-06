@@ -11,6 +11,7 @@ gpui = "0.2.2"
 anyhow.workspace = true
 rayon.workspace = true
 image = "0.25"
+env_logger = "0.11"
 
 [[bin]]
 name = "mca-selector"
