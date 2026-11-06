@@ -525,22 +525,41 @@ impl Workspace {
             }
         }
 
-        // Selection overlay.
+        // Selection overlay, drawn as horizontal spans so adjacent chunks
+        // form one seamless rectangle.
         let sel_fill = gpui::rgba(0x3C78D848);
         let sel_border = gpui::rgba(0x7FA8F0FF);
-        let mut selected_bounds: Vec<Bounds<gpui::Pixels>> = Vec::new();
+        let mut spans: HashMap<i32, Vec<(i32, i32)>> = HashMap::new();
         for &(cxw, czw) in self.map.selection.iter() {
-            let origin = view.block_to_screen(((cxw * 16) as f64, (czw * 16) as f64), vp);
-            let b = bounds_at(ox + origin.0, oy + origin.1, chunk_px, chunk_px);
-            if offscreen(b, bounds) {
-                continue;
-            }
-            selected_bounds.push(b);
+            spans.entry(czw).or_default().push((cxw, cxw));
         }
-        selected_bounds.sort_by_key(|b| {
+        let mut span_bounds: Vec<Bounds<gpui::Pixels>> = Vec::new();
+        for (czw, mut runs) in spans {
+            runs.sort_by_key(|r| r.0);
+            // Merge contiguous runs.
+            let mut merged: Vec<(i32, i32)> = Vec::with_capacity(runs.len());
+            for (x0, x1) in runs {
+                match merged.last_mut() {
+                    Some((_, last_x1)) if x0 <= *last_x1 + 1 => {
+                        *last_x1 = (*last_x1).max(x1);
+                    }
+                    _ => merged.push((x0, x1)),
+                }
+            }
+            for (x0, x1) in merged {
+                let origin = view.block_to_screen(((x0 * 16) as f64, (czw * 16) as f64), vp);
+                let w = ((x1 - x0 + 1) * 16) as f64 * view.zoom;
+                let b = bounds_at(ox + origin.0, oy + origin.1, w, chunk_px);
+                if offscreen(b, bounds) {
+                    continue;
+                }
+                span_bounds.push(b);
+            }
+        }
+        span_bounds.sort_by_key(|b| {
             (b.origin.x.to_f64() as i64) * 4 + (b.origin.y.to_f64() as i64)
         });
-        for b in &selected_bounds {
+        for b in &span_bounds {
             window.paint_quad(fill(*b, sel_fill));
             paint_outline(window, *b, 1.0, sel_border.into());
         }
