@@ -349,16 +349,20 @@ impl Workspace {
         };
         let width_blocks = ((max_rx - min_rx + 1) * 512) as f64;
         let height_blocks = ((max_rz - min_rz + 1) * 512) as f64;
+        self.map.view.center = (
+            (min_rx * 512) as f64 + width_blocks / 2.0,
+            (min_rz * 512) as f64 + height_blocks / 2.0,
+        );
+        // MCA_INIT_ZOOM is an intentional starting zoom; fit only centers.
+        if std::env::var_os("MCA_INIT_ZOOM").is_some() {
+            return;
+        }
         let (vw, vh) = self.map.viewport;
         // Leave some margin.
         let zoom = ((vw - 40.0) / width_blocks)
             .min((vh - 40.0) / height_blocks)
             .clamp(1.0 / 512.0, 32.0);
         self.map.view.zoom = zoom;
-        self.map.view.center = (
-            (min_rx * 512) as f64 + width_blocks / 2.0,
-            (min_rz * 512) as f64 + height_blocks / 2.0,
-        );
     }
 
     /// Region coordinate range currently visible.
