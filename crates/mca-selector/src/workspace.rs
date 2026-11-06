@@ -37,6 +37,8 @@ pub struct Workspace {
     pub export_dir: String,
     /// Open export dialog, if any.
     pub export_dialog: Option<ExportDialog>,
+    /// Error from the last world-open attempt, shown on the landing screen.
+    pub open_error: Option<String>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -46,7 +48,7 @@ fn empty_image() -> gpui::RenderImage {
 }
 
 impl Workspace {
-    pub fn open_world(world: mc_core::world::World, cx: &mut App) -> Entity<Self> {
+    pub fn new(world: Option<mc_core::world::World>, open_error: Option<String>, cx: &mut App) -> Entity<Self> {
         cx.new(|cx| {
             let mut ws = Self {
                 map: MapState {
@@ -54,6 +56,8 @@ impl Workspace {
                     dimension: 0,
                     regions: HashMap::new(),
                     region_summaries: HashMap::new(),
+                    region_images: HashMap::new(),
+                    building_regions: Default::default(),
                     tiles: HashMap::new(),
                     pending: Default::default(),
                     loading_regions: Default::default(),
@@ -67,6 +71,7 @@ impl Workspace {
                     show_region_grid: true,
                     needs_fit: false,
                 },
+                open_error,
                 export_dir: std::env::var("MCA_EXPORT_DIR")
                     .unwrap_or_else(|_| "/tmp/mca-selector-export".to_string()),
                 export_dialog: None,
@@ -76,15 +81,68 @@ impl Workspace {
             if let Some(i) = ws
                 .map
                 .world
-                .dimensions
-                .iter()
-                .position(|d| d.name == "Overworld")
+                .as_ref()
+                .and_then(|w| w.dimensions.iter().position(|d| d.name == "Overworld"))
             {
                 ws.map.dimension = i;
             }
-            ws.load_dimension(cx);
+            if ws.map.world.is_some() {
+                ws.load_dimension(cx);
+            }
             ws
         })
+    }
+
+    /// Open a world folder via the platform directory picker and load it,
+    /// replacing whatever is open.
+    pub fn open_world_via_dialog(&mut self, cx: &mut Context<Self>) {
+        let task = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open a Minecraft world folder".into()),
+        });
+        let task = cx.spawn(async move |this, cx| {
+            // The prompt resolves to Result<Result<Option<paths>>, Canceled>.
+            let picked = match task.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) => None, // user cancelled
+                Ok(Err(e)) => {
+                    let _ = this.update(cx, |ws, _cx| {
+                        ws.open_error = Some(format!(
+                            "The system folder picker failed: {e}. \
+                             Pass the world folder as a CLI argument instead."
+                        ));
+                    });
+                    return;
+                }
+                Err(_) => return, // task cancelled
+            };
+            let Some(path) = picked else {
+                return; // user cancelled
+            };
+            let opened = mc_core::world::World::open(&path);
+            let _ = this.update(cx, |ws, cx| match opened {
+                Ok(world) => {
+                    ws.map.world = Some(world);
+                    ws.map.dimension = 0;
+                    if let Some(i) = ws
+                        .map
+                        .world
+                        .as_ref()
+                        .and_then(|w| w.dimensions.iter().position(|d| d.name == "Overworld"))
+                    {
+                        ws.map.dimension = i;
+                    }
+                    ws.open_error = None;
+                    ws.load_dimension(cx);
+                }
+                Err(e) => {
+                    ws.open_error = Some(format!("Could not open {}: {e}", path.display()));
+                }
+            });
+        });
+        self._tasks.push(task);
     }
 
     /// Load the region list of the current dimension (background), then
@@ -92,10 +150,15 @@ impl Workspace {
     fn load_dimension(&mut self, cx: &mut Context<Self>) {
         self.map.tiles.clear();
         self.map.region_summaries.clear();
+        self.map.region_images.clear();
+        self.map.building_regions.clear();
         self.map.regions.clear();
         self.map.pending.clear();
         self.map.selection.clear();
-        let Some(dim) = self.map.world.dimensions.get(self.map.dimension).cloned() else {
+        let Some(world) = &self.map.world else {
+            return;
+        };
+        let Some(dim) = world.dimensions.get(self.map.dimension).cloned() else {
             return;
         };
         let io = cx.background_spawn(async move {
@@ -137,7 +200,13 @@ impl Workspace {
     }
 
     pub fn set_dimension(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.map.world.dimensions.len() && index != self.map.dimension {
+        let len = self
+            .map
+            .world
+            .as_ref()
+            .map(|w| w.dimensions.len())
+            .unwrap_or(0);
+        if index < len && index != self.map.dimension {
             self.map.dimension = index;
             self.load_dimension(cx);
         }
@@ -188,42 +257,173 @@ impl Workspace {
         )
     }
 
-    /// Request tiles for the chunks nearest the view center first.
+    /// Request rendering work for the current view.
+    ///
+    /// LOD rules:
+    /// - chunk size on screen >= 32px: per-chunk tasks (few chunks visible);
+    /// - below that: one background task per region renders all of its
+    ///   chunks and composites them into a single 512x512 image, so the
+    ///   canvas paints a handful of images per frame no matter how far out
+    ///   the view is. This keeps pan/zoom on the main thread.
     fn request_tiles(&mut self, cx: &mut Context<Self>) {
-        const MAX_PENDING: usize = 512;
-        if self.map.pending.len() >= MAX_PENDING {
+        if self.map.world.is_none() {
             return;
         }
+        let chunk_px = self.map.view.zoom * 16.0;
         let (min_rx, max_rx, min_rz, max_rz) = self.visible_regions();
-        let mut missing: Vec<(ChunkCoord, f64)> = Vec::new();
-        for rz in min_rz..=max_rz {
-            for rx in min_rx..=max_rx {
-                let Some(info) = self.map.regions.get(&(rx, rz)) else {
-                    continue;
-                };
-                for lz in 0..32i32 {
-                    for lx in 0..32i32 {
-                        if !info.has(lx, lz) {
-                            continue;
+
+        if chunk_px >= 32.0 {
+            const MAX_PENDING: usize = 512;
+            if self.map.pending.len() >= MAX_PENDING {
+                return;
+            }
+            let mut missing: Vec<(ChunkCoord, f64)> = Vec::new();
+            for rz in min_rz..=max_rz {
+                for rx in min_rx..=max_rx {
+                    let Some(info) = self.map.regions.get(&(rx, rz)) else {
+                        continue;
+                    };
+                    for lz in 0..32i32 {
+                        for lx in 0..32i32 {
+                            if !info.has(lx, lz) {
+                                continue;
+                            }
+                            let coord = (rx * 32 + lx, rz * 32 + lz);
+                            if self.map.tiles.contains_key(&coord)
+                                || self.map.pending.contains(&coord)
+                            {
+                                continue;
+                            }
+                            let dx = (coord.0 * 16 + 8) as f64 - self.map.view.center.0;
+                            let dz = (coord.1 * 16 + 8) as f64 - self.map.view.center.1;
+                            missing.push((coord, dx * dx + dz * dz));
                         }
-                        let coord = (rx * 32 + lx, rz * 32 + lz);
-                        if self.map.tiles.contains_key(&coord)
-                            || self.map.pending.contains(&coord)
-                        {
-                            continue;
-                        }
-                        let dx = (coord.0 * 16 + 8) as f64 - self.map.view.center.0;
-                        let dz = (coord.1 * 16 + 8) as f64 - self.map.view.center.1;
-                        missing.push((coord, dx * dx + dz * dz));
                     }
                 }
             }
+            missing.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            let budget = MAX_PENDING - self.map.pending.len();
+            for (coord, _) in missing.into_iter().take(budget) {
+                self.spawn_tile_task(coord, cx);
+            }
+            return;
         }
-        missing.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        let budget = MAX_PENDING - self.map.pending.len();
-        for (coord, _) in missing.into_iter().take(budget) {
-            self.spawn_tile_task(coord, cx);
+
+        // Region-LOD: composite whole regions in the background.
+        const MAX_BUILDING: usize = 8;
+        for rz in min_rz..=max_rz {
+            for rx in min_rx..=max_rx {
+                if self.map.building_regions.len() >= MAX_BUILDING {
+                    return;
+                }
+                let Some(info) = self.map.regions.get(&(rx, rz)) else {
+                    continue;
+                };
+                if info.count() == 0
+                    || self.map.region_images.contains_key(&(rx, rz))
+                    || self.map.building_regions.contains(&(rx, rz))
+                {
+                    continue;
+                }
+                self.spawn_region_tile_task((rx, rz), cx);
+            }
         }
+    }
+
+    /// Render every chunk of one region in the background and composite the
+    /// tiles into a 512x512 RGBA image (1px per block).
+    fn spawn_region_tile_task(&mut self, coord: RegionCoord, cx: &mut Context<Self>) {
+        let (rx, rz) = coord;
+        let Some(info) = self.map.regions.get(&coord) else {
+            return;
+        };
+        let path = info.path.clone();
+        self.map.building_regions.insert(coord);
+        let io = cx.background_spawn(async move {
+            let Ok(region) = Region::open(&path) else {
+                return None;
+            };
+            let mut tiles: Vec<(ChunkCoord, Arc<TileEntry>)> = Vec::new();
+            let mut sum = [0u64; 3];
+            let mut count = 0u32;
+            let mut img = vec![0u8; 512 * 512 * 4];
+            for lz in 0..32i32 {
+                for lx in 0..32i32 {
+                    // Placeholder color for chunks without data.
+                    let base = &mut img[(lz * 512 + lx * 16) as usize * 4..];
+                    for py in 0..16usize {
+                        for px in 0..16usize {
+                            let o = (py * 512 + px) * 4;
+                            base[o] = 0x22;
+                            base[o + 1] = 0x25;
+                            base[o + 2] = 0x2c;
+                            base[o + 3] = 0xff;
+                        }
+                    }
+                    if !region.has_chunk(lx as u8, lz as u8).unwrap_or(false) {
+                        continue;
+                    }
+                    let Ok(bytes) = region.chunk_data(lx as u8, lz as u8) else {
+                        continue;
+                    };
+                    let Ok(chunk) = Chunk::from_nbt(&bytes) else {
+                        continue;
+                    };
+                    let tile = mc_core::map::render_tile(&chunk);
+                    let ox = (lx * 16) as usize;
+                    let oz = (lz * 16) as usize;
+                    for py in 0..16usize {
+                        for px in 0..16usize {
+                            let si = (py * 16 + px) * 4;
+                            let di = ((oz + py) * 512 + ox + px) * 4;
+                            img[di..di + 4].copy_from_slice(&tile.rgba[si..si + 4]);
+                        }
+                    }
+                    sum[0] += u64::from(tile.avg[0]);
+                    sum[1] += u64::from(tile.avg[1]);
+                    sum[2] += u64::from(tile.avg[2]);
+                    count += 1;
+                    let render_image =
+                        gpui::RenderImage::new(vec![image::Frame::new(
+                            image::RgbaImage::from_raw(16, 16, tile.rgba.clone())?,
+                        )]);
+                    tiles.push((
+                        (rx * 32 + lx, rz * 32 + lz),
+                        Arc::new(TileEntry {
+                            image: Arc::new(render_image),
+                            avg: tile.avg,
+                            height: tile.max_height,
+                        }),
+                    ));
+                }
+            }
+            let region_image = image::RgbaImage::from_raw(512, 512, img)?;
+            Some((coord, tiles, (sum, count), region_image))
+        });
+        let task = cx.spawn(async move |this, cx| {
+            if let Some((coord, tiles, (sum, count), region_image)) = io.await {
+                let _ = this.update(cx, |ws, cx| {
+                    for (chunk_coord, tile) in tiles {
+                        ws.map.tiles.insert(chunk_coord, tile);
+                    }
+                    let summary = ws.map.region_summaries.entry(coord).or_default();
+                    summary.sum[0] += sum[0];
+                    summary.sum[1] += sum[1];
+                    summary.sum[2] += sum[2];
+                    summary.count += count;
+                    let render_image =
+                        gpui::RenderImage::new(vec![image::Frame::new(region_image)]);
+                    ws.map.region_images.insert(coord, Arc::new(render_image));
+                    ws.map.building_regions.remove(&coord);
+                    cx.notify();
+                });
+            } else {
+                let _ = this.update(cx, |ws, _cx| {
+                    ws.map.building_regions.remove(&coord);
+                });
+            }
+        });
+        self._tasks.push(task);
     }
 
     fn spawn_tile_task(&mut self, coord: ChunkCoord, cx: &mut Context<Self>) {
@@ -429,25 +629,73 @@ impl Workspace {
                 let Some(info) = self.map.regions.get(&(rx, rz)) else {
                     continue;
                 };
-                for lz in 0..32i32 {
-                    for lx in 0..32i32 {
-                        if !info.has(lx, lz) {
-                            continue;
+
+                // Zoomed out: paint the whole region as one composited
+                // 512x512 image (1px per block) so each frame is a handful
+                // of images instead of thousands of chunk tiles. Falls back
+                // to chunk-average quads while the region image is built.
+                if chunk_px < 32.0 {
+                    match self.map.region_images.get(&(rx, rz)) {
+                        Some(img) => {
+                            let _ = window.paint_image(
+                                region_bounds,
+                                Corners::default(),
+                                img.clone(),
+                                0,
+                                false,
+                            );
                         }
-                        let cxw = rx * 32 + lx;
-                        let czw = rz * 32 + lz;
-                        let origin =
-                            view.block_to_screen(((cxw * 16) as f64, (czw * 16) as f64), vp);
-                        let chunk_bounds = bounds_at(
-                            ox + origin.0,
-                            oy + origin.1,
-                            chunk_px,
-                            chunk_px,
-                        );
-                        if offscreen(chunk_bounds, bounds) {
-                            continue;
+                        None => {
+                            for lz in 0..32i32 {
+                                for lx in 0..32i32 {
+                                    if !info.has(lx, lz) {
+                                        continue;
+                                    }
+                                    let cxw = rx * 32 + lx;
+                                    let czw = rz * 32 + lz;
+                                    let origin = view.block_to_screen(
+                                        ((cxw * 16) as f64, (czw * 16) as f64),
+                                        vp,
+                                    );
+                                    let chunk_bounds = bounds_at(
+                                        ox + origin.0,
+                                        oy + origin.1,
+                                        chunk_px,
+                                        chunk_px,
+                                    );
+                                    if offscreen(chunk_bounds, bounds) {
+                                        continue;
+                                    }
+                                    let color = self
+                                        .map
+                                        .tiles
+                                        .get(&(cxw, czw))
+                                        .map(|t| t.avg)
+                                        .unwrap_or([0x22, 0x25, 0x2c, 255]);
+                                    window.paint_quad(fill(chunk_bounds, color4(color)));
+                                }
+                            }
                         }
-                        if chunk_px >= 4.0 {
+                    }
+                } else {
+                    for lz in 0..32i32 {
+                        for lx in 0..32i32 {
+                            if !info.has(lx, lz) {
+                                continue;
+                            }
+                            let cxw = rx * 32 + lx;
+                            let czw = rz * 32 + lz;
+                            let origin = view
+                                .block_to_screen(((cxw * 16) as f64, (czw * 16) as f64), vp);
+                            let chunk_bounds = bounds_at(
+                                ox + origin.0,
+                                oy + origin.1,
+                                chunk_px,
+                                chunk_px,
+                            );
+                            if offscreen(chunk_bounds, bounds) {
+                                continue;
+                            }
                             if let Some(tile) = self.map.tiles.get(&(cxw, czw)) {
                                 if let Err(e) = window.paint_image(
                                     chunk_bounds,
@@ -463,20 +711,6 @@ impl Workspace {
                                 // Not yet rendered: neutral placeholder.
                                 window.paint_quad(fill(chunk_bounds, rgb(UNLOADED)));
                             }
-                        } else {
-                            let color = self
-                                .map
-                                .tiles
-                                .get(&(cxw, czw))
-                                .map(|t| t.avg)
-                                .or_else(|| {
-                                    self.map
-                                        .region_summaries
-                                        .get(&(rx, rz))
-                                        .and_then(|s| s.avg())
-                                })
-                                .unwrap_or([0x22, 0x25, 0x2c, 255]);
-                            window.paint_quad(fill(chunk_bounds, color4(color)));
                         }
                     }
                 }
@@ -776,7 +1010,11 @@ impl gpui::Render for Workspace {
             }));
 
         // Toolbar.
-        let dim = self.map.world.dimensions[self.map.dimension].clone();
+        let dim = self
+            .map
+            .world
+            .as_ref()
+            .map(|w| w.dimensions[self.map.dimension].clone());
         let mut toolbar = div()
             .flex()
             .items_center()
@@ -786,7 +1024,21 @@ impl gpui::Render for Workspace {
             .bg(rgb(CHROME_BG))
             .border_b_1()
             .border_color(rgb(0x111214))
-            .child(self.render_toolbar_button("Open"))
+            .child(
+                div()
+                    .id("btn-open")
+                    .px_2()
+                    .py_1()
+                    .text_size(px(13.0))
+                    .text_color(rgb(TEXT))
+                    .rounded_sm()
+                    .hover(|s| s.bg(rgb(0x3A3C42)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                        this.open_world_via_dialog(cx);
+                    }))
+                    .child("Open world…"),
+            )
             .child(
                 div()
                     .id("btn-export")
@@ -805,32 +1057,34 @@ impl gpui::Render for Workspace {
             )
             .child(self.render_toolbar_button("Import chunks"))
             .child(div().w_2())
-            .child(
+            .children(dim.is_some().then(|| {
                 div()
                     .text_size(px(12.0))
                     .text_color(rgb(0x888888))
-                    .child("Dimension:"),
-            );
-        for (i, d) in self.map.world.dimensions.iter().enumerate() {
-            let active = i == self.map.dimension;
-            let name = d.name.clone();
-            toolbar = toolbar.child(
-                div()
-                    .id(SharedString::from(format!("dim-{i}")))
-                    .px_2()
-                    .py_1()
-                    .text_size(px(13.0))
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .when(active, |s| s.bg(rgb(ACCENT)).text_color(rgb(0xFFFFFF)))
-                    .when(!active, |s| {
-                        s.text_color(rgb(TEXT)).hover(|s| s.bg(rgb(0x3A3C42)))
-                    })
-                    .on_click(cx.listener(move |this, _ev, _window, cx| {
-                        this.set_dimension(i, cx);
-                    }))
-                    .child(SharedString::from(name)),
-            );
+                    .child("Dimension:")
+            }));
+        if let Some(world) = &self.map.world {
+            for (i, d) in world.dimensions.iter().enumerate() {
+                let active = i == self.map.dimension;
+                let name = d.name.clone();
+                toolbar = toolbar.child(
+                    div()
+                        .id(SharedString::from(format!("dim-{i}")))
+                        .px_2()
+                        .py_1()
+                        .text_size(px(13.0))
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .when(active, |s| s.bg(rgb(ACCENT)).text_color(rgb(0xFFFFFF)))
+                        .when(!active, |s| {
+                            s.text_color(rgb(TEXT)).hover(|s| s.bg(rgb(0x3A3C42)))
+                        })
+                        .on_click(cx.listener(move |this, _ev, _window, cx| {
+                            this.set_dimension(i, cx);
+                        }))
+                        .child(SharedString::from(name)),
+                );
+            }
         }
         toolbar = toolbar
             .child(div().w_2())
@@ -880,13 +1134,16 @@ impl gpui::Render for Workspace {
                 div()
                     .text_size(px(12.0))
                     .text_color(rgb(0x888888))
-                    .child(SharedString::from(format!(
-                        "{} · {} regions · {} tiles ({} pending)",
-                        dim.name,
-                        self.map.regions.len(),
-                        self.map.tiles.len(),
-                        self.map.pending.len()
-                    ))),
+                    .child(SharedString::from(match &dim {
+                        Some(dim) => format!(
+                            "{} · {} regions · {} tiles ({} pending)",
+                            dim.name,
+                            self.map.regions.len(),
+                            self.map.tiles.len(),
+                            self.map.pending.len()
+                        ),
+                        None => "No world open".to_string(),
+                    })),
             );
 
         // Status bar, like the original: selection info left, coordinates
@@ -941,6 +1198,76 @@ impl gpui::Render for Workspace {
             .child(toolbar)
             .child(map)
             .child(status);
+
+        // Landing screen while no world is open: ask the user to pick a
+        // world folder.
+        if self.map.world.is_none() {
+            let error = self.open_error.clone();
+            root = root.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .bg(gpui::rgba(0x000000AA))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(460.0))
+                            .bg(rgb(CHROME_BG))
+                            .border_1()
+                            .border_color(rgb(0x4A4C52))
+                            .rounded_lg()
+                            .p_6()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_size(px(20.0))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(0xFFFFFF))
+                                    .child("mca-selector-rs"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(0x999999))
+                                    .text_center()
+                                    .child(
+                                        "Open a Minecraft world folder to view its chunks, \
+                                         select regions of the map and export them.",
+                                    ),
+                            )
+                            .children(error.clone().map(|e| {
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(0xE07A6A))
+                                    .text_center()
+                                    .child(SharedString::from(e))
+                            }))
+                            .child(
+                                div()
+                                    .id("landing-open")
+                                    .mt_2()
+                                    .px_4()
+                                    .py_2()
+                                    .rounded_md()
+                                    .text_size(px(14.0))
+                                    .text_color(rgb(0xFFFFFF))
+                                    .bg(rgb(ACCENT))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(0x4A88E8)))
+                                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                                        this.open_world_via_dialog(cx);
+                                    }))
+                                    .child("Open world…"),
+                            ),
+                    ),
+            );
+        }
 
         // Export modal, when open.
         if let Some(dialog) = &self.export_dialog {
@@ -1072,8 +1399,14 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let world = self.map.world.clone();
-        let Some(dim) = self.map.world.dimensions.get(self.map.dimension).cloned() else {
+        let Some(world) = self.map.world.clone() else {
+            if let Some(d) = self.export_dialog.as_mut() {
+                d.message = Some("No world is open.".into());
+            }
+            cx.notify();
+            return;
+        };
+        let Some(dim) = world.dimensions.get(self.map.dimension).cloned() else {
             return;
         };
         let io = cx.background_spawn(async move {

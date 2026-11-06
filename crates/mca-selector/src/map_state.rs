@@ -129,11 +129,19 @@ pub struct PanDrag {
 
 /// Everything the map screen shows.
 pub struct MapState {
-    pub world: World,
+    /// The opened world, or `None` while the landing screen asks for one.
+    pub world: Option<World>,
     pub dimension: usize,
     /// Region info per dimension index (loaded lazily per dimension).
     pub regions: HashMap<RegionCoord, RegionInfo>,
     pub region_summaries: HashMap<RegionCoord, RegionSummary>,
+    /// Composited 512x512 region images (1px per block), built in the
+    /// background once a region's chunks are rendered. Used for all
+    /// zoomed-out views so the canvas paints a handful of images instead of
+    /// thousands of chunk tiles.
+    pub region_images: HashMap<RegionCoord, Arc<gpui::RenderImage>>,
+    /// Regions whose compositing task is currently running.
+    pub building_regions: std::collections::HashSet<RegionCoord>,
     pub tiles: HashMap<ChunkCoord, Arc<TileEntry>>,
     pub pending: std::collections::HashSet<ChunkCoord>,
     pub loading_regions: std::collections::HashSet<RegionCoord>,
