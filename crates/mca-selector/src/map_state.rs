@@ -47,9 +47,13 @@ pub struct ViewState {
 
 impl ViewState {
     pub fn new() -> Self {
+        let zoom = std::env::var("MCA_INIT_ZOOM")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.5);
         Self {
             center: (0.0, 0.0),
-            zoom: 0.5,
+            zoom: zoom.clamp(1.0 / 512.0, 32.0),
         }
     }
 
