@@ -7,10 +7,9 @@
 //! NBT data.
 
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use flate2::read::{GzDecoder, ZlibDecoder};
+use libdeflater::{DecompressionError, Decompressor};
 use memmap2::Mmap;
 
 use crate::error::{Error, Result};
@@ -18,6 +17,34 @@ use crate::error::{Error, Result};
 pub const REGION_CHUNKS: usize = 32;
 const HEADER_SECTORS: u32 = 2;
 const SECTOR_SIZE: usize = 4096;
+
+/// Decompress a zlib or gzip payload with libdeflate. The output size is
+/// not stored in the stream, so the buffer grows on demand.
+fn decompress(payload: &[u8], gzip: bool) -> Option<Vec<u8>> {
+    let mut cap = 256 * 1024;
+    loop {
+        let mut out = vec![0u8; cap];
+        let mut dec = Decompressor::new();
+        let result = if gzip {
+            dec.gzip_decompress(payload, &mut out)
+        } else {
+            dec.zlib_decompress(payload, &mut out)
+        };
+        match result {
+            Ok(n) => {
+                out.truncate(n);
+                return Some(out);
+            }
+            Err(DecompressionError::InsufficientSpace) => {
+                cap *= 4;
+                if cap > 128 * 1024 * 1024 {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
@@ -158,23 +185,11 @@ impl Region {
         let compression =
             Compression::from_byte(self.map[offset + 4])?;
         let payload = &self.map[offset + 5..offset + 4 + length];
-        Ok(match compression {
-            Compression::Gzip => GzDecoder::new(payload)
-                .bytes()
-                .collect::<std::io::Result<Vec<u8>>>()
-                .map_err(|source| Error::Io {
-                    path: self.path.clone().into(),
-                    source,
-                })?,
-            Compression::Zlib => ZlibDecoder::new(payload)
-                .bytes()
-                .collect::<std::io::Result<Vec<u8>>>()
-                .map_err(|source| Error::Io {
-                    path: self.path.clone().into(),
-                    source,
-                })?,
-            Compression::Uncompressed => payload.to_vec(),
-        })
+        match compression {
+            Compression::Uncompressed => Ok(payload.to_vec()),
+            _ => decompress(payload, compression == Compression::Gzip)
+                .ok_or(Error::Decompress),
+        }
     }
 
     /// Visit every chunk present in the region with its local coordinates

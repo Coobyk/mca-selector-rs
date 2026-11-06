@@ -8,9 +8,10 @@
 //! - [`chunk`]: the chunk NBT model for modern Anvil (1.18+) plus the packed
 //!   bit helpers used by block palettes and heightmaps.
 //! - [`world`]: locating dimensions of a save folder and listing regions.
-//! - [`map`]: block colors and chunk tile rendering for the world map.
+//! - [`map`]: block colors, chunk tile and region image rendering for the
+//!   world map.
 
-pub mod chunk;
+pub mod chunk_fast;
 pub mod error;
 pub mod export;
 pub mod map;

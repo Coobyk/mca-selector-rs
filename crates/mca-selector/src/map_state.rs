@@ -3,10 +3,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{App, Context, Entity, Task, Window};
-use mc_core::chunk::Chunk;
-use mc_core::map::{ChunkTile, render_tile};
-use mc_core::region::Region;
 use mc_core::world::World;
 
 /// Chunk coordinates.
@@ -38,27 +34,6 @@ impl RegionInfo {
 
     pub fn count(&self) -> u32 {
         self.present.iter().map(|w| w.count_ones()).sum()
-    }
-}
-
-/// Running region average, updated as chunk tiles arrive.
-#[derive(Default)]
-pub struct RegionSummary {
-    pub sum: [u64; 3],
-    pub count: u32,
-}
-
-impl RegionSummary {
-    pub fn avg(&self) -> Option<mc_core::map::colors::Rgba> {
-        if self.count == 0 {
-            return None;
-        }
-        Some([
-            (self.sum[0] / u64::from(self.count)) as u8,
-            (self.sum[1] / u64::from(self.count)) as u8,
-            (self.sum[2] / u64::from(self.count)) as u8,
-            255,
-        ])
     }
 }
 
@@ -127,24 +102,71 @@ pub struct PanDrag {
     pub start_pos: (f64, f64),
 }
 
+/// Bounded detail-image cache: the newest-inserted entries win.
+pub struct DetailCache {
+    pub map: HashMap<RegionCoord, (Arc<gpui::RenderImage>, u64)>,
+    clock: u64,
+    pub cap: usize,
+}
+
+impl DetailCache {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            clock: 0,
+            cap,
+        }
+    }
+
+    pub fn insert(&mut self, coord: RegionCoord, img: Arc<gpui::RenderImage>) {
+        self.clock += 1;
+        if self.map.len() >= self.cap && !self.map.contains_key(&coord) {
+            // Evict the oldest entry.
+            if let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, c))| *c)
+                .map(|(k, _)| *k)
+            {
+                self.map.remove(&oldest);
+            }
+        }
+        self.map.insert(coord, (img, self.clock));
+    }
+
+    pub fn get(&self, coord: &RegionCoord) -> Option<Arc<gpui::RenderImage>> {
+        self.map.get(coord).map(|(img, _)| img.clone())
+    }
+
+    pub fn contains(&self, coord: &RegionCoord) -> bool {
+        self.map.contains_key(coord)
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+}
+
 /// Everything the map screen shows.
 pub struct MapState {
     /// The opened world, or `None` while the landing screen asks for one.
     pub world: Option<World>,
     pub dimension: usize,
+    /// Generation counter, bumped whenever the dimension (or world) changes;
+    /// background results from older generations are dropped.
+    pub render_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Region info per dimension index (loaded lazily per dimension).
     pub regions: HashMap<RegionCoord, RegionInfo>,
-    pub region_summaries: HashMap<RegionCoord, RegionSummary>,
-    /// Composited 512x512 region images (1px per block), built in the
-    /// background once a region's chunks are rendered. Used for all
-    /// zoomed-out views so the canvas paints a handful of images instead of
-    /// thousands of chunk tiles.
-    pub region_images: HashMap<RegionCoord, Arc<gpui::RenderImage>>,
-    /// Regions whose compositing task is currently running.
+    /// Permanently cached 256x256 base image per region (2px per block).
+    pub region_base: HashMap<RegionCoord, Arc<gpui::RenderImage>>,
+    /// Full-resolution 512x512 images for regions on screen while zoomed
+    /// in, bounded by an LRU.
+    pub region_detail: DetailCache,
+    /// Regions whose rendering task is currently queued or running.
     pub building_regions: std::collections::HashSet<RegionCoord>,
+    /// Per-chunk tiles for the zoomed-in view, capped to bound memory.
     pub tiles: HashMap<ChunkCoord, Arc<TileEntry>>,
     pub pending: std::collections::HashSet<ChunkCoord>,
-    pub loading_regions: std::collections::HashSet<RegionCoord>,
     pub selection: std::collections::HashSet<ChunkCoord>,
     pub view: ViewState,
     pub select_drag: Option<SelectDrag>,
@@ -157,4 +179,9 @@ pub struct MapState {
     /// Set when regions were loaded and the view should fit them once the
     /// real viewport size is known.
     pub needs_fit: bool,
+    /// When the current dimension's region list was loaded (for the
+    /// full-world render timing log).
+    pub load_started: std::time::Instant,
+    /// Whether the full-render timing was already reported.
+    pub load_timed: bool,
 }

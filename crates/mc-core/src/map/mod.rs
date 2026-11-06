@@ -1,67 +1,56 @@
 //! Map pixel generation.
 //!
-//! [`tile`] renders one chunk into a 16x16 RGBA image in the style of
-//! Xaero's world map: the topmost block of each column is mapped to a color
-//! (see [`colors`]), water blends with depth, and columns are shaded by the
-//! height difference towards the south-east neighbor (light from the
-//! north-west).
+//! [`render_tile_rgba`] renders one chunk into a 16x16 RGBA image in the
+//! style of Xaero's world map: the topmost block of each column is mapped to
+//! a color (see [`colors`]), water blends with depth, and columns are
+//! shaded by the height difference towards the south-east neighbor (light
+//! from the north-west).
 
 pub mod colors;
+pub mod region;
 
-use crate::chunk::{Chunk, Heightmaps, PaletteEntry, SECTION_BLOCKS};
+use crate::chunk_fast::{FastChunk, FastSection};
+use crate::packed::{palette_bits, PackedBits, HEIGHTMAP_BITS};
 
 /// Side length of a chunk in blocks; also the tile resolution.
 pub const TILE_SIZE: usize = 16;
 
-/// A rendered chunk tile: block-resolution RGBA plus the flat average color
-/// used when zoomed out.
-#[derive(Debug, Clone)]
-pub struct ChunkTile {
-    pub rgba: Vec<u8>,
-    pub avg: colors::Rgba,
-    /// Minimum and maximum surface height, for the altitude legend.
-    pub min_height: i32,
+/// A rendered chunk tile: RGBA plus the flat average color used when zoomed
+/// out.
+pub struct TileOut {
+    pub rgba: [u8; 1024],
+    pub avg: [u8; 3],
     pub max_height: i32,
 }
 
-/// A rendered tile of a chunk that had no data (empty space in the region
-/// file). Painted fully transparent so the background shows through.
-pub fn empty_tile() -> ChunkTile {
-    ChunkTile {
-        rgba: vec![0; TILE_SIZE * TILE_SIZE * 4],
-        avg: [0, 0, 0, 0],
-        min_height: 0,
-        max_height: 0,
-    }
-}
+/// Render one chunk from the fast-parsed model. Returns `None` when the
+/// chunk has no heightmap (nothing to draw).
+pub fn render_tile_rgba(chunk: &FastChunk) -> Option<TileOut> {
+    let motion = chunk.motion_blocking.as_ref()?;
+    let ocean_floor = chunk.ocean_floor.as_ref();
 
-/// Render one chunk into a tile. Returns [`empty_tile`] when the chunk
-/// carries no block data.
-pub fn render_tile(chunk: &Chunk) -> ChunkTile {
-    // Heights of the first free y above the surface, per column.
-    let mut heights = [i32::MIN; TILE_SIZE * TILE_SIZE];
-    let mut ocean_floors = [i32::MIN; TILE_SIZE * TILE_SIZE];
-    if let Some(hm) = &chunk.heightmaps {
-        if let Some(motion) = hm.get("MOTION_BLOCKING") {
-            for z in 0..TILE_SIZE {
-                for x in 0..TILE_SIZE {
-                    heights[z * TILE_SIZE + x] = Heightmaps::height_at(motion, x, z);
-                }
-            }
-        }
-        if let Some(floor) = hm.get("OCEAN_FLOOR") {
-            for z in 0..TILE_SIZE {
-                for x in 0..TILE_SIZE {
-                    ocean_floors[z * TILE_SIZE + x] = Heightmaps::height_at(floor, x, z);
-                }
-            }
+    // Section lookup by Y index (-4..=19 for 1.18+ worlds).
+    let mut by_y: [Option<&FastSection>; 24] = Default::default();
+    for s in &chunk.sections {
+        let i = (s.y + 4) as usize;
+        if i < 24 {
+            by_y[i] = Some(s);
         }
     }
 
-    let mut rgba = vec![0u8; TILE_SIZE * TILE_SIZE * 4];
+    let mut heights = [0i32; TILE_SIZE * TILE_SIZE];
+    let mut floors = [0i32; TILE_SIZE * TILE_SIZE];
+    for z in 0..TILE_SIZE {
+        for x in 0..TILE_SIZE {
+            heights[z * TILE_SIZE + x] = height_at(motion, x, z);
+            floors[z * TILE_SIZE + x] = ocean_floor
+                .map(|f| height_at(f, x, z))
+                .unwrap_or(i32::MIN);
+        }
+    }
+
     let mut raw_colors = [[0u8; 3]; TILE_SIZE * TILE_SIZE];
     let mut filled = [false; TILE_SIZE * TILE_SIZE];
-    let mut min_height = i32::MAX;
     let mut max_height = i32::MIN;
     let mut any = false;
 
@@ -74,27 +63,25 @@ pub fn render_tile(chunk: &Chunk) -> ChunkTile {
             }
             any = true;
             filled[idx] = true;
-            min_height = min_height.min(top_y - 1);
             max_height = max_height.max(top_y - 1);
 
-            // The block just below the surface.
-            let top_block = block_at(chunk, x, top_y - 1, z);
+            let top_block = block_at(&by_y, x, top_y - 1, z);
             let mut color = match &top_block {
-                Some(p) => colors::block_color(short_name(p)),
+                Some(name) => colors::block_color(name),
                 None => colors::map_colors::STONE,
             };
 
             // Water columns: blend floor color with water by depth.
-            if is_water(&top_block) {
-                let floor_y = if ocean_floors[idx] != i32::MIN {
-                    ocean_floors[idx]
+            if top_block.map(|n| n == "water" || n == "bubble_column").unwrap_or(false) {
+                let floor_y = if floors[idx] != i32::MIN {
+                    floors[idx]
                 } else {
                     top_y - 6
                 };
                 let depth = (top_y - floor_y).clamp(0, 32);
-                let floor_block = block_at(chunk, x, floor_y - 1, z);
+                let floor_block = block_at(&by_y, x, floor_y - 1, z);
                 let floor_color = match &floor_block {
-                    Some(p) => colors::block_color(short_name(p)),
+                    Some(name) => colors::block_color(name),
                     None => colors::map_colors::DIRT,
                 };
                 color = blend_water(floor_color, depth);
@@ -104,11 +91,11 @@ pub fn render_tile(chunk: &Chunk) -> ChunkTile {
     }
 
     if !any {
-        return empty_tile();
+        return None;
     }
 
-    // Height shading: light from the north-west. A column that rises towards
-    // the south-east gets darker, one that falls gets brighter.
+    let mut rgba = [0u8; 1024];
+    let mut sum = [0u64; 3];
     for z in 0..TILE_SIZE {
         for x in 0..TILE_SIZE {
             let idx = z * TILE_SIZE + x;
@@ -116,9 +103,6 @@ pub fn render_tile(chunk: &Chunk) -> ChunkTile {
                 continue;
             }
             let h = heights[idx];
-            if h == i32::MIN {
-                continue;
-            }
             // Neighbor to the south-east; outside the chunk, reuse the own
             // height so chunk borders get no artificial seam.
             let h_se = heights
@@ -137,42 +121,30 @@ pub fn render_tile(chunk: &Chunk) -> ChunkTile {
             rgba[o + 1] = c[1];
             rgba[o + 2] = c[2];
             rgba[o + 3] = 255;
+            sum[0] += u64::from(raw_colors[idx][0]);
+            sum[1] += u64::from(raw_colors[idx][1]);
+            sum[2] += u64::from(raw_colors[idx][2]);
         }
     }
 
-    // Flat average color for the zoomed-out view.
-    let mut sum = [0u64; 3];
-    for c in &raw_colors {
-        sum[0] += u64::from(c[0]);
-        sum[1] += u64::from(c[1]);
-        sum[2] += u64::from(c[2]);
-    }
-    let n = (TILE_SIZE * TILE_SIZE) as u64;
-    let avg = [
-        (sum[0] / n) as u8,
-        (sum[1] / n) as u8,
-        (sum[2] / n) as u8,
-        255,
-    ];
-
-    ChunkTile {
+    Some(TileOut {
         rgba,
-        avg,
-        min_height,
+        avg: [(sum[0] / 256) as u8, (sum[1] / 256) as u8, (sum[2] / 256) as u8],
         max_height,
-    }
+    })
 }
+
+// The `filled` mask is set during the heightmap pass above and consumed by
+// the shading pass.
 
 /// Water color over a floor color; `depth` in blocks (0..=32). Shallow water
 /// stays close to the floor color, deep water approaches a solid dark blue.
 fn blend_water(floor: colors::Rgba, depth: i32) -> colors::Rgba {
     let water = colors::tints::WATER;
-    // Deep-blue target gets darker with depth.
     let t = (depth as f32 / 32.0).clamp(0.0, 1.0);
-    let alpha = 0.68 + 0.27 * t; // how much water covers the floor
+    let alpha = 0.68 + 0.27 * t;
     let mut out = [0u8; 4];
     for i in 0..3 {
-        // Water color darkens towards the deep-blue end.
         let w = water[i] as f32 * (1.0 - 0.35 * t);
         out[i] = (floor[i] as f32 * (1.0 - alpha) + w * alpha).round() as u8;
     }
@@ -180,25 +152,36 @@ fn blend_water(floor: colors::Rgba, depth: i32) -> colors::Rgba {
     out
 }
 
-fn short_name(entry: &PaletteEntry) -> &str {
-    entry.name().strip_prefix("minecraft:").unwrap_or(entry.name())
-}
-
-fn is_water(entry: &Option<PaletteEntry>) -> bool {
-    entry
-        .as_ref()
-        .is_some_and(|p| short_name(p) == "water" || short_name(p) == "bubble_column")
-}
-
-/// Block state of one position, found via the section that contains `y`.
-/// Returns `None` when the section is absent or has no block states.
-fn block_at(chunk: &Chunk, x: usize, y: i32, z: usize) -> Option<PaletteEntry> {
-    if x >= SECTION_BLOCKS || z >= SECTION_BLOCKS {
+/// Block name at one position, found via the section that contains `y`.
+fn block_at<'a>(
+    by_y: &'a [Option<&'a FastSection>; 24],
+    x: usize,
+    y: i32,
+    z: usize,
+) -> Option<&'a str> {
+    if x >= TILE_SIZE || z >= TILE_SIZE {
         return None;
     }
-    let section_y = i8::try_from(y.div_euclid(16)).ok()?;
-    let section = chunk.section(section_y)?;
-    let states = section.block_states.as_ref()?;
-    let index = Chunk::block_palette_index(section, x, y.rem_euclid(16) as usize, z);
-    states.palette.get(index as usize).cloned()
+    let sy = y.div_euclid(16) + 4;
+    if !(0..24).contains(&sy) {
+        return None;
+    }
+    let section = by_y[sy as usize]?;
+    let bits = palette_bits(section.names.len());
+    let index = match &section.data {
+        None => 0,
+        Some(data) => PackedBits::new(data, bits)
+            .get((y.rem_euclid(16) as usize * 16 + z) * 16 + x),
+    };
+    section.names.get(index as usize).map(|n| &**n)
+}
+
+/// Read height of the column `(x, z)` from a packed heightmap array.
+/// Heights are stored as `y - world_min_y` (`y + 64` in 1.18); this returns
+/// the plain world Y.
+fn height_at(map: &[i64], x: usize, z: usize) -> i32 {
+    debug_assert!(x < 16 && z < 16);
+    let bits = PackedBits::new(map, HEIGHTMAP_BITS);
+    let raw = bits.get(z * 16 + x);
+    raw as i32 - 64
 }

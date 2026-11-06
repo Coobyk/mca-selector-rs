@@ -10,6 +10,7 @@ mc-core = { path = "../mc-core" }
 gpui = "0.2.2"
 anyhow.workspace = true
 rayon.workspace = true
+async-channel = "2"
 image = "0.25"
 env_logger = "0.11"
 

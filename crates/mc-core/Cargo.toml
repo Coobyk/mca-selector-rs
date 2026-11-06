@@ -6,13 +6,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-fastnbt.workspace = true
-flate2.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
 memmap2.workspace = true
-serde.workspace = true
+libdeflater = "1"
+fastnbt.workspace = true
+flate2 = "1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [[example]]
 name = "scan"
@@ -23,8 +26,8 @@ name = "dbgchunk"
 [[example]]
 name = "render"
 
-[dev-dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
-
 [[example]]
 name = "export"
+
+[[example]]
+name = "bench"

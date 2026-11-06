@@ -28,11 +28,11 @@ pub enum Error {
     #[error("unsupported chunk compression type {0}")]
     UnknownCompression(u8),
 
+    #[error("failed to decompress chunk payload")]
+    Decompress,
+
     #[error("chunk payload length {length} out of bounds in {path}")]
     BadLength { length: u32, path: Box<Path> },
-
-    #[error("nbt error: {0}")]
-    Nbt(#[from] fastnbt::error::Error),
 
     #[error("region file name {0:?} does not match r.<x>.<z>.mca")]
     BadRegionName(String),

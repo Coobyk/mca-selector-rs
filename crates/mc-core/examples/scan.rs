@@ -1,17 +1,15 @@
-//! Scan a world and print per-dimension stats — the manual test for
-//! region/chunk parsing. Usage: `cargo run --example scan -- <world-dir> [dimension]`.
+//! Scan a world and print per-dimension stats, using the fast chunk parser.
+//! Usage: `cargo run --release --example scan -- <world-dir> [dimension]`.
 
 use std::time::Instant;
 
-use mc_core::chunk::Chunk;
+use mc_core::chunk_fast::parse_chunk;
 use mc_core::world::RegionBounds;
 
 /// Per-region summary, produced in parallel and folded at the end.
 #[derive(Default)]
 struct RegionSummary {
     chunks: u64,
-    errors: u64,
-    first_error: Option<String>,
     versions: std::collections::BTreeMap<i32, u64>,
     statuses: std::collections::BTreeMap<String, u64>,
     sample: Option<(i32, i32, String)>,
@@ -36,7 +34,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         let started = Instant::now();
-        let results = world.scan(dim, |region, (rx, rz)| {
+        let results = world.scan(dim, |region, _coords| {
             let mut summary = RegionSummary::default();
             for cz in 0..32u8 {
                 for cx in 0..32u8 {
@@ -46,34 +44,36 @@ fn main() -> anyhow::Result<()> {
                     let Ok(bytes) = region.chunk_data(cx, cz) else {
                         continue;
                     };
-                    let Ok(chunk) = Chunk::from_nbt(&bytes) else {
-                        summary.errors += 1;
-                        if summary.first_error.is_none() {
-                            summary.first_error =
-                                Some(format!("({cx},{cz}): {}", Chunk::debug_nbt_error(&bytes)));
-                        }
+                    let Some(chunk) = parse_chunk(&bytes) else {
                         continue;
                     };
                     summary.chunks += 1;
                     *summary.versions.entry(chunk.data_version).or_insert(0) += 1;
-                    *summary.statuses.entry(chunk.status.clone()).or_insert(0) += 1;
-                    if summary.sample.is_none() {
-                        let top = chunk.top_section().map(|s| {
-                            s.block_states
-                                .as_ref()
-                                .map(|b| b.palette[0].state_string())
-                                .unwrap_or_default()
-                        });
-                        summary.sample = Some((chunk.x_pos, chunk.z_pos, top.unwrap_or_default()));
-                    }                }
+                    summary.sample.get_or_insert_with(|| {
+                        let top = chunk
+                            .sections
+                            .iter()
+                            .max_by_key(|s| s.y)
+                            .and_then(|s| s.names.first().map(|n| n.to_string()));
+                        (chunk.x_pos, chunk.z_pos, top.unwrap_or_default())
+                    });
+                    // Status is not part of the fast parse; derive a rough
+                    // one from the presence of a heightmap.
+                    *summary
+                        .statuses
+                        .entry(if chunk.motion_blocking.is_some() {
+                            "has-heightmaps".to_string()
+                        } else {
+                            "no-heightmaps".to_string()
+                        })
+                        .or_insert(0) += 1;
+                }
             }
             Some(summary)
         })?;
 
         let mut regions = 0u32;
         let mut chunks = 0u64;
-        let mut errors = 0u64;
-        let mut first_error = None;
         let mut versions = std::collections::BTreeMap::new();
         let mut statuses = std::collections::BTreeMap::new();
         let mut coords = Vec::new();
@@ -85,8 +85,6 @@ fn main() -> anyhow::Result<()> {
             let summary = summary;
             regions += 1;
             chunks += summary.chunks;
-            errors += summary.errors;
-            first_error = first_error.or(summary.first_error);
             for (v, n) in summary.versions {
                 *versions.entry(v).or_insert(0) += n;
             }
@@ -111,10 +109,6 @@ fn main() -> anyhow::Result<()> {
             ))
         );
         println!("  scan took: {:?}", started.elapsed());
-        println!("  chunk errors: {errors}");
-        if let Some(e) = first_error {
-            println!("  first error: {e}");
-        }
         let top_versions: Vec<_> = versions.iter().rev().take(5).collect();
         println!("  data versions (newest 5): {top_versions:?}");
         println!("  statuses: {statuses:?}");
