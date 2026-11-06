@@ -33,6 +33,10 @@ fn color4(c: Rgba) -> gpui::Hsla {
 pub struct Workspace {
     pub map: MapState,
     /// Outstanding background tasks keep-alive.
+    /// Directory the export dialog starts from.
+    pub export_dir: String,
+    /// Open export dialog, if any.
+    pub export_dialog: Option<ExportDialog>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -63,6 +67,9 @@ impl Workspace {
                     show_region_grid: true,
                     needs_fit: false,
                 },
+                export_dir: std::env::var("MCA_EXPORT_DIR")
+                    .unwrap_or_else(|_| "/tmp/mca-selector-export".to_string()),
+                export_dialog: None,
                 _tasks: Vec::new(),
             };
             // Prefer the overworld as the initial dimension.
@@ -761,7 +768,22 @@ impl gpui::Render for Workspace {
             .border_b_1()
             .border_color(rgb(0x111214))
             .child(self.render_toolbar_button("Open"))
-            .child(self.render_toolbar_button("Export selection"))
+            .child(
+                div()
+                    .id("btn-export")
+                    .px_2()
+                    .py_1()
+                    .text_size(px(13.0))
+                    .text_color(rgb(TEXT))
+                    .rounded_sm()
+                    .hover(|s| s.bg(rgb(0x3A3C42)))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                        this.open_export_dialog();
+                        cx.notify();
+                    }))
+                    .child("Export selection"),
+            )
             .child(self.render_toolbar_button("Import chunks"))
             .child(div().w_2())
             .child(
@@ -890,7 +912,7 @@ impl gpui::Render for Workspace {
 
         let map = self.render_map(_window, cx);
 
-        div()
+        let mut root = div()
             .flex()
             .flex_col()
             .size_full()
@@ -899,6 +921,167 @@ impl gpui::Render for Workspace {
             .child(menu_bar)
             .child(toolbar)
             .child(map)
-            .child(status)
+            .child(status);
+
+        // Export modal, when open.
+        if let Some(dialog) = &self.export_dialog {
+            let path = dialog.path.clone();
+            let message = dialog.message.clone();
+            root = root.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .bg(gpui::rgba(0x00000066))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(520.0))
+                            .bg(rgb(CHROME_BG))
+                            .border_1()
+                            .border_color(rgb(0x4A4C52))
+                            .rounded_lg()
+                            .p_4()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xFFFFFF))
+                                    .child(format!(
+                                        "Export {} selected chunks",
+                                        self.map.selection.len()
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(TEXT))
+                                    .child(SharedString::from(format!(
+                                        "Destination folder: {path}"
+                                    ))),
+                            )
+                            .children(message.clone().map(|m| {
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(0x8FBC8F))
+                                    .child(SharedString::from(m))
+                            }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("dialog-cancel")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .text_size(px(13.0))
+                                            .text_color(rgb(TEXT))
+                                            .bg(rgb(0x3A3C42))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _ev, _window, cx| {
+                                                this.export_dialog = None;
+                                                cx.notify();
+                                            }))
+                                            .child("Cancel"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("dialog-export")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .text_size(px(13.0))
+                                            .text_color(rgb(0xFFFFFF))
+                                            .bg(rgb(ACCENT))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(
+                                                |this, _ev, _window, cx| {
+                                                    let path = this
+                                                        .export_dialog
+                                                        .as_ref()
+                                                        .map(|d| d.path.clone())
+                                                        .unwrap_or_default();
+                                                    this.run_export(path, cx);
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .child("Export"),
+                                    ),
+                            ),
+                    ),
+            );
+        }
+
+        root
+    }
+}
+
+/// Modal state for exporting the selection.
+#[derive(Clone)]
+pub struct ExportDialog {
+    pub path: String,
+    pub message: Option<String>,
+}
+
+impl Workspace {
+    pub fn open_export_dialog(&mut self) {
+        if self.map.selection.is_empty() {
+            // Nothing selected: surface via dialog message anyway.
+        }
+        self.export_dialog = Some(ExportDialog {
+            path: self.export_dir.clone(),
+            message: None,
+        });
+    }
+
+    pub fn run_export(&mut self, path: String, cx: &mut Context<Self>) {
+        self.export_dir = path.clone();
+        let selection: std::collections::BTreeSet<ChunkCoord> =
+            self.map.selection.iter().copied().collect();
+        if selection.is_empty() {
+            if let Some(d) = self.export_dialog.as_mut() {
+                d.message = Some("Nothing is selected.".into());
+            }
+            cx.notify();
+            return;
+        }
+        let world = self.map.world.clone();
+        let Some(dim) = self.map.world.dimensions.get(self.map.dimension).cloned() else {
+            return;
+        };
+        let io = cx.background_spawn(async move {
+            std::fs::create_dir_all(&path).ok();
+            mc_core::export::export_selection(&world, &dim, &selection, std::path::Path::new(&path))
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let result = io.await;
+            let _ = this.update(cx, |ws, cx| {
+                match result {
+                    Ok(stats) => {
+                        if let Some(d) = ws.export_dialog.as_mut() {
+                            d.message = Some(format!(
+                                "Exported {} chunks into {} region files at {}",
+                                stats.chunks, stats.regions, ws.export_dir
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(d) = ws.export_dialog.as_mut() {
+                            d.message = Some(format!("Export failed: {e}"));
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        });
+        self._tasks.push(task);
     }
 }

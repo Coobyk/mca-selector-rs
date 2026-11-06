@@ -25,3 +25,6 @@ name = "render"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[[example]]
+name = "export"

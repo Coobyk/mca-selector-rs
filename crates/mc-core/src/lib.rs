@@ -12,9 +12,11 @@
 
 pub mod chunk;
 pub mod error;
+pub mod export;
 pub mod map;
 pub mod packed;
 pub mod region;
+pub mod region_writer;
 pub mod world;
 
 pub use error::{Error, Result};
