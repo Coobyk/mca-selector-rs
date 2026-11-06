@@ -61,7 +61,7 @@ pub struct BlockStates {
 ///   properties as sibling string keys, e.g. `{"": "oak_stairs", facing: "east"}`.
 ///
 /// All are normalized into `name` + optional `properties`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PaletteEntry {
     pub name: String,
     pub properties: Option<std::collections::HashMap<String, String>>,
