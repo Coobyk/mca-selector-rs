@@ -19,7 +19,6 @@ use gpui::{
 };
 use rayon::prelude::*;
 use mc_core::chunk_fast::parse_chunk;
-use mc_core::map::colors::Rgba;
 use mc_core::region::Region;
 
 use crate::map_state::*;
@@ -36,7 +35,7 @@ const MAP_BG: u32 = 0x101014;
 const UNLOADED: u32 = 0x22252C;
 
 /// Convert an RGBA byte color into gpui's paint color.
-fn color4(c: Rgba) -> gpui::Hsla {
+fn color4(c: [u8; 4]) -> gpui::Hsla {
     let hex = u32::from_be_bytes(c);
     gpui::rgba(hex).into()
 }
@@ -479,59 +478,66 @@ impl Workspace {
                 let lx = coord.0.rem_euclid(32);
                 let lz = coord.1.rem_euclid(32);
                 let region = Region::open(&path).ok()?;
-                let bytes = region.chunk_data(lx as u8, lz as u8).ok()?;
-                let chunk = parse_chunk(&bytes)?;
-                let raw = mc_core::map::render_tile_raw(&chunk)?;
-                // Neighbor heightmaps from the same region file so shading
-                // crosses chunk borders seamlessly.
-                let neighbor = |nx: i32, nz: i32| -> Option<Vec<i64>> {
-                    if nx > 31 || nz > 31 {
+                let load = |nx: i32, nz: i32| -> Option<mc_core::chunk_fast::FastChunk> {
+                    if !(0..32).contains(&nx) || !(0..32).contains(&nz) {
                         return None;
                     }
                     region
                         .chunk_data(nx as u8, nz as u8)
                         .ok()
                         .and_then(|b| parse_chunk(&b))
-                        .and_then(|c| c.motion_blocking)
                 };
-                let east = neighbor(lx + 1, lz);
-                let south = neighbor(lx, lz + 1);
-                let se = neighbor(lx + 1, lz + 1);
-                let rgba = mc_core::map::shade_tile(&raw, &|dx, dz| {
-                    if dx < 16 && dz < 16 {
-                        let h = raw.heights[dz as usize * 16 + dx as usize];
-                        if h == i32::MIN {
-                            None
-                        } else {
-                            Some(h)
+                let center = load(lx, lz)?;
+                let north = load(lx, lz - 1);
+                let west = load(lx - 1, lz);
+                let nw = load(lx - 1, lz - 1);
+
+                // Grid covering the chunk plus its N/W/NW margin, so Xaero's
+                // slope (north/north-west) and biome-blending lookups work
+                // across the chunk borders.
+                let mut grid = mc_core::map::ColumnGrid::empty(48, 48);
+                for (gx, gz, chunk) in [
+                    (16i32, 16i32, Some(&center)),
+                    (16, 0, north.as_ref()),
+                    (0, 16, west.as_ref()),
+                    (0, 0, nw.as_ref()),
+                ]
+                .into_iter()
+                .filter_map(|(gx, gz, c)| c.map(|c| (gx, gz, c)))
+                {
+                    if let Some(cols) = mc_core::map::chunk_columns(chunk, &mut |n| {
+                        grid.biome_id(n)
+                    }) {
+                        for z in 0..16usize {
+                            for x in 0..16usize {
+                                let si = z * 16 + x;
+                                let di = (gz as usize + z) * 48 + gx as usize + x;
+                                grid.tint[di] = cols.tint[si];
+                                grid.water_depth[di] = cols.water_depth[si];
+                                grid.floor_height[di] = cols.floor_height[si];
+                                grid.biome[di] = cols.biome[si];
+                                grid.glowing[di] = cols.glowing[si];
+                            }
                         }
-                    } else if dx == 16 && dz < 16 {
-                        east
-                            .as_ref()
-                            .map(|m| mc_core::map::height_at(m, 0, dz as usize))
-                    } else if dz == 16 && dx < 16 {
-                        south
-                            .as_ref()
-                            .map(|m| mc_core::map::height_at(m, dx as usize, 0))
-                    } else {
-                        se.as_ref().map(|m| mc_core::map::height_at(m, 0, 0))
                     }
-                });
-                let img = image::RgbaImage::from_raw(16, 16, rgba.to_vec())?;
+                }
+                let full = mc_core::map::render_columns(&grid)?;
+                let mut rgba = Vec::with_capacity(16 * 16 * 4);
+                for z in 16..32usize {
+                    for x in 16..32usize {
+                        let si = (z * 48 + x) * 4;
+                        rgba.extend_from_slice(&full[si..si + 4]);
+                    }
+                }
+                let img = image::RgbaImage::from_raw(16, 16, rgba)?;
                 let render_image = gpui::RenderImage::new(vec![image::Frame::new(img)]);
                 Some(Arc::new(TileEntry {
                     image: Arc::new(render_image),
-                    avg: [raw.avg[0], raw.avg[1], raw.avg[2], 255],
-                    height: raw.max_height,
                 }))
             })()
-            .unwrap_or_else(|| {
-                Arc::new(TileEntry {
-                    image: Arc::new(empty_image()),
-                    avg: [0, 0, 0, 0],
-                    height: 0,
-                })
-            });
+            .unwrap_or_else(|| Arc::new(TileEntry {
+                image: Arc::new(empty_image()),
+            }));
             (coord, tile)
         });
         let task = cx.spawn(async move |this, cx| {

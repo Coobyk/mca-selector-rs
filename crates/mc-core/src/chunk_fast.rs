@@ -6,6 +6,8 @@
 
 use std::convert::TryInto;
 
+use crate::packed::PackedBits;
+
 /// A section's block palette (names only; properties don't affect map
 /// colors) and its packed block data.
 pub struct FastSection {
@@ -13,6 +15,38 @@ pub struct FastSection {
     /// Block names, `minecraft:` prefix stripped.
     pub names: Vec<Box<str>>,
     pub data: Option<Vec<i64>>,
+    /// Biome palette (4x4x4 cells per section), names with namespace.
+    pub biomes: Option<FastBiomes>,
+}
+
+/// Section biome storage: a palette of biome names plus the packed 4x4x4
+/// cell data (index `(y&15)>>2 * 16 + (z&15)>>2 * 4 + (x&15)>>2`).
+#[derive(Debug, Clone)]
+pub struct FastBiomes {
+    pub palette: Vec<Box<str>>,
+    pub data: Option<Vec<i64>>,
+}
+
+impl FastBiomes {
+    /// Biome name at block coordinates local to the section.
+    pub fn at(&self, x: usize, y: usize, z: usize) -> &str {
+        let cell = ((y & 15) >> 2) * 16 + ((z & 15) >> 2) * 4 + ((x & 15) >> 2);
+        match &self.data {
+            None => &self.palette[0],
+            Some(data) => {
+                let bits = self.bits();
+                let packed = PackedBits::new(data, bits);
+                let idx = packed.get(cell) as usize;
+                self.palette.get(idx).map(|s| &**s).unwrap_or("")
+            }
+        }
+    }
+
+    fn bits(&self) -> u32 {
+        // Vanilla biome palettes: ceil(log2(len)) with a 1-bit minimum.
+        let len = self.palette.len().max(2);
+        ((usize::BITS - (len - 1).leading_zeros()).max(1)).min(16)
+    }
 }
 
 /// The subset of a chunk NBT used for map rendering.
@@ -88,7 +122,7 @@ fn parse_chunk_slow(bytes: &[u8]) -> Option<FastChunk> {
                 Some(fastnbt::Value::LongArray(a)) => Some(a.clone().into_inner()),
                 _ => None,
             };
-            sections.push(FastSection { y, names, data });
+            sections.push(FastSection { y, names, data, biomes: None });
         }
     }
     let longs = |k: &str| match root.get("Heightmaps") {
@@ -207,6 +241,7 @@ fn parse_section(r: &mut R, chunk: &mut FastChunk) -> Option<()> {
     let mut y: i8 = 0;
     let mut names: Option<Vec<Box<str>>> = None;
     let mut data: Option<Vec<i64>> = None;
+    let mut biomes: Option<FastBiomes> = None;
     loop {
         let tag = r.u8()?;
         if tag == 0 {
@@ -218,6 +253,9 @@ fn parse_section(r: &mut R, chunk: &mut FastChunk) -> Option<()> {
             ("block_states", 10) => {
                 parse_block_states(r, &mut names, &mut data)?;
             }
+            ("biomes", 10) => {
+                biomes = Some(parse_biomes(r)?);
+            }
             _ => r.skip_payload(tag)?,
         }
     }
@@ -226,9 +264,45 @@ fn parse_section(r: &mut R, chunk: &mut FastChunk) -> Option<()> {
             y,
             names,
             data,
+            biomes,
         });
     }
     Some(())
+}
+
+/// Section biome storage parser: `{palette: [names], data: longs}`.
+fn parse_biomes(r: &mut R) -> Option<FastBiomes> {
+    let mut palette: Option<Vec<Box<str>>> = None;
+    let mut data: Option<Vec<i64>> = None;
+    loop {
+        let tag = r.u8()?;
+        if tag == 0 {
+            break;
+        }
+        let name = r.name()?;
+        match (name, tag) {
+            ("palette", 9) => {
+                let elem = r.u8()?;
+                let len = r.i32()?;
+                if len < 0 {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    out.push(Box::from(r.string()?.as_str()));
+                }
+                palette = Some(out);
+            }
+            ("data", 12) => {
+                data = Some(r.long_array()?);
+            }
+            _ => r.skip_payload(tag)?,
+        }
+    }
+    Some(FastBiomes {
+        palette: palette?,
+        data,
+    })
 }
 
 fn parse_block_states(

@@ -1,13 +1,13 @@
-//! Region-level rendering: parse and render every chunk of a region file in
-//! parallel (rayon) and composite the tiles into one image. Shading runs
-//! after all chunks are rendered, using cross-chunk height lookups, so
-//! terrain reads as one continuous surface.
+//! Region-level rendering: parse and render every chunk of a region file
+//! in parallel (rayon), assemble the region-wide column grid, and run the
+//! Xaero color math (which needs cross-chunk biome blending and neighbor
+//! heights) over it.
 
 use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::{render_tile_raw, shade_tile, TileRaw};
+use super::{chunk_columns, render_columns, ChunkColumns, ColumnGrid};
 use crate::region::Region;
 
 /// Side of the composited region image (one pixel per block).
@@ -23,16 +23,14 @@ pub struct RegionRender {
     /// Half-resolution base composite for the permanent cache.
     pub base256: Vec<u8>,
     pub chunk_count: u32,
-    pub sum: [u64; 3],
 }
 
-/// Render one region file. The heavy work (zlib + NBT + tile colors) runs
-/// on the rayon pool; this function blocks until the region is done, so it
-/// belongs on a background thread.
+/// Render one region file. The heavy work (zlib + NBT) runs on the rayon
+/// pool; this function blocks until the region is done, so it belongs on a
+/// background thread.
 pub fn render_region_file(path: &Path, coord: (i32, i32)) -> Option<RegionRender> {
     let region = Region::open(path).ok()?;
 
-    // Collect present chunk slots first so rayon can spread them.
     let mut slots: Vec<(i32, i32)> = Vec::new();
     for lz in 0..32i32 {
         for lx in 0..32i32 {
@@ -42,73 +40,57 @@ pub fn render_region_file(path: &Path, coord: (i32, i32)) -> Option<RegionRender
         }
     }
 
-    // Pass 1: unshaded colors + heights per chunk, in parallel.
-    let mut raws: Vec<Option<TileRaw>> = (0..32 * 32).map(|_| None).collect();
-    let rendered: Vec<(usize, TileRaw)> = slots
+    // Pass 1: per-chunk column data, in parallel.
+    let rendered: Vec<(usize, ChunkColumns, Vec<String>)> = slots
         .into_par_iter()
         .filter_map(|(lx, lz)| {
             let bytes = region.chunk_data(lx as u8, lz as u8).ok()?;
             let chunk = crate::chunk_fast::parse_chunk(&bytes)?;
-            let raw = render_tile_raw(&chunk)?;
-            Some((((lz as usize) * 32 + lx as usize), raw))
+            // Biome ids are localized per chunk here and remapped below.
+            let mut names: Vec<String> = Vec::new();
+            let mut id = |n: &str| -> u16 {
+                if let Some(i) = names.iter().position(|b| b == n) {
+                    return i as u16;
+                }
+                names.push(n.to_string());
+                (names.len() - 1) as u16
+            };
+            let cols = chunk_columns(&chunk, &mut id)?;
+            Some(((lz as usize) * 32 + lx as usize, cols, names))
         })
         .collect();
-    for (slot, raw) in rendered {
-        raws[slot] = Some(raw);
+
+    if rendered.is_empty() {
+        return None;
     }
 
-    // Cross-chunk height lookup over the whole 512x512 region area. Columns
-    // outside the region resolve to None, which falls back to the column's
-    // own height; the drawn region border covers that seam.
-    let height_at_region = |gx: i32, gz: i32| -> Option<i32> {
-        if !(0..512).contains(&gx) || !(0..512).contains(&gz) {
-            return None;
-        }
-        let raw = raws[((gz / 16) * 32 + gx / 16) as usize].as_ref()?;
-        let h = raw.heights[((gz % 16) * 16 + gx % 16) as usize];
-        if h == i32::MIN {
-            None
-        } else {
-            Some(h)
-        }
-    };
-
-    // Pass 2: shade with neighbor heights and composite.
-    let mut img512 = vec![0u8; REGION_IMG * REGION_IMG * 4];
-    let mut sum = [0u64; 3];
-    let mut count = 0u32;
-    for z in 0..REGION_IMG {
-        for x in 0..REGION_IMG {
-            let o = (z * REGION_IMG + x) * 4;
-            img512[o] = 0x22;
-            img512[o + 1] = 0x25;
-            img512[o + 2] = 0x2c;
-            img512[o + 3] = 0xff;
-        }
-    }
-    for lz in 0..32i32 {
-        for lx in 0..32i32 {
-            let Some(raw) = raws[(lz * 32 + lx) as usize].as_ref() else {
-                continue;
-            };
-            let rgba = shade_tile(raw, &|dx, dz| {
-                height_at_region(lx * 16 + dx, lz * 16 + dz)
-            });
-            let ox = (lx * 16) as usize;
-            let oz = (lz * 16) as usize;
-            for py in 0..16usize {
-                for px in 0..16usize {
-                    let si = (py * 16 + px) * 4;
-                    let di = ((oz + py) * REGION_IMG + ox + px) * 4;
-                    img512[di..di + 4].copy_from_slice(&rgba[si..si + 4]);
+    // Assemble the region-wide column grid with a shared biome table.
+    let mut grid = ColumnGrid::empty(REGION_IMG, REGION_IMG);
+    for (slot, cols, names) in &rendered {
+        let lx = (*slot % 32) as usize;
+        let lz = (*slot / 32) as usize;
+        let ox = lx * 16;
+        let oz = lz * 16;
+        for z in 0..16usize {
+            for x in 0..16usize {
+                let si = z * 16 + x;
+                let di = (oz + z) * REGION_IMG + ox + x;
+                if names.is_empty() {
+                    continue;
                 }
+                let biome_name = &names[cols.biome[si] as usize];
+                let gid = grid.biome_id(biome_name);
+                grid.base[di] = cols.base[si];
+                grid.tint[di] = cols.tint[si];
+                grid.water_depth[di] = cols.water_depth[si];
+                grid.floor_height[di] = cols.floor_height[si];
+                grid.biome[di] = gid;
+                grid.glowing[di] = cols.glowing[si];
             }
-            sum[0] += u64::from(raw.avg[0]);
-            sum[1] += u64::from(raw.avg[1]);
-            sum[2] += u64::from(raw.avg[2]);
-            count += 1;
         }
     }
+
+    let img512 = render_columns(&grid)?;
 
     // Box-filter downscale 512 -> 256 (2x2 average).
     let mut base256 = vec![0u8; BASE_IMG * BASE_IMG * 4];
@@ -134,7 +116,6 @@ pub fn render_region_file(path: &Path, coord: (i32, i32)) -> Option<RegionRender
         coord,
         img512,
         base256,
-        chunk_count: count,
-        sum,
+        chunk_count: rendered.len() as u32,
     })
 }

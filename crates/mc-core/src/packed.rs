@@ -17,6 +17,7 @@ impl<'a> PackedBits<'a> {
     /// (`bits <= 32`).
     pub fn new(data: &'a [i64], bits: u32) -> Self {
         debug_assert!((1..=32).contains(&bits));
+        let bits = bits.clamp(1, 32);
         let per_long = 64 / bits;
         Self {
             data,

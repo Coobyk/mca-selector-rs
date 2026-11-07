@@ -15,8 +15,6 @@ pub const REGION_CHUNKS: i32 = 32;
 /// A rendered chunk tile plus its flat average color, ready to paint.
 pub struct TileEntry {
     pub image: Arc<gpui::RenderImage>,
-    pub avg: mc_core::map::colors::Rgba,
-    pub height: i32,
 }
 
 /// Which chunks exist in a region file, from its (cheap) sector table.
