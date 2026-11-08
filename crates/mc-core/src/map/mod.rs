@@ -163,8 +163,14 @@ pub fn chunk_columns(
                 if y < min_y {
                     break;
                 }
+                // A missing section or palette is air, not a wall: keep
+                // walking down instead of giving up on the column.
                 let Some(name) = block_name(y) else {
-                    break;
+                    if y == 0 {
+                        break;
+                    }
+                    y -= 1;
+                    continue;
                 };
                 if is_water && y >= floor_y {
                     // Water between the surface and the floor: skipped so
@@ -193,7 +199,8 @@ pub fn chunk_columns(
                             let mut y2 = y - 1;
                             while y2 > min_y && y2 > 0 {
                                 let Some(n2) = block_name(y2) else {
-                                    break;
+                                    y2 -= 1;
+                                    continue;
                                 };
                                 if colors::is_invisible(n2) {
                                     y2 -= 1;

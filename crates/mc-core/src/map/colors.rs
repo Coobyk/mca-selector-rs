@@ -83,6 +83,10 @@ pub fn block_paint(name: &str) -> Option<Paint> {
         .binary_search_by(|(n, ..)| (*n).cmp(name))
     {
         let (_, rgba, flag) = xaero_colors::XAERO_ACCURATE[i];
+        // Fully transparent entries (air variants) paint nothing.
+        if rgba & 0xFF == 0 {
+            return None;
+        }
         let tint = match flag >> 8 {
             1 => TintKind::Grass,
             2 => TintKind::Foliage,
