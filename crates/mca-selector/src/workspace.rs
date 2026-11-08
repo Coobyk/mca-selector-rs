@@ -1111,7 +1111,7 @@ fn next_pow2_scale(chunk_px: f64) -> u32 {
     ((chunk_px / 16.0).ceil() as usize)
         .max(1)
         .next_power_of_two()
-        .clamp(1, 8) as u32
+        .clamp(1, 16) as u32
 }
 
 /// Nearest-neighbor `factor`x upscale of a 16x16 tile image, cached per

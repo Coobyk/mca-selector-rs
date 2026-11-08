@@ -151,10 +151,13 @@ pub fn chunk_columns(
                 cols.water_depth[idx] = (surface_y - floor_y).max(1);
             }
 
-            // Walk down from the surface to the first visible block with a
-            // map color. Water blocks above the floor are skipped (they are
-            // drawn as the overlay), as are Xaero's invisible blocks.
-            let mut y = surface_y - 1;
+            // Walk down from just above the surface to the first visible
+            // block with a map color. Starting at `surface_y` catches
+            // overlay blocks the heightmap does not count (snow layers
+            // and similar); air simply falls through. Water blocks above
+            // the floor are skipped (they are drawn as the overlay), as
+            // are Xaero's invisible blocks.
+            let mut y = surface_y;
             let min_y = (surface_y - 64).max(0);
             loop {
                 if y < min_y {
