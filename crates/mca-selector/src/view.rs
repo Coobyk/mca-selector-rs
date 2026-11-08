@@ -830,6 +830,12 @@ impl Render for MainView {
                 v.update_needed = true;
                 cx.notify();
             }))
+            .on_action(cx.listener(|v, _: &DeleteChunksAction, _w, cx| v.delete_chunks(cx)))
+            .on_action(cx.listener(|v, _: &DefragmentAction, _w, cx| v.defragment(cx)))
+            .on_action(cx.listener(|v, _: &ExportChunksAction, _w, cx| v.export_chunks(cx)))
+            .on_action(cx.listener(|v, _: &CopyChunksAction, _w, cx| v.copy_chunks(cx)))
+            .on_action(cx.listener(|v, _: &PasteChunksAction, _w, cx| v.paste_chunks(cx)))
+            .on_action(cx.listener(|v, _: &ExportImageAction, w, cx| v.export_image(w, cx)))
             .on_action(cx.listener(|v, _: &AboutAction, _w, cx| {
                 v.dialog = Some(Dialog::About);
                 cx.notify();
@@ -956,6 +962,199 @@ impl MainView {
         .detach();
     }
 
+
+    // -- chunk operations -------------------------------------------------------
+
+    fn delete_chunks(&mut self, cx: &mut Context<Self>) {
+        let sel = self.map.selection.clone();
+        if sel.is_empty() { return; }
+        self.dialog = Some(Dialog::Confirm {
+            msg: "Delete selected chunks?".into(),
+            action: Box::new(move |v, _w, cx| {
+                let sel = sel.clone();
+                let tx = v.map.result_tx.clone();
+                mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+                    mc_core::jobs::PRIORITY_LOW, None,
+                    move || {
+                        for (&region_l, chunks) in &sel.selection {
+                            let region = mc_core::point::Point2i::from_long(region_l);
+                            let dirs = crate::config::world().and_then(|w| w.dirs.region.clone());
+                            let Some(dir) = dirs else { continue };
+                            let path = dir.join(mc_core::files::mca_file_name(region));
+                            if !path.exists() { continue; }
+                            let Ok(mut m) = mc_core::mca::McaFile::new(path.clone()) else { continue };
+                            if m.load(false).is_err() { continue; }
+                            match chunks {
+                                None => {
+                                    let _ = std::fs::remove_file(&path);
+                                }
+                                Some(cs) => {
+                                    m.delete_chunks(cs);
+                                    let _ = m.save_with_temp_file(&path);
+                                }
+                            }
+                            let _ = tx.send(crate::tilemap::TileResult::Image {
+                                region, image: None, zoom: 0, structures: None, cache_write: false,
+                            });
+                        }
+                    }));
+                v.dialog = None;
+                cx.notify();
+            }),
+        });
+        cx.notify();
+    }
+
+    fn defragment(&mut self, cx: &mut Context<Self>) {
+        let sel = self.map.selection.clone();
+        if sel.is_empty() { return; }
+        self.dialog = Some(Dialog::Confirm {
+            msg: "Defragment selected regions?".into(),
+            action: Box::new(move |v, _w, cx| {
+                let tx = v.map.result_tx.clone();
+                mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+                    mc_core::jobs::PRIORITY_LOW, None,
+                    move || {
+                        for &region_l in sel.selection.keys() {
+                            let region = mc_core::point::Point2i::from_long(region_l);
+                            let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
+                            let path = dir.join(mc_core::files::mca_file_name(region));
+                            if !path.exists() { continue; }
+                            if let Ok(mut m) = mc_core::mca::McaFile::new(path.clone()) {
+                                if m.load_offsets().is_ok() {
+                                    let _ = m.defragment(&path);
+                                }
+                            }
+                            let _ = tx.send(crate::tilemap::TileResult::Image {
+                                region, image: None, zoom: 0, structures: None, cache_write: false,
+                            });
+                        }
+                    }));
+                v.dialog = None;
+                cx.notify();
+            }),
+        });
+        cx.notify();
+    }
+
+    fn export_chunks(&mut self, cx: &mut Context<Self>) {
+        let sel = self.map.selection.clone();
+        if sel.is_empty() { return; }
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false, directories: true, multiple: false,
+            prompt: Some("Select world directory to export to".into()),
+        });
+        cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(dir) = paths.into_iter().next() {
+                    let region_dir = dir.join("region");
+                    let _ = std::fs::create_dir_all(&region_dir);
+                    mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+                        mc_core::jobs::PRIORITY_LOW, None,
+                        move || {
+                            for (&region_l, chunks) in &sel.selection {
+                                let region = mc_core::point::Point2i::from_long(region_l);
+                                let Some(src_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
+                                let src = src_dir.join(mc_core::files::mca_file_name(region));
+                                let dst = region_dir.join(mc_core::files::mca_file_name(region));
+                                if !src.exists() { continue; }
+                                match chunks {
+                                    None => { let _ = std::fs::copy(&src, &dst); }
+                                    Some(cs) => {
+                                        let mut m = match mc_core::mca::McaFile::new(src) { Ok(m) => m, Err(_) => continue };
+                                        if m.load(false).is_err() { continue; }
+                                        // keep only selected chunks
+                                        let mut keep = mc_core::selection::ChunkSet::new();
+                                        for i in 0..1024 { if !cs.get(i) { keep.set(i); } }
+                                        m.delete_chunks(&keep);
+                                        let _ = m.save_with_temp_file(&dst);
+                                    }
+                                }
+                            }
+                        }));
+                }
+            }
+        }).detach();
+    }
+
+    fn copy_chunks(&mut self, cx: &mut Context<Self>) {
+        // upstream copies selected chunks into cache-dir clipboard world
+        let sel = self.map.selection.clone();
+        if sel.is_empty() { return; }
+        let clip = mc_core::files::base_cache_dir().join("clipboard").join("region");
+        let _ = std::fs::remove_dir_all(&clip);
+        let _ = std::fs::create_dir_all(&clip);
+        let origin = sel.selection.keys().next().copied();
+        let Some(origin_l) = origin else { return };
+        let origin = mc_core::point::Point2i::from_long(origin_l);
+        for (&region_l, chunks) in &sel.selection {
+            let region = mc_core::point::Point2i::from_long(region_l);
+            let Some(src_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
+            let src = src_dir.join(mc_core::files::mca_file_name(region));
+            let dst = clip.join(mc_core::files::mca_file_name(region));
+            if !src.exists() { continue; }
+            match chunks {
+                None => { let _ = std::fs::copy(&src, &dst); }
+                Some(cs) => {
+                    let mut m = match mc_core::mca::McaFile::new(src) { Ok(m) => m, Err(_) => continue };
+                    if m.load(false).is_err() { continue; }
+                    let mut keep = mc_core::selection::ChunkSet::new();
+                    for i in 0..1024 { if !cs.get(i) { keep.set(i); } }
+                    m.delete_chunks(&keep);
+                    let _ = m.save_with_temp_file(&dst);
+                }
+            }
+        }
+        // record origin for offset paste
+        let _ = std::fs::write(clip.join("../origin.txt"), format!("{},{}", origin.x, origin.z));
+        cx.notify();
+    }
+
+    fn paste_chunks(&mut self, cx: &mut Context<Self>) {
+        let clip = mc_core::files::base_cache_dir().join("clipboard").join("region");
+        if !clip.is_dir() { return; }
+        let tx = self.map.result_tx.clone();
+        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+            mc_core::jobs::PRIORITY_LOW, None,
+            move || {
+                let Ok(rd) = std::fs::read_dir(&clip) else { return };
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let Some(region) = mc_core::files::parse_mca_file_name(&name) else { continue };
+                    let dst_dir = match crate::config::world().and_then(|w| w.dirs.region.clone()) {
+                        Some(d) => d,
+                        None => return,
+                    };
+                    let dst = dst_dir.join(&name);
+                    let Ok(mut src) = mc_core::mca::McaFile::new(e.path()) else { continue };
+                    let mut dst_file = if dst.exists() {
+                        mc_core::mca::McaFile::new(dst.clone()).ok()
+                    } else {
+                        Some(mc_core::mca::McaFile::empty(region, dst.clone()))
+                    };
+                    if src.load(false).is_err() { continue; }
+                    if let Some(d) = dst_file.as_mut() {
+                        if dst.exists() && d.load(false).is_err() { continue; }
+                        for (i, c) in src.chunks.iter().enumerate() {
+                            if c.is_some() {
+                                d.chunks[i] = c.clone();
+                                if let Some(cc) = &mut d.chunks[i] {
+                                    cc.timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|t| t.as_secs() as i32).unwrap_or(0);
+                                }
+                            }
+                        }
+                        let _ = d.save_with_temp_file(&dst);
+                    }
+                    let _ = tx.send(crate::tilemap::TileResult::Image {
+                        region, image: None, zoom: 0, structures: None, cache_write: false,
+                    });
+                }
+            }));
+        cx.notify();
+    }
+
     fn export_image(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let sel = self.map.selection.clone();
         if sel.is_empty() {
@@ -967,13 +1166,64 @@ impl MainView {
             &PathBuf::from(std::env::var("HOME").unwrap_or_default()),
             Some("selection.png"),
         );
-        cx.spawn(async move |_this, _cx| {
+        let tx = self.map.result_tx.clone();
+        let _ = tx;
+        cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
             if let Ok(Ok(Some(path))) = rx.await {
-                let _ = path;
-                let _ = sel;
+                // compute bounds
+                let mut minx = i32::MAX; let mut minz = i32::MAX;
+                let mut maxx = i32::MIN; let mut maxz = i32::MIN;
+                for &region_l in sel.selection.keys() {
+                    let r = mc_core::point::Point2i::from_long(region_l);
+                    minx = minx.min(r.x); minz = minz.min(r.z);
+                    maxx = maxx.max(r.x); maxz = maxz.max(r.z);
+                }
+                let w = (maxx - minx + 1) as usize * 512;
+                let h = (maxz - minz + 1) as usize * 512;
+                let cfg = crate::config::world().map(|w| {
+                    mc_core::render::RenderSettings {
+                        render_height: w.cfg.render_height,
+                        layer_only: w.cfg.render_layer_only,
+                        caves: w.cfg.render_caves,
+                        shade: w.cfg.shade,
+                        shade_water: w.cfg.shade_water,
+                        shade_altitude: w.cfg.shade_altitude,
+                    }
+                }).unwrap_or_default();
+                let sel2 = sel.clone();
+                mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+                    mc_core::jobs::PRIORITY_LOW, None,
+                    move || {
+                        let mut px = vec![0u32; w * h];
+                        let corrupted = [0u32; 256];
+                        for &region_l in sel2.selection.keys() {
+                            let region = mc_core::point::Point2i::from_long(region_l);
+                            let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
+                            let p = dir.join(mc_core::files::mca_file_name(region));
+                            if !p.exists() { continue; }
+                            let Ok(mut m) = mc_core::mca::McaFile::new(p) else { continue };
+                            if m.load(true).is_err() { continue; }
+                            if let Some(img) = mc_core::render::generate_image(&m, 1, &cfg, &corrupted) {
+                                let ox = ((region.x - minx) * 512) as usize;
+                                let oz = ((region.z - minz) * 512) as usize;
+                                for z in 0..512usize {
+                                    for x in 0..512usize {
+                                        px[(oz + z) * w + ox + x] = img[z * 512 + x];
+                                    }
+                                }
+                            }
+                        }
+                        let mut rgba = Vec::with_capacity(px.len() * 4);
+                        for &p in px.iter() {
+                            rgba.push((p >> 16) as u8);
+                            rgba.push((p >> 8) as u8);
+                            rgba.push(p as u8);
+                            rgba.push((p >> 24) as u8);
+                        }
+                        let _ = image::save_buffer(&path, &rgba, w as u32, h as u32, image::ColorType::Rgba8);
+                    }));
             }
-        })
-        .detach();
+        }).detach();
     }
 
     fn render_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
