@@ -3,6 +3,14 @@
 Minecraft 26.3 jar: block -> vanilla map color, biome -> grass/foliage/water
 tints, and the block tint-kind list (mirrors vanilla BlockColors.createDefault)."""
 
+# NOTE: the Blocks.java regex below only sees explicit `mapColor(MapColor.*)`
+# calls; every block registered with `ofLegacyCopy`/`mapColor(Block)` (all
+# stairs, slabs, logs, fences, ...) is missed, and item ids leak in as false
+# positives. The checked-in BLOCK_MAP_COLORS was therefore regenerated from a
+# per-state `getMapColor().col` export (facts.json + gameplay-facts.json of a
+# prepared Horizon 26.3 client), which resolves those derivations. Regenerating
+# from Blocks.java alone will reintroduce ~600 missing entries.
+
 import json
 import os
 import re

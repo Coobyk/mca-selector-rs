@@ -75,10 +75,12 @@ pub fn render_region_file(path: &Path, coord: (i32, i32)) -> Option<RegionRender
             for x in 0..16usize {
                 let si = z * 16 + x;
                 let di = (oz + z) * REGION_IMG + ox + x;
-                if names.is_empty() {
-                    continue;
-                }
-                let biome_name = &names[cols.biome[si] as usize];
+                // Chunks without any biome data (partially generated)
+                // still render; their tint falls back to the defaults.
+                let biome_name = names
+                    .get(cols.biome[si] as usize)
+                    .map(|s| s.as_str())
+                    .unwrap_or("plains");
                 let gid = grid.biome_id(biome_name);
                 grid.base[di] = cols.base[si];
                 grid.tint[di] = cols.tint[si];

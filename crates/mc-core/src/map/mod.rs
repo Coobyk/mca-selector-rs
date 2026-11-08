@@ -179,16 +179,26 @@ pub fn chunk_columns(
                     y -= 1;
                     continue;
                 }
-                if let Some(color) = colors::block_map_color(name) {
-                    cols.base[idx] = [
-                        ((color >> 16) & 0xFF) as u8,
-                        ((color >> 8) & 0xFF) as u8,
-                        (color & 0xFF) as u8,
-                    ];
-                    cols.tint[idx] = colors::tint_kind_of(name);
-                    cols.glowing[idx] = colors::is_glowing(name);
+                match colors::block_map_color(name) {
+                    Some(color) => {
+                        cols.base[idx] = [
+                            ((color >> 16) & 0xFF) as u8,
+                            ((color >> 8) & 0xFF) as u8,
+                            (color & 0xFF) as u8,
+                        ];
+                        cols.tint[idx] = colors::tint_kind_of(name);
+                        cols.glowing[idx] = colors::is_glowing(name);
+                        break;
+                    }
+                    // No map color (MapColor.NONE): invisible, keep going
+                    // down to the first colored block.
+                    None => {
+                        if y == 0 {
+                            break;
+                        }
+                        y -= 1;
+                    }
                 }
-                break;
             }
         }
     }
@@ -348,7 +358,8 @@ pub fn render_columns(grid: &ColumnGrid) -> Option<Vec<u8>> {
             if depth > 0 {
                 let wcolor_i = {
                     // Water tint of this column's biome (blended).
-                    let [wr, wg, wb] = tints[i];
+                    let [wr, wg, wb] =
+                        blended_tint(grid, x as i32, z as i32, TintKind::Water);
                     // The water overlay's own map color, tinted by the
                     // biome water color.
                     let wc = colors::block_map_color("water").unwrap_or(0x4040FF);

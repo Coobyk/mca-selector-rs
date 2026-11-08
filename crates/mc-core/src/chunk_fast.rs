@@ -289,7 +289,7 @@ fn parse_biomes(r: &mut R) -> Option<FastBiomes> {
                 }
                 let mut out = Vec::with_capacity(len as usize);
                 for _ in 0..len {
-                    out.push(Box::from(r.string()?.as_str()));
+                    out.push(Box::from(strip_prefix(r.string()?.as_str())));
                 }
                 palette = Some(out);
             }
