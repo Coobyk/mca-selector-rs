@@ -1,6 +1,6 @@
 [package]
 name = "mc-core"
-description = "Minecraft Anvil region parsing and map rendering core for mca-selector-rs"
+description = "Faithful Rust port of the MCA Selector core: NBT, Anvil IO, versioned chunk rendering, selection and tile caches"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,29 +9,15 @@ license.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
-memmap2.workspace = true
-libdeflater = "1"
-fastnbt.workspace = true
-flate2 = "1"
+serde.workspace = true
+serde_json.workspace = true
+flate2.workspace = true
+lz4_flex.workspace = true
+image.workspace = true
+base64.workspace = true
+md-5.workspace = true
+parking_lot.workspace = true
+indexmap.workspace = true
 
 [dev-dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
-
-[[example]]
-name = "scan"
-
-[[example]]
-name = "dbgchunk"
-
-[[example]]
-name = "render"
-
-[[example]]
-name = "export"
-
-[[example]]
-name = "bench"
-
-[[example]]
-name = "stagetime"
-
+image.workspace = true

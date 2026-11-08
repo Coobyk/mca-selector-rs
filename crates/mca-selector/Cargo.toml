@@ -1,6 +1,6 @@
 [package]
 name = "mca-selector"
-description = "Minecraft region/chunk map editor UI (mca-selector-rs)"
+description = "A faithful Rust + GPUI port of MCA Selector"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,10 +9,12 @@ license.workspace = true
 mc-core = { path = "../mc-core" }
 gpui = "0.2.2"
 anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
 rayon.workspace = true
-async-channel = "2"
-image = "0.25"
 env_logger = "0.11"
+parking_lot.workspace = true
 
 [[bin]]
 name = "mca-selector"
