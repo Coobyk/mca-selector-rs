@@ -227,10 +227,12 @@ pub fn chunk_columns(
                         {
                             rgb = [0x55, 0x37, 0x1E];
                         }
-                        if p.alpha < 255 {
-                            // Translucent top (leaves, water over non-water):
-                            // blend over the first opaque painted block
-                            // directly below it, like Xaero composites.
+                        // Translucent tops are only blended for tinted
+                        // layers (leaves, water); flag-0 blocks (flowers,
+                        // crops, glass) paint opaque — their texture-alpha
+                        // is meant for compositing onto terrain, and
+                        // blending would fade them into the ground.
+                        if p.alpha < 255 && !matches!(p.tint, TintKind::None) {
                             let mut y2 = y - 1;
                             while y2 > min_y && y2 > 0 {
                                 let Some((sec2, lut2, pi2)) = entry_at(y2) else {
