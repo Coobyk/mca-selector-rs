@@ -414,7 +414,7 @@ impl Workspace {
             .unwrap_or(self.map.view.center);
 
         if chunk_px >= 32.0 {
-            const MAX_PENDING: usize = 512;
+            const MAX_PENDING: usize = 256;
             if self.map.pending.len() >= MAX_PENDING {
                 return;
             }
@@ -456,8 +456,13 @@ impl Workspace {
                     .or_default()
                     .push(coord);
             }
+            // Batches stay small so a moving cursor redirects the render
+            // within one batch's lifetime instead of waiting for a whole
+            // region queued under a stale focus point.
             for ((rx, rz), coords) in by_region {
-                self.spawn_region_tile_task(rx, rz, coords, cx);
+                for batch in coords.chunks(96) {
+                    self.spawn_region_tile_task(rx, rz, batch.to_vec(), cx);
+                }
             }
             // Bound the zoom-in cache by dropping tiles outside the
             // visible range rather than wiping everything.
