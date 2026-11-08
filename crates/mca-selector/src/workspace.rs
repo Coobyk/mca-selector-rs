@@ -404,49 +404,73 @@ impl Workspace {
         let (min_rx, max_rx, min_rz, max_rz) = self.visible_regions();
         let gen = self.map.render_gen.load(Ordering::Relaxed);
 
+        // Focus point for render priority: the cursor when it hovers the
+        // map, else the viewport center.
+        let vp = self.map.viewport;
+        let focus = self
+            .map
+            .mouse
+            .map(|m| self.map.view.screen_to_block(m, vp))
+            .unwrap_or(self.map.view.center);
+
         if chunk_px >= 32.0 {
             const MAX_PENDING: usize = 512;
             if self.map.pending.len() >= MAX_PENDING {
                 return;
             }
+            // Only the chunks intersecting the viewport (+1 margin) are
+            // queued, in one batched task per region.
+            let tl = self.map.view.screen_to_block((0.0, 0.0), vp);
+            let br = self.map.view.screen_to_block((vp.0, vp.1), vp);
+            let min_cx = (tl.0.floor() as i32).div_euclid(16) - 1;
+            let max_cx = (br.0.floor() as i32).div_euclid(16) + 1;
+            let min_cz = (tl.1.floor() as i32).div_euclid(16) - 1;
+            let max_cz = (br.1.floor() as i32).div_euclid(16) + 1;
             let mut missing: Vec<(ChunkCoord, f64)> = Vec::new();
-            for rz in min_rz..=max_rz {
-                for rx in min_rx..=max_rx {
+            for czw in min_cz..=max_cz {
+                for cxw in min_cx..=max_cx {
+                    let (rx, rz) = (cxw.div_euclid(32), czw.div_euclid(32));
                     let Some(info) = self.map.regions.get(&(rx, rz)) else {
                         continue;
                     };
-                    for lz in 0..32i32 {
-                        for lx in 0..32i32 {
-                            if !info.has(lx, lz) {
-                                continue;
-                            }
-                            let coord = (rx * 32 + lx, rz * 32 + lz);
-                            if self.map.tiles.contains_key(&coord)
-                                || self.map.pending.contains(&coord)
-                            {
-                                continue;
-                            }
-                            let dx = (coord.0 * 16 + 8) as f64 - self.map.view.center.0;
-                            let dz = (coord.1 * 16 + 8) as f64 - self.map.view.center.1;
-                            missing.push((coord, dx * dx + dz * dz));
-                        }
+                    if !info.has(cxw.rem_euclid(32), czw.rem_euclid(32)) {
+                        continue;
                     }
+                    let coord = (cxw, czw);
+                    if self.map.tiles.contains_key(&coord)
+                        || self.map.pending.contains(&coord)
+                    {
+                        continue;
+                    }
+                    let dx = (cxw * 16 + 8) as f64 - focus.0;
+                    let dz = (czw * 16 + 8) as f64 - focus.1;
+                    missing.push((coord, dx * dx + dz * dz));
                 }
             }
             missing.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             let budget = MAX_PENDING - self.map.pending.len();
+            let mut by_region: HashMap<(i32, i32), Vec<ChunkCoord>> = HashMap::new();
             for (coord, _) in missing.into_iter().take(budget) {
-                self.spawn_tile_task(coord, cx);
+                by_region
+                    .entry((coord.0.div_euclid(32), coord.1.div_euclid(32)))
+                    .or_default()
+                    .push(coord);
             }
-            // Bound the zoom-in cache.
+            for ((rx, rz), coords) in by_region {
+                self.spawn_region_tile_task(rx, rz, coords, cx);
+            }
+            // Bound the zoom-in cache by dropping tiles outside the
+            // visible range rather than wiping everything.
             if self.map.tiles.len() > 20_000 {
-                self.map.tiles.clear();
+                self.map.tiles.retain(|&(x, z), _| {
+                    x >= min_cx - 64 && x <= max_cx + 64 && z >= min_cz - 64 && z <= max_cz + 64
+                });
             }
             return;
         }
 
         // Region-LOD: queue whole regions for the driver. Requests are
-        // sorted by distance from the view center so the visible area
+        // sorted by distance from the focus point so the visible area
         // completes first.
         let want_detail = chunk_px * 32.0 >= 256.0;
         let mut missing: Vec<(RegionCoord, f64, PathBuf)> = Vec::new();
@@ -463,8 +487,8 @@ impl Workspace {
                 if !need_base && !need_detail {
                     continue;
                 }
-                let dx = (rx * 512 + 256) as f64 - self.map.view.center.0;
-                let dz = (rz * 512 + 256) as f64 - self.map.view.center.1;
+                let dx = (rx * 512 + 256) as f64 - focus.0;
+                let dz = (rz * 512 + 256) as f64 - focus.1;
                 missing.push(((rx, rz), dx * dx + dz * dz, info.path.clone()));
             }
         }
@@ -476,86 +500,31 @@ impl Workspace {
         }
     }
 
-    /// Render one chunk tile on demand (zoomed-in view).
-    fn spawn_tile_task(&mut self, coord: ChunkCoord, cx: &mut Context<Self>) {
-        let (rx, rz) = (coord.0.div_euclid(32), coord.1.div_euclid(32));
+    /// Render a batch of chunk tiles of one region (zoomed-in view) in a
+    /// single background task: the file is opened once and each needed
+    /// chunk is parsed once even when shared by several tiles.
+    fn spawn_region_tile_task(
+        &mut self,
+        rx: i32,
+        rz: i32,
+        coords: Vec<ChunkCoord>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(info) = self.map.regions.get(&(rx, rz)) else {
             return;
         };
         let path = info.path.clone();
-        self.map.pending.insert(coord);
-        let io = cx.background_spawn(async move {
-            let tile = (|| -> Option<Arc<TileEntry>> {
-                let lx = coord.0.rem_euclid(32);
-                let lz = coord.1.rem_euclid(32);
-                let region = Region::open(&path).ok()?;
-                let load = |nx: i32, nz: i32| -> Option<mc_core::chunk_fast::FastChunk> {
-                    if !(0..32).contains(&nx) || !(0..32).contains(&nz) {
-                        return None;
-                    }
-                    region
-                        .chunk_data(nx as u8, nz as u8)
-                        .ok()
-                        .and_then(|b| parse_chunk(&b))
-                };
-                let center = load(lx, lz)?;
-                let north = load(lx, lz - 1);
-                let west = load(lx - 1, lz);
-                let nw = load(lx - 1, lz - 1);
-
-                // Grid covering the chunk plus its N/W/NW margin, so Xaero's
-                // slope (north/north-west) and biome-blending lookups work
-                // across the chunk borders.
-                let mut grid = mc_core::map::ColumnGrid::empty(48, 48);
-                for (gx, gz, chunk) in [
-                    (16i32, 16i32, Some(&center)),
-                    (16, 0, north.as_ref()),
-                    (0, 16, west.as_ref()),
-                    (0, 0, nw.as_ref()),
-                ]
-                .into_iter()
-                .filter_map(|(gx, gz, c)| c.map(|c| (gx, gz, c)))
-                {
-                    if let Some(cols) = mc_core::map::chunk_columns(chunk, &mut |n| {
-                        grid.biome_id(n)
-                    }) {
-                        for z in 0..16usize {
-                            for x in 0..16usize {
-                                let si = z * 16 + x;
-                                let di = (gz as usize + z) * 48 + gx as usize + x;
-                                grid.tint[di] = cols.tint[si];
-                                grid.water_depth[di] = cols.water_depth[si];
-                                grid.floor_height[di] = cols.floor_height[si];
-                                grid.biome[di] = cols.biome[si];
-                                grid.glowing[di] = cols.glowing[si];
-                            }
-                        }
-                    }
-                }
-                let full = mc_core::map::render_columns(&grid)?;
-                let mut rgba = Vec::with_capacity(16 * 16 * 4);
-                for z in 16..32usize {
-                    for x in 16..32usize {
-                        let si = (z * 48 + x) * 4;
-                        rgba.extend_from_slice(&full[si..si + 4]);
-                    }
-                }
-                let img = image::RgbaImage::from_raw(16, 16, to_bgra(rgba))?;
-                let render_image = gpui::RenderImage::new(vec![image::Frame::new(img)]);
-                Some(Arc::new(TileEntry {
-                    image: Arc::new(render_image),
-                }))
-            })()
-            .unwrap_or_else(|| Arc::new(TileEntry {
-                image: Arc::new(empty_image()),
-            }));
-            (coord, tile)
-        });
+        for coord in &coords {
+            self.map.pending.insert(*coord);
+        }
+        let io = cx.background_spawn(async move { render_region_tiles(&path, &coords) });
         let task = cx.spawn(async move |this, cx| {
-            let (coord, tile) = io.await;
+            let tiles = io.await;
             let _ = this.update(cx, |ws, cx| {
-                ws.map.pending.remove(&coord);
-                ws.map.tiles.insert(coord, tile);
+                for (coord, tile) in tiles {
+                    ws.map.pending.remove(&coord);
+                    ws.map.tiles.insert(coord, tile);
+                }
                 cx.notify();
             });
         });
@@ -660,11 +629,11 @@ impl Workspace {
             .overflow_hidden()
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(Self::on_left_down))
             .on_mouse_down(gpui::MouseButton::Middle, cx.listener(Self::on_middle_down))
-            .on_mouse_down(gpui::MouseButton::Right, cx.listener(Self::on_middle_down))
+            .on_mouse_down(gpui::MouseButton::Right, cx.listener(Self::on_right_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(gpui::MouseButton::Left, cx.listener(Self::on_left_up))
             .on_mouse_up(gpui::MouseButton::Middle, cx.listener(Self::on_drag_end))
-            .on_mouse_up(gpui::MouseButton::Right, cx.listener(Self::on_drag_end))
+            .on_mouse_up(gpui::MouseButton::Right, cx.listener(Self::on_left_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(canvas(
                 move |bounds, _window, _cx| bounds,
@@ -817,19 +786,33 @@ impl Workspace {
                         bounds_at(x, y, thickness, region_px + thickness),
                         border,
                     ));
+                    // Right/bottom edges only when no neighboring region
+                    // draws its own top/left edge there.
+                    if !self.map.regions.contains_key(&(rx + 1, rz)) {
+                        window.paint_quad(fill(
+                            bounds_at(x + region_px, y, thickness, region_px + thickness),
+                            border,
+                        ));
+                    }
+                    if !self.map.regions.contains_key(&(rx, rz + 1)) {
+                        window.paint_quad(fill(
+                            bounds_at(x, y + region_px, region_px + thickness, thickness),
+                            border,
+                        ));
+                    }
                 }
             }
         }
 
-        // Selection overlay, drawn as horizontal spans so adjacent chunks
-        // form one seamless rectangle.
+        // Selection overlay: fills as merged horizontal spans, then a
+        // single border along the union perimeter (an edge is only drawn
+        // where the neighboring chunk is not selected).
         let sel_fill = gpui::rgba(0x3C78D848);
         let sel_border = gpui::rgba(0x7FA8F0FF);
         let mut spans: HashMap<i32, Vec<(i32, i32)>> = HashMap::new();
         for &(cxw, czw) in self.map.selection.iter() {
             spans.entry(czw).or_default().push((cxw, cxw));
         }
-        let mut span_bounds: Vec<Bounds<gpui::Pixels>> = Vec::new();
         for (czw, mut runs) in spans {
             runs.sort_by_key(|r| r.0);
             let mut merged: Vec<(i32, i32)> = Vec::with_capacity(runs.len());
@@ -845,18 +828,33 @@ impl Workspace {
                 let origin = view.block_to_screen(((x0 * 16) as f64, (czw * 16) as f64), vp);
                 let w = ((x1 - x0 + 1) * 16) as f64 * view.zoom;
                 let b = bounds_at(ox + origin.0, oy + origin.1, w, chunk_px);
-                if offscreen(b, bounds) {
-                    continue;
+                if !offscreen(b, bounds) {
+                    window.paint_quad(fill(b, sel_fill));
                 }
-                span_bounds.push(b);
             }
         }
-        span_bounds.sort_by_key(|b| {
-            (b.origin.x.to_f64() as i64) * 4 + (b.origin.y.to_f64() as i64)
-        });
-        for b in &span_bounds {
-            window.paint_quad(fill(*b, sel_fill));
-            paint_outline(window, *b, 1.0, sel_border.into());
+        let t = 1.0f64.max(chunk_px / 24.0).min(2.0);
+        for &(cxw, czw) in self.map.selection.iter() {
+            let origin = view.block_to_screen(((cxw * 16) as f64, (czw * 16) as f64), vp);
+            let x = ox + origin.0;
+            let y = oy + origin.1;
+            let mut edge = |b: Bounds<gpui::Pixels>| {
+                if !offscreen(b, bounds) {
+                    window.paint_quad(fill(b, sel_border));
+                }
+            };
+            if !self.map.selection.contains(&(cxw, czw - 1)) {
+                edge(bounds_at(x, y, chunk_px, t));
+            }
+            if !self.map.selection.contains(&(cxw, czw + 1)) {
+                edge(bounds_at(x, y + chunk_px - t, chunk_px, t));
+            }
+            if !self.map.selection.contains(&(cxw - 1, czw)) {
+                edge(bounds_at(x, y, t, chunk_px));
+            }
+            if !self.map.selection.contains(&(cxw + 1, czw)) {
+                edge(bounds_at(x + chunk_px - t, y, t, chunk_px));
+            }
         }
 
         // Active selection rectangle.
@@ -884,12 +882,13 @@ impl Workspace {
     ) {
         let pos = self.map_local(event.position, window);
         let vp = self.map.viewport;
-        let mode = if event.modifiers.control {
-            SelectMode::Add
-        } else if event.modifiers.alt {
+        // Left-drag adds to the selection; Alt subtracts; right-drag
+        // subtracts (see on_right_down). Replace is gone: clear the
+        // selection from the menu to start over.
+        let mode = if event.modifiers.alt {
             SelectMode::Subtract
         } else {
-            SelectMode::Replace
+            SelectMode::Add
         };
         let block = self.map.view.screen_to_block(pos, vp);
         let start = (
@@ -914,6 +913,28 @@ impl Workspace {
         self.map.pan_drag = Some(PanDrag {
             start_center: self.map.view.center,
             start_pos: pos,
+        });
+        cx.notify();
+    }
+
+    /// Right-drag removes chunks from the selection.
+    fn on_right_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pos = self.map_local(event.position, window);
+        let vp = self.map.viewport;
+        let block = self.map.view.screen_to_block(pos, vp);
+        let start = (
+            (block.0.floor() as i32).div_euclid(16),
+            (block.1.floor() as i32).div_euclid(16),
+        );
+        self.map.select_drag = Some(SelectDrag {
+            start,
+            current: start,
+            mode: SelectMode::Subtract,
         });
         cx.notify();
     }
@@ -987,13 +1008,105 @@ impl Workspace {
     }
 }
 
+/// Render a batch of chunk tiles of one region: the file is opened once
+/// and each needed chunk is parsed once, even when shared as the
+/// N/W/NW neighbor of several tiles.
+fn render_region_tiles(
+    path: &std::path::Path,
+    coords: &[ChunkCoord],
+) -> Vec<(ChunkCoord, Arc<TileEntry>)> {
+    let mut out = Vec::with_capacity(coords.len());
+    let Ok(region) = Region::open(path) else {
+        return out;
+    };
+    let mut chunks: HashMap<(i32, i32), Option<Arc<mc_core::chunk_fast::FastChunk>>> =
+        HashMap::new();
+    let mut load = |nx: i32, nz: i32| -> Option<Arc<mc_core::chunk_fast::FastChunk>> {
+        if !(0..32).contains(&nx) || !(0..32).contains(&nz) {
+            return None;
+        }
+        if let Some(c) = chunks.get(&(nx, nz)) {
+            return c.clone();
+        }
+        let c = region
+            .chunk_data(nx as u8, nz as u8)
+            .ok()
+            .and_then(|b| parse_chunk(&b))
+            .map(Arc::new);
+        chunks.insert((nx, nz), c.clone());
+        c
+    };
+    for &coord in coords {
+        let lx = coord.0.rem_euclid(32);
+        let lz = coord.1.rem_euclid(32);
+        let center = load(lx, lz);
+        let north = load(lx, lz - 1);
+        let west = load(lx - 1, lz);
+        let nw = load(lx - 1, lz - 1);
+
+        // Grid covering the chunk plus its N/W/NW margin, so Xaero's
+        // slope (north/north-west) and biome-blending lookups work
+        // across the chunk borders.
+        let tile = (|| {
+            let mut grid = mc_core::map::ColumnGrid::empty(48, 48);
+            for (gx, gz, chunk) in [
+                (16i32, 16i32, center.as_ref()),
+                (16, 0, north.as_ref()),
+                (0, 16, west.as_ref()),
+                (0, 0, nw.as_ref()),
+            ]
+            .into_iter()
+            .filter_map(|(gx, gz, c)| c.map(|c| (gx, gz, c)))
+            {
+                if let Some(cols) = mc_core::map::chunk_columns(chunk, &mut |n| {
+                    grid.biome_id(n)
+                }) {
+                    for z in 0..16usize {
+                        for x in 0..16usize {
+                            let si = z * 16 + x;
+                            let di = (gz as usize + z) * 48 + gx as usize + x;
+                            grid.base[di] = cols.base[si];
+                            grid.tint[di] = cols.tint[si];
+                            grid.water_depth[di] = cols.water_depth[si];
+                            grid.floor_height[di] = cols.floor_height[si];
+                            grid.biome[di] = cols.biome[si];
+                            grid.glowing[di] = cols.glowing[si];
+                        }
+                    }
+                }
+            }
+            let full = mc_core::map::render_columns(&grid)?;
+            let mut rgba = Vec::with_capacity(16 * 16 * 4);
+            for z in 16..32usize {
+                for x in 16..32usize {
+                    let si = (z * 48 + x) * 4;
+                    rgba.extend_from_slice(&full[si..si + 4]);
+                }
+            }
+            let img = image::RgbaImage::from_raw(16, 16, to_bgra(rgba))?;
+            let render_image = gpui::RenderImage::new(vec![image::Frame::new(img)]);
+            Some(Arc::new(TileEntry {
+                image: Arc::new(render_image),
+            }))
+        })()
+        .unwrap_or_else(|| {
+            Arc::new(TileEntry {
+                image: Arc::new(empty_image()),
+            })
+        });
+        out.push((coord, tile));
+    }
+    out
+}
+
 /// Smallest power-of-two replication factor that covers the on-screen
-/// chunk size (chunk_px / 16 rounded up).
+/// chunk size (chunk_px / 16 rounded up), capped so tiles stay small
+/// and the upscale cache does not churn at extreme zoom.
 fn next_pow2_scale(chunk_px: f64) -> u32 {
     ((chunk_px / 16.0).ceil() as usize)
         .max(1)
         .next_power_of_two()
-        .clamp(1, 32) as u32
+        .clamp(1, 8) as u32
 }
 
 /// Nearest-neighbor `factor`x upscale of a 16x16 tile image, cached per
@@ -1029,7 +1142,7 @@ fn upscaled_image(
             .expect("upscaled tile size mismatch"),
     )]));
     let mut c = cache.borrow_mut();
-    if c.len() > 400 {
+    if c.len() > 2048 {
         c.clear();
     }
     c.insert(key, img.clone());

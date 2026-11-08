@@ -163,9 +163,10 @@ pub fn chunk_columns(
                 let Some(name) = block_name(y) else {
                     break;
                 };
-                let below_surface = y < surface_y - 1;
-                if is_water && below_surface && y >= floor_y {
-                    // Water between the surface and the floor.
+                if is_water && y >= floor_y {
+                    // Water between the surface and the floor: skipped so
+                    // the floor block provides the base color; the water
+                    // becomes the translucent overlay drawn on top.
                     if y == 0 {
                         break;
                     }
@@ -179,14 +180,44 @@ pub fn chunk_columns(
                     y -= 1;
                     continue;
                 }
-                match colors::block_map_color(name) {
-                    Some(color) => {
-                        cols.base[idx] = [
-                            ((color >> 16) & 0xFF) as u8,
-                            ((color >> 8) & 0xFF) as u8,
-                            (color & 0xFF) as u8,
-                        ];
-                        cols.tint[idx] = colors::tint_kind_of(name);
+                match colors::block_paint(name) {
+                    Some(p) => {
+                        let mut rgb = p.rgb;
+                        if p.alpha < 255 {
+                            // Translucent top (leaves, water over non-water):
+                            // blend over the first opaque painted block
+                            // directly below it, like Xaero composites.
+                            let mut y2 = y - 1;
+                            while y2 > min_y && y2 > 0 {
+                                let Some(n2) = block_name(y2) else {
+                                    break;
+                                };
+                                if colors::is_invisible(n2) {
+                                    y2 -= 1;
+                                    continue;
+                                }
+                                match colors::block_paint(n2) {
+                                    Some(u) if u.alpha >= 255 => {
+                                        let a = p.alpha as u32;
+                                        let ia = 255 - a;
+                                        rgb = [
+                                            ((rgb[0] as u32 * a + u.rgb[0] as u32 * ia)
+                                                / 255) as u8,
+                                            ((rgb[1] as u32 * a + u.rgb[1] as u32 * ia)
+                                                / 255) as u8,
+                                            ((rgb[2] as u32 * a + u.rgb[2] as u32 * ia)
+                                                / 255) as u8,
+                                        ];
+                                    }
+                                    // Another translucent layer or no paint:
+                                    // stop, the canopy color stands on its own.
+                                    _ => {}
+                                }
+                                break;
+                            }
+                        }
+                        cols.base[idx] = rgb;
+                        cols.tint[idx] = p.tint;
                         cols.glowing[idx] = colors::is_glowing(name);
                         break;
                     }
@@ -360,16 +391,20 @@ pub fn render_columns(grid: &ColumnGrid) -> Option<Vec<u8>> {
                     // Water tint of this column's biome (blended).
                     let [wr, wg, wb] =
                         blended_tint(grid, x as i32, z as i32, TintKind::Water);
-                    // The water overlay's own map color, tinted by the
+                    // The water overlay's own paint, tinted by the
                     // biome water color.
-                    let wc = colors::block_map_color("water").unwrap_or(0x4040FF);
+                    let wc = colors::block_paint("water")
+                        .map(|p| p.rgb)
+                        .unwrap_or([0x40, 0x40, 0xFF]);
                     [
-                        (wr as u32 * ((wc >> 16) & 0xFF)) / 255,
-                        (wg as u32 * ((wc >> 8) & 0xFF)) / 255,
-                        (wb as u32 * (wc & 0xFF)) / 255,
+                        wr as u32 * wc[0] as u32 / 255,
+                        wg as u32 * wc[1] as u32 / 255,
+                        wb as u32 * wc[2] as u32 / 255,
                     ]
                 };
-                let transparency = 127.0f64 / 255.0;
+                let transparency = colors::block_paint("water")
+                    .map(|p| p.alpha as f64 / 255.0)
+                    .unwrap_or(127.0 / 255.0);
                 let skylight_above = 15.0f64;
                 let sun = (15 - depth.max(0)).max(0) as f64;
                 let intensity =

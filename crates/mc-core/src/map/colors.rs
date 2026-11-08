@@ -65,6 +65,52 @@ pub fn biome_tint(biome: &str) -> [u32; 3] {
         .unwrap_or([0x91BD59, 0x77AB2F, 0x3F76E4])
 }
 
+/// What a visible block paints as: the base color (before biome tint),
+/// its translucency, and which biome tint applies.
+pub struct Paint {
+    pub rgb: [u8; 3],
+    /// 255 = opaque. Xaero composites translucent tops (leaves, water)
+    /// over what lies below.
+    pub alpha: u8,
+    pub tint: TintKind,
+}
+
+/// Block name -> how Xaero paints it on the map. The XAERO_ACCURATE
+/// table holds Xaero's texture-derived colors and tint flags; blocks
+/// added after MC 1.21.8 fall back to the vanilla map color table.
+pub fn block_paint(name: &str) -> Option<Paint> {
+    if let Ok(i) = xaero_colors::XAERO_ACCURATE
+        .binary_search_by(|(n, ..)| (*n).cmp(name))
+    {
+        let (_, rgba, flag) = xaero_colors::XAERO_ACCURATE[i];
+        let tint = match flag >> 8 {
+            1 => TintKind::Grass,
+            2 => TintKind::Foliage,
+            3 => TintKind::DryFoliage,
+            4 => TintKind::Water,
+            _ => TintKind::None,
+        };
+        return Some(Paint {
+            rgb: [
+                ((rgba >> 24) & 0xFF) as u8,
+                ((rgba >> 16) & 0xFF) as u8,
+                ((rgba >> 8) & 0xFF) as u8,
+            ],
+            alpha: (rgba & 0xFF) as u8,
+            tint,
+        });
+    }
+    block_map_color(name).map(|c| Paint {
+        rgb: [
+            ((c >> 16) & 0xFF) as u8,
+            ((c >> 8) & 0xFF) as u8,
+            (c & 0xFF) as u8,
+        ],
+        alpha: 255,
+        tint: tint_kind(name),
+    })
+}
+
 /// Blocks that emit light (emissive >= 1), matched by name. Xaero brightens
 /// these until their color channels sum to at least 407.
 pub fn is_glowing(name: &str) -> bool {
