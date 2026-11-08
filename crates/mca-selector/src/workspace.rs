@@ -45,6 +45,17 @@ fn empty_image() -> gpui::RenderImage {
     gpui::RenderImage::new(vec![image::Frame::new(img)])
 }
 
+/// GPUI's blade atlas stores polychrome textures as Bgra8Unorm and
+/// `paint_image` uploads frame bytes verbatim, so manually built
+/// RenderImage frames must already be BGRA (the img element swizzles
+/// RGBA itself; paint_image does not).
+fn to_bgra(mut rgba: Vec<u8>) -> Vec<u8> {
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    rgba
+}
+
 /// A request for one region render, stamped with the generation it was made
 /// under so stale work can be dropped cheaply.
 type RegionRequest = (u64, RegionCoord, PathBuf);
@@ -154,7 +165,7 @@ impl Workspace {
                     let base = image::RgbaImage::from_raw(
                         mc_core::map::region::BASE_IMG as u32,
                         mc_core::map::region::BASE_IMG as u32,
-                        rendered.base256,
+                        to_bgra(rendered.base256),
                     );
                     if let Some(img) = base {
                         ws.map.region_base.insert(
@@ -165,7 +176,7 @@ impl Workspace {
                     let detail = image::RgbaImage::from_raw(
                         mc_core::map::region::REGION_IMG as u32,
                         mc_core::map::region::REGION_IMG as u32,
-                        rendered.img512,
+                        to_bgra(rendered.img512),
                     );
                     if let Some(img) = detail {
                         ws.map
@@ -529,7 +540,7 @@ impl Workspace {
                         rgba.extend_from_slice(&full[si..si + 4]);
                     }
                 }
-                let img = image::RgbaImage::from_raw(16, 16, rgba)?;
+                let img = image::RgbaImage::from_raw(16, 16, to_bgra(rgba))?;
                 let render_image = gpui::RenderImage::new(vec![image::Frame::new(img)]);
                 Some(Arc::new(TileEntry {
                     image: Arc::new(render_image),
@@ -962,7 +973,7 @@ impl Workspace {
         let pos = self.map_local(event.position, window);
         let delta = event.delta.pixel_delta(px(1.0));
         let lines = (delta.y.to_f64() + delta.x.to_f64()) / 40.0;
-        let factor = 1.2_f64.powf(lines.clamp(-6.0, 6.0));
+        let factor = 1.4_f64.powf(lines.clamp(-6.0, 6.0));
         self.map.view.zoom_at(factor, pos, self.map.viewport);
         cx.notify();
     }
