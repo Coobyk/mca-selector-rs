@@ -89,6 +89,30 @@ pub fn chunk_columns(
         }
     }
 
+    // Per-palette-entry lookups, computed once per section: the column
+    // walk then does array indexing instead of name lookups and binary
+    // searches per block.
+    struct SecLut {
+        paint: Vec<Option<colors::Paint>>,
+        invisible: Vec<bool>,
+        water: Vec<bool>,
+        glowing: Vec<bool>,
+    }
+    let mut luts: [Option<SecLut>; 24] = Default::default();
+    for i in 0..24 {
+        let Some(s) = by_y[i] else { continue };
+        luts[i] = Some(SecLut {
+            paint: s.names.iter().map(|n| colors::block_paint(n)).collect(),
+            invisible: s.names.iter().map(|n| colors::is_invisible(n)).collect(),
+            water: s
+                .names
+                .iter()
+                .map(|n| &**n == "water" || &**n == "bubble_column")
+                .collect(),
+            glowing: s.names.iter().map(|n| colors::is_glowing(n)).collect(),
+        });
+    }
+
     let motion = chunk.motion_blocking.as_ref()?;
     let ocean_floor = chunk.ocean_floor.as_ref();
 
@@ -123,54 +147,35 @@ pub fn chunk_columns(
                 }
             }
 
-            // Block name at one position; None when the section or palette
-            // is missing.
-            let block_name = |y: i32| -> Option<&str> {
+            // Section + palette index at one position; None when the
+            // section or palette is missing (treated as air).
+            let entry_at = |y: i32| -> Option<(&FastSection, &SecLut, usize)> {
                 let sy = y.div_euclid(16) + 4;
                 let section = by_y.get(sy as usize).and_then(|s| *s)?;
+                let lut = luts[sy as usize].as_ref()?;
                 let names = &section.names;
                 if names.is_empty() {
                     return None;
                 }
-                let states = section.data.as_ref();
-                let bits = palette_bits(names.len());
-                let index = match states {
+                let index = match section.data.as_ref() {
                     None => 0,
-                    Some(data) => PackedBits::new(data, bits)
-                        .get((y.rem_euclid(16) as usize * 16 + z) * 16 + x),
+                    Some(data) => PackedBits::new(data, palette_bits(names.len()))
+                        .get((y.rem_euclid(16) as usize * 16 + z) * 16 + x)
+                        as usize,
                 };
-                names.get(index as usize).map(|s| &**s)
-            };
-
-            // Farmland `moisture` property at one position (0 when the
-            // entry has none or the palette lacks the data).
-            let block_moist = |y: i32| -> u8 {
-                let sy = y.div_euclid(16) + 4;
-                let Some(section) = by_y.get(sy as usize).and_then(|s| *s) else {
-                    return 0;
-                };
-                if section.moisture.is_empty() {
-                    return 0;
+                if index >= names.len() {
+                    return None;
                 }
-                let names = &section.names;
-                if names.is_empty() {
-                    return 0;
-                }
-                let states = section.data.as_ref();
-                let bits = palette_bits(names.len());
-                let index = match states {
-                    None => 0,
-                    Some(data) => PackedBits::new(data, bits)
-                        .get((y.rem_euclid(16) as usize * 16 + z) * 16 + x),
-                };
-                section.moisture.get(index as usize).copied().unwrap_or(0)
+                Some((section, lut, index))
             };
 
             // Water column? The surface block is water: the visible color
             // comes from the floor below, and the water becomes an overlay
             // with depth `surface_y - floor_y`.
-            let surface_block = block_name(surface_y - 1);
-            let is_water = surface_block == Some("water") || surface_block == Some("bubble_column");
+            let is_water = matches!(
+                entry_at(surface_y - 1),
+                Some((_, lut, pi)) if lut.water[pi]
+            );
             if is_water {
                 cols.water_depth[idx] = (surface_y - floor_y).max(1);
             }
@@ -189,7 +194,7 @@ pub fn chunk_columns(
                 }
                 // A missing section or palette is air, not a wall: keep
                 // walking down instead of giving up on the column.
-                let Some(name) = block_name(y) else {
+                let Some((sec, lut, pi)) = entry_at(y) else {
                     if y == 0 {
                         break;
                     }
@@ -206,18 +211,20 @@ pub fn chunk_columns(
                     y -= 1;
                     continue;
                 }
-                if colors::is_invisible(name) {
+                if lut.invisible[pi] {
                     if y == 0 {
                         break;
                     }
                     y -= 1;
                     continue;
                 }
-                match colors::block_paint(name) {
+                match &lut.paint[pi] {
                     Some(p) => {
                         let mut rgb = p.rgb;
                         // Hydrated farmland is a darker, wetter brown.
-                        if name == "farmland" && block_moist(y) > 0 {
+                        if &*sec.names[pi] == "farmland"
+                            && sec.moisture.get(pi).copied().unwrap_or(0) > 0
+                        {
                             rgb = [0x55, 0x37, 0x1E];
                         }
                         if p.alpha < 255 {
@@ -226,27 +233,35 @@ pub fn chunk_columns(
                             // directly below it, like Xaero composites.
                             let mut y2 = y - 1;
                             while y2 > min_y && y2 > 0 {
-                                let Some(n2) = block_name(y2) else {
+                                let Some((sec2, lut2, pi2)) = entry_at(y2) else {
                                     y2 -= 1;
                                     continue;
                                 };
-                                if colors::is_invisible(n2) {
+                                if lut2.invisible[pi2] {
                                     y2 -= 1;
                                     continue;
                                 }
-                                match colors::block_paint(n2) {
-                                    Some(mut u) if u.alpha >= 255 => {
-                                        if n2 == "farmland" && block_moist(y2) > 0 {
-                                            u.rgb = [0x55, 0x37, 0x1E];
+                                match &lut2.paint[pi2] {
+                                    Some(u) if u.alpha >= 255 => {
+                                        let mut urgb = u.rgb;
+                                        if &*sec2.names[pi2] == "farmland"
+                                            && sec2
+                                                .moisture
+                                                .get(pi2)
+                                                .copied()
+                                                .unwrap_or(0)
+                                                > 0
+                                        {
+                                            urgb = [0x55, 0x37, 0x1E];
                                         }
                                         let a = p.alpha as u32;
                                         let ia = 255 - a;
                                         rgb = [
-                                            ((rgb[0] as u32 * a + u.rgb[0] as u32 * ia)
+                                            ((rgb[0] as u32 * a + urgb[0] as u32 * ia)
                                                 / 255) as u8,
-                                            ((rgb[1] as u32 * a + u.rgb[1] as u32 * ia)
+                                            ((rgb[1] as u32 * a + urgb[1] as u32 * ia)
                                                 / 255) as u8,
-                                            ((rgb[2] as u32 * a + u.rgb[2] as u32 * ia)
+                                            ((rgb[2] as u32 * a + urgb[2] as u32 * ia)
                                                 / 255) as u8,
                                         ];
                                     }
@@ -259,7 +274,7 @@ pub fn chunk_columns(
                         }
                         cols.base[idx] = rgb;
                         cols.tint[idx] = p.tint;
-                        cols.glowing[idx] = colors::is_glowing(name);
+                        cols.glowing[idx] = lut.glowing[pi];
                         break;
                     }
                     // No map color (MapColor.NONE): invisible, keep going
@@ -279,7 +294,13 @@ pub fn chunk_columns(
 
 /// Tint of one column: the biome color of its tint kind, averaged over the
 /// 5-sample cross (center + 4 neighbors) like Xaero's biome blending.
-fn blended_tint(grid: &ColumnGrid, x: i32, z: i32, kind: TintKind) -> [u32; 3] {
+fn blended_tint(
+    grid: &ColumnGrid,
+    tints: &[[u32; 3]],
+    x: i32,
+    z: i32,
+    kind: TintKind,
+) -> [u32; 3] {
     if let TintKind::Fixed(c) = kind {
         return [((c >> 16) & 0xFF) as u32, ((c >> 8) & 0xFF) as u32, (c & 0xFF) as u32];
     }
@@ -295,8 +316,11 @@ fn blended_tint(grid: &ColumnGrid, x: i32, z: i32, kind: TintKind) -> [u32; 3] {
             continue;
         }
         let i = nz as usize * grid.stride + nx as usize;
-        let biome = &grid.biomes[grid.biome[i] as usize];
-        let [g, f, w] = colors::biome_tint(biome);
+        // Biome-less chunks leave the name table empty: fall back to
+        // the plains tint like biome_tint does.
+        let &[g, f, w] = tints
+            .get(grid.biome[i] as usize)
+            .unwrap_or(&[0x91BD59, 0x77AB2F, 0x3F76E4]);
         let c = match kind {
             TintKind::Grass => g,
             TintKind::Foliage => f,
@@ -366,19 +390,23 @@ fn slope_brightness(height: i32, h_north: Option<i32>, h_nw: Option<i32>, glowin
 /// Render a grid of columns into RGBA pixels (`4 * stride * rows` bytes).
 /// Returns (pixels, width, height) or None when the grid is empty.
 pub fn render_columns(grid: &ColumnGrid) -> Option<Vec<u8>> {
+    // One biome-tint lookup per distinct biome instead of one per
+    // neighbor sample per pixel.
+    let tints: Vec<[u32; 3]> =
+        grid.biomes.iter().map(|b| colors::biome_tint(b)).collect();
     let stride = grid.stride;
     let rows = grid.rows;
     let mut out = vec![0u8; stride * rows * 4];
 
     // Precompute blended tints per column (5-sample cross).
-    let mut tints: Vec<[u32; 3]> = vec![[255, 255, 255]; stride * rows];
+    let mut col_tints: Vec<[u32; 3]> = vec![[255, 255, 255]; stride * rows];
     for z in 0..rows {
         for x in 0..stride {
             let i = z * stride + x;
             if grid.floor_height[i] == i32::MIN {
                 continue;
             }
-            tints[i] = blended_tint(grid, x as i32, z as i32, grid.tint[i]);
+            col_tints[i] = blended_tint(grid, &tints, x as i32, z as i32, grid.tint[i]);
         }
     }
 
@@ -391,7 +419,7 @@ pub fn render_columns(grid: &ColumnGrid) -> Option<Vec<u8>> {
                 continue;
             }
             any = true;
-            let [tr, tg, tb] = tints[i];
+            let [tr, tg, tb] = col_tints[i];
             let base = grid.base[i];
             let mut r = ((tr as u32 * (base[0] as u32)) / 255) as i64;
             let mut g = ((tg as u32 * (base[1] as u32)) / 255) as i64;
@@ -431,7 +459,7 @@ pub fn render_columns(grid: &ColumnGrid) -> Option<Vec<u8>> {
                 let wcolor_i = {
                     // Water tint of this column's biome (blended).
                     let [wr, wg, wb] =
-                        blended_tint(grid, x as i32, z as i32, TintKind::Water);
+                        blended_tint(grid, &tints, x as i32, z as i32, TintKind::Water);
                     // The water overlay's own paint, tinted by the
                     // biome water color.
                     let wc = colors::block_paint("water")

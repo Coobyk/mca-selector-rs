@@ -85,9 +85,10 @@ impl Workspace {
             async_channel::unbounded::<(u64, mc_core::map::region::RegionRender)>();
         let gen = Arc::new(AtomicU64::new(0));
 
-        // Driver: one background task; the heavy per-chunk work is spread
-        // across the rayon pool inside `render_region_file`. Spawned below
-        // and kept alive in `_tasks` (dropping a gpui task cancels it).
+        // Driver: dispatch region renders onto the rayon pool so several
+        // regions render concurrently instead of queueing behind one
+        // task; the pool bounds parallelism itself. Spawned below and
+        // kept alive in `_tasks` (dropping a gpui task cancels it).
         let gen_driver = gen.clone();
         let driver = cx.background_spawn(async move {
             while let Ok((req_gen, coord, path)) = req_rx.recv().await {
@@ -95,11 +96,14 @@ impl Workspace {
                 if req_gen != gen_driver.load(Ordering::Relaxed) {
                     continue;
                 }
-                if let Some(rendered) = mc_core::map::region::render_region_file(&path, coord) {
-                    if res_tx.send((req_gen, rendered)).await.is_err() {
-                        break;
+                let res_tx = res_tx.clone();
+                rayon::spawn(move || {
+                    if let Some(rendered) =
+                        mc_core::map::region::render_region_file(&path, coord)
+                    {
+                        let _ = res_tx.try_send((req_gen, rendered));
                     }
-                }
+                });
             }
         });
 
