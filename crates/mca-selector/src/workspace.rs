@@ -91,27 +91,32 @@ impl Workspace {
             async_channel::unbounded::<(u64, mc_core::map::region::RegionRender)>();
         let gen = Arc::new(AtomicU64::new(0));
 
-        // Driver: dispatch region renders onto the rayon pool so several
-        // regions render concurrently instead of queueing behind one
-        // task; the pool bounds parallelism itself. Spawned below and
-        // kept alive in `_tasks` (dropping a gpui task cancels it).
-        let gen_driver = gen.clone();
-        let driver = cx.background_spawn(async move {
-            while let Ok((req_gen, coord, path)) = req_rx.recv().await {
-                // Stale request (dimension switched meanwhile): skip.
-                if req_gen != gen_driver.load(Ordering::Relaxed) {
-                    continue;
-                }
-                let res_tx = res_tx.clone();
-                rayon::spawn(move || {
+        // Drivers: a few background tasks pull region requests off the
+        // shared channel so several regions render concurrently; each
+        // render additionally spreads its chunks across the rayon pool.
+        // Spawned below and kept alive in `_tasks` (dropping a gpui task
+        // cancels it).
+        let mut drivers = Vec::new();
+        for _ in 0..4 {
+            let gen_driver = gen.clone();
+            let res_tx = res_tx.clone();
+            let req_rx = req_rx.clone();
+            drivers.push(cx.background_spawn(async move {
+                while let Ok((req_gen, coord, path)) = req_rx.recv().await {
+                    // Stale request (dimension switched meanwhile): skip.
+                    if req_gen != gen_driver.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     if let Some(rendered) =
                         mc_core::map::region::render_region_file(&path, coord)
                     {
-                        let _ = res_tx.try_send((req_gen, rendered));
+                        if res_tx.send((req_gen, rendered)).await.is_err() {
+                            break;
+                        }
                     }
-                });
-            }
-        });
+                }
+            }));
+        }
 
         let this_req_tx = req_tx.clone();
         let entity = cx.new(|cx| {
@@ -211,7 +216,7 @@ impl Workspace {
             }
         });
         entity.update(cx, |ws, _| {
-            ws._tasks.push(driver);
+            ws._tasks.extend(drivers);
             ws._tasks.push(receiver);
         });
 
