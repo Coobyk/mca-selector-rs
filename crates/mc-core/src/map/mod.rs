@@ -235,7 +235,10 @@ pub fn chunk_columns(
                                     continue;
                                 }
                                 match colors::block_paint(n2) {
-                                    Some(u) if u.alpha >= 255 => {
+                                    Some(mut u) if u.alpha >= 255 => {
+                                        if n2 == "farmland" && block_moist(y2) > 0 {
+                                            u.rgb = [0x55, 0x37, 0x1E];
+                                        }
                                         let a = p.alpha as u32;
                                         let ia = 255 - a;
                                         rgb = [
