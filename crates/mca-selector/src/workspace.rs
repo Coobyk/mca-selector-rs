@@ -418,6 +418,12 @@ impl Workspace {
         if self.map.world.is_none() {
             return;
         }
+        // While the view is being dragged, do not re-enumerate and sort
+        // the missing set on every mouse-move repaint — already-pending
+        // tasks keep rendering; new requests resume on release.
+        if self.map.pan_drag.is_some() {
+            return;
+        }
         let chunk_px = self.map.view.zoom * 16.0;
         let (min_rx, max_rx, min_rz, max_rz) = self.visible_regions();
         let gen = self.map.render_gen.load(Ordering::Relaxed);
@@ -1037,6 +1043,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.map.pan_drag = None;
+        self.request_tiles(cx);
         cx.notify();
     }
 
