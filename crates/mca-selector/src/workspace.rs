@@ -70,6 +70,12 @@ pub struct Workspace {
     pub open_error: Option<String>,
     /// Sender for region render requests, consumed by the driver task.
     req_tx: async_channel::Sender<RegionRequest>,
+    /// Cached selection overlay, rebuilt when the selection mutates so
+    /// the paint loop does not iterate the whole set every frame:
+    /// merged row spans (cz, x0, x1) plus perimeter edge masks
+    /// (cx, cz, bits N=1 S=2 W=4 E=8).
+    sel_spans: Vec<(i32, i32, i32)>,
+    sel_edges: Vec<(i32, i32, u8)>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -138,6 +144,8 @@ impl Workspace {
                     .unwrap_or_else(|_| "/tmp/mca-selector-export".to_string()),
                 export_dialog: None,
                 req_tx: this_req_tx,
+                sel_spans: Vec::new(),
+                sel_edges: Vec::new(),
                 _tasks: Vec::new(),
             };
             // Prefer the overworld as the initial dimension.
@@ -280,6 +288,7 @@ impl Workspace {
         self.map.building_regions.clear();
         self.map.regions.clear();
         self.map.selection.clear();
+        self.rebuild_selection_overlay();
         let Some(world) = self.map.world.clone() else {
             return;
         };
@@ -569,10 +578,57 @@ impl Workspace {
                 }
             }
         }
+        self.rebuild_selection_overlay();
+    }
+
+    /// Rebuild the cached selection overlay (merged row spans and
+    /// perimeter edges). Called after every selection mutation instead
+    /// of doing this work per painted frame.
+    fn rebuild_selection_overlay(&mut self) {
+        self.sel_spans.clear();
+        self.sel_edges.clear();
+        let sel = &self.map.selection;
+        if sel.is_empty() {
+            return;
+        }
+        let mut rows: HashMap<i32, Vec<i32>> = HashMap::new();
+        for &(cxw, czw) in sel.iter() {
+            rows.entry(czw).or_default().push(cxw);
+            let mut mask = 0u8;
+            if !sel.contains(&(cxw, czw - 1)) {
+                mask |= 1;
+            }
+            if !sel.contains(&(cxw, czw + 1)) {
+                mask |= 2;
+            }
+            if !sel.contains(&(cxw - 1, czw)) {
+                mask |= 4;
+            }
+            if !sel.contains(&(cxw + 1, czw)) {
+                mask |= 8;
+            }
+            if mask != 0 {
+                self.sel_edges.push((cxw, czw, mask));
+            }
+        }
+        for (czw, mut xs) in rows {
+            xs.sort_unstable();
+            let mut x0 = xs[0];
+            let mut prev = xs[0];
+            for &x in &xs[1..] {
+                if x > prev + 1 {
+                    self.sel_spans.push((czw, x0, prev));
+                    x0 = x;
+                }
+                prev = x;
+            }
+            self.sel_spans.push((czw, x0, prev));
+        }
     }
 
     pub fn clear_selection(&mut self) {
         self.map.selection.clear();
+        self.rebuild_selection_overlay();
     }
 
     pub fn invert_selection(&mut self) {
@@ -597,6 +653,7 @@ impl Workspace {
                 self.map.selection.insert(c);
             }
         }
+        self.rebuild_selection_overlay();
     }
 
     pub fn zoom(&mut self, factor: f64) {
@@ -813,37 +870,21 @@ impl Workspace {
             }
         }
 
-        // Selection overlay: fills as merged horizontal spans, then a
-        // single border along the union perimeter (an edge is only drawn
-        // where the neighboring chunk is not selected).
+        // Selection overlay: the span/edge geometry is cached by
+        // rebuild_selection_overlay on mutation; painting only maps
+        // it to screen space. Fills first, then the perimeter border.
         let sel_fill = gpui::rgba(0x3C78D848);
         let sel_border = gpui::rgba(0x7FA8F0FF);
-        let mut spans: HashMap<i32, Vec<(i32, i32)>> = HashMap::new();
-        for &(cxw, czw) in self.map.selection.iter() {
-            spans.entry(czw).or_default().push((cxw, cxw));
-        }
-        for (czw, mut runs) in spans {
-            runs.sort_by_key(|r| r.0);
-            let mut merged: Vec<(i32, i32)> = Vec::with_capacity(runs.len());
-            for (x0, x1) in runs {
-                match merged.last_mut() {
-                    Some((_, last_x1)) if x0 <= *last_x1 + 1 => {
-                        *last_x1 = (*last_x1).max(x1);
-                    }
-                    _ => merged.push((x0, x1)),
-                }
-            }
-            for (x0, x1) in merged {
-                let origin = view.block_to_screen(((x0 * 16) as f64, (czw * 16) as f64), vp);
-                let w = ((x1 - x0 + 1) * 16) as f64 * view.zoom;
-                let b = bounds_at(ox + origin.0, oy + origin.1, w, chunk_px);
-                if !offscreen(b, bounds) {
-                    window.paint_quad(fill(b, sel_fill));
-                }
+        for &(czw, x0, x1) in &self.sel_spans {
+            let origin = view.block_to_screen(((x0 * 16) as f64, (czw * 16) as f64), vp);
+            let w = ((x1 - x0 + 1) * 16) as f64 * view.zoom;
+            let b = bounds_at(ox + origin.0, oy + origin.1, w, chunk_px);
+            if !offscreen(b, bounds) {
+                window.paint_quad(fill(b, sel_fill));
             }
         }
         let t = 1.0f64.max(chunk_px / 24.0).min(2.0);
-        for &(cxw, czw) in self.map.selection.iter() {
+        for &(cxw, czw, mask) in &self.sel_edges {
             let origin = view.block_to_screen(((cxw * 16) as f64, (czw * 16) as f64), vp);
             let x = ox + origin.0;
             let y = oy + origin.1;
@@ -852,16 +893,16 @@ impl Workspace {
                     window.paint_quad(fill(b, sel_border));
                 }
             };
-            if !self.map.selection.contains(&(cxw, czw - 1)) {
+            if mask & 1 != 0 {
                 edge(bounds_at(x, y, chunk_px, t));
             }
-            if !self.map.selection.contains(&(cxw, czw + 1)) {
+            if mask & 2 != 0 {
                 edge(bounds_at(x, y + chunk_px - t, chunk_px, t));
             }
-            if !self.map.selection.contains(&(cxw - 1, czw)) {
+            if mask & 4 != 0 {
                 edge(bounds_at(x, y, t, chunk_px));
             }
-            if !self.map.selection.contains(&(cxw + 1, czw)) {
+            if mask & 8 != 0 {
                 edge(bounds_at(x + chunk_px - t, y, t, chunk_px));
             }
         }
@@ -1003,7 +1044,7 @@ impl Workspace {
         let pos = self.map_local(event.position, window);
         let delta = event.delta.pixel_delta(px(1.0));
         let lines = (delta.y.to_f64() + delta.x.to_f64()) / 40.0;
-        let factor = 1.4_f64.powf(lines.clamp(-6.0, 6.0));
+        let factor = 1.7_f64.powf(lines.clamp(-6.0, 6.0));
         self.map.view.zoom_at(factor, pos, self.map.viewport);
         cx.notify();
     }
