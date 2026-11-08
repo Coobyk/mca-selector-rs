@@ -629,6 +629,10 @@ impl MainView {
         Some(r)
     }
 
+    fn render_layer_only_only(&self) -> bool {
+        config::world().map(|w| w.cfg.render_layer_only).unwrap_or(false)
+    }
+
     fn status_text(&mut self) -> String {
         let (min, max) = self.map.visible_region_bounds(Point2f::ZERO);
         let visible_regions = ((max.x - min.x + 1) * (max.z - min.z + 1)).max(0) as usize;
@@ -861,6 +865,11 @@ impl Render for MainView {
                     )
                     .children(self.render_dialog(cx)),
             )
+            .children(if show_bar && !self.render_layer_only_only() {
+                vec![self.render_height_slider(cx)]
+            } else {
+                vec![]
+            })
             .child(
                 div()
                     .h(px(22.))
@@ -962,6 +971,100 @@ impl MainView {
         .detach();
     }
 
+
+
+    fn render_height_slider(&self, cx: &mut Context<Self>) -> AnyElement {
+        let h = config::world().map(|w| w.cfg.render_height).unwrap_or(319);
+        div()
+            .h(px(22.))
+            .w_full()
+            .bg(rgb(0x242424))
+            .flex()
+            .items_center()
+            .px_2()
+            .gap_2()
+            .text_size(px(11.))
+            .text_color(rgb(0xbbbbbb))
+            .child(format!("height {}", h))
+            .child(
+                // simple - and + controls matching slider behavior (16px step)
+                h_flex().gap_1()
+                    .child(button("-", cx, |v, _w, cx| {
+                        if let Some(mut ws) = config::world() {
+                            ws.cfg.render_height = (ws.cfg.render_height - 16).max(-64);
+                            ws.cfg.save(&ws.cache_dir);
+                            config::set_world(Some(ws));
+                        }
+                        v.map.mark_all_tiles_obsolete();
+                        v.update_needed = true;
+                        cx.notify();
+                    }))
+                    .child(button("+", cx, |v, _w, cx| {
+                        if let Some(mut ws) = config::world() {
+                            ws.cfg.render_height = (ws.cfg.render_height + 16).min(319);
+                            ws.cfg.save(&ws.cache_dir);
+                            config::set_world(Some(ws));
+                        }
+                        v.map.mark_all_tiles_obsolete();
+                        v.update_needed = true;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+
+    fn toggle_render(&self, label: &'static str, val: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id(SharedString::from(format!("rs-{label}")))
+            .px_2().py_1()
+            .bg(if val { rgb(0x2a4a2a) } else { rgb(0x3c3f41) })
+            .border_1().border_color(rgb(0x555555))
+            .rounded_sm()
+            .cursor_pointer()
+            .text_size(px(12.))
+            .child(format!("{}: {}", label, if val { "on" } else { "off" }))
+            .on_click(cx.listener(move |v, _, _w, cx| {
+                if let Some(Dialog::RenderSettings { draft }) = &mut v.dialog {
+                    match label {
+                        "Shade" => draft.shade = !draft.shade,
+                        "Water" => draft.shade_water = !draft.shade_water,
+                        "Altitude" => draft.shade_altitude = !draft.shade_altitude,
+                        "Smooth render" => draft.smooth_rendering = !draft.smooth_rendering,
+                        "Smooth overlays" => draft.smooth_overlays = !draft.smooth_overlays,
+                        "Layer only" => draft.render_layer_only = !draft.render_layer_only,
+                        "Caves" => draft.render_caves = !draft.render_caves,
+                        "Nonexistent" => draft.show_nonexistent_regions = !draft.show_nonexistent_regions,
+                        _ => {}
+                    }
+                }
+                cx.notify();
+            }))
+    }
+
+    fn toggle_global(&self, label: &'static str, val: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id(SharedString::from(format!("gs-{label}")))
+            .px_2().py_1()
+            .bg(if val { rgb(0x2a4a2a) } else { rgb(0x3c3f41) })
+            .border_1().border_color(rgb(0x555555))
+            .rounded_sm()
+            .cursor_pointer()
+            .text_size(px(12.))
+            .child(format!("{}: {}", label, if val { "on" } else { "off" }))
+            .on_click(cx.listener(move |v, _, _w, cx| {
+                if let Some(Dialog::Settings { draft }) = &mut v.dialog {
+                    match label {
+                        "Chunk grid" => draft.show_chunk_grid = !draft.show_chunk_grid,
+                        "Region grid" => draft.show_region_grid = !draft.show_region_grid,
+                        "Coordinates" => draft.show_coordinates = !draft.show_coordinates,
+                        "Debug" => draft.debug = !draft.debug,
+                        _ => {}
+                    }
+                }
+                cx.notify();
+            }))
+    }
 
     // -- chunk operations -------------------------------------------------------
 
@@ -1326,7 +1429,13 @@ impl MainView {
                     .child(text_el(format!("Paste chunks color: rgba({:.2},{:.2},{:.2},{:.2})", draft.paste_chunks_color.r, draft.paste_chunks_color.g, draft.paste_chunks_color.b, draft.paste_chunks_color.a), 12.))
                     .child(text_el(format!("Process threads: {}  Write threads: {}  Max loaded files: {}", draft.process_threads, draft.write_threads, draft.max_loaded_files), 12.))
                     .child(text_el(format!("Minecraft saves dir: {}", draft.mc_saves_dir), 12.))
-                    .child(text_el(format!("Chunk grid: {}  Region grid: {}  Coordinates: {}", draft.show_chunk_grid, draft.show_region_grid, draft.show_coordinates), 12.))
+                    .child(
+                        h_flex().gap_1().flex_wrap()
+                            .child(self.toggle_global("Chunk grid", draft.show_chunk_grid, cx))
+                            .child(self.toggle_global("Region grid", draft.show_region_grid, cx))
+                            .child(self.toggle_global("Coordinates", draft.show_coordinates, cx))
+                            .child(self.toggle_global("Debug", draft.debug, cx)),
+                    )
                     .child(
                         h_flex().gap_2()
                             .child(button("Save", cx, |v, _w, cx| {
@@ -1346,10 +1455,24 @@ impl MainView {
                 v_flex().gap_1()
                     .child(text_el("Render settings", 16.))
                     .child(text_el(format!("Render height: {}", draft.render_height), 12.))
-                    .child(text_el(format!("Shade: {}  Shade water: {}  Shade altitude: {}", draft.shade, draft.shade_water, draft.shade_altitude), 12.))
-                    .child(text_el(format!("Smooth rendering: {}  Smooth overlays: {}", draft.smooth_rendering, draft.smooth_overlays), 12.))
-                    .child(text_el(format!("Layer only: {}  Caves: {}", draft.render_layer_only, draft.render_caves), 12.))
-                    .child(text_el(format!("Show nonexistent regions: {}  Header-only zoom: {}", draft.show_nonexistent_regions, draft.render_header_only_zoom_level), 12.))
+                    .child(
+                        h_flex().gap_1().flex_wrap()
+                            .child(self.toggle_render("Shade", draft.shade, cx))
+                            .child(self.toggle_render("Water", draft.shade_water, cx))
+                            .child(self.toggle_render("Altitude", draft.shade_altitude, cx)),
+                    )
+                    .child(
+                        h_flex().gap_1().flex_wrap()
+                            .child(self.toggle_render("Smooth render", draft.smooth_rendering, cx))
+                            .child(self.toggle_render("Smooth overlays", draft.smooth_overlays, cx)),
+                    )
+                    .child(
+                        h_flex().gap_1().flex_wrap()
+                            .child(self.toggle_render("Layer only", draft.render_layer_only, cx))
+                            .child(self.toggle_render("Caves", draft.render_caves, cx))
+                            .child(self.toggle_render("Nonexistent", draft.show_nonexistent_regions, cx)),
+                    )
+                    .child(text_el(format!("Header-only zoom: {}", draft.render_header_only_zoom_level), 12.))
                     .child(
                         h_flex().gap_2()
                             .child(button("Save", cx, |v, _w, cx| {
