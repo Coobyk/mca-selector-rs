@@ -3265,6 +3265,8 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "smallvec",
+ "smol",
 ]
 
 [[package]]

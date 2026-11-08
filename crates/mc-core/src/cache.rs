@@ -107,3 +107,8 @@ pub fn delete_data(world_uuid: &str, r: Point2i) {
     }
     let _ = std::fs::remove_file(lod_image_path(world_uuid, r));
 }
+
+/// delete a world's whole cache entry
+pub fn delete_all(world_uuid: &str) {
+    let _ = std::fs::remove_dir_all(db_dir().join(world_uuid));
+}
