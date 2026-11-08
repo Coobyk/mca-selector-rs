@@ -522,7 +522,13 @@ impl Workspace {
             }
         }
         missing.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Bound in-flight region renders: queueing the whole world at
+        // once saturates every core and stalls the UI thread.
+        const MAX_BUILDING: usize = 16;
         for (coord, _, path) in missing {
+            if self.map.building_regions.len() >= MAX_BUILDING {
+                break;
+            }
             if self.map.building_regions.insert(coord) {
                 let _ = self.req_tx.try_send((gen, coord, path));
             }
