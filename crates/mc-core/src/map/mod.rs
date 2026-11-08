@@ -142,6 +142,30 @@ pub fn chunk_columns(
                 names.get(index as usize).map(|s| &**s)
             };
 
+            // Farmland `moisture` property at one position (0 when the
+            // entry has none or the palette lacks the data).
+            let block_moist = |y: i32| -> u8 {
+                let sy = y.div_euclid(16) + 4;
+                let Some(section) = by_y.get(sy as usize).and_then(|s| *s) else {
+                    return 0;
+                };
+                if section.moisture.is_empty() {
+                    return 0;
+                }
+                let names = &section.names;
+                if names.is_empty() {
+                    return 0;
+                }
+                let states = section.data.as_ref();
+                let bits = palette_bits(names.len());
+                let index = match states {
+                    None => 0,
+                    Some(data) => PackedBits::new(data, bits)
+                        .get((y.rem_euclid(16) as usize * 16 + z) * 16 + x),
+                };
+                section.moisture.get(index as usize).copied().unwrap_or(0)
+            };
+
             // Water column? The surface block is water: the visible color
             // comes from the floor below, and the water becomes an overlay
             // with depth `surface_y - floor_y`.
@@ -192,6 +216,10 @@ pub fn chunk_columns(
                 match colors::block_paint(name) {
                     Some(p) => {
                         let mut rgb = p.rgb;
+                        // Hydrated farmland is a darker, wetter brown.
+                        if name == "farmland" && block_moist(y) > 0 {
+                            rgb = [0x55, 0x37, 0x1E];
+                        }
                         if p.alpha < 255 {
                             // Translucent top (leaves, water over non-water):
                             // blend over the first opaque painted block

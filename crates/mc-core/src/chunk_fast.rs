@@ -14,6 +14,9 @@ pub struct FastSection {
     pub y: i8,
     /// Block names, `minecraft:` prefix stripped.
     pub names: Vec<Box<str>>,
+    /// Per-palette-entry `moisture` property value (farmland); 0 for
+    /// entries without one. Same length as `names` when populated.
+    pub moisture: Vec<u8>,
     pub data: Option<Vec<i64>>,
     /// Biome palette (4x4x4 cells per section), names with namespace.
     pub biomes: Option<FastBiomes>,
@@ -97,23 +100,41 @@ fn parse_chunk_slow(bytes: &[u8]) -> Option<FastChunk> {
                 continue;
             };
             let mut names = Vec::new();
+            let mut moisture = Vec::new();
             match bs.get("palette") {
                 Some(fastnbt::Value::List(entries)) => {
                     for e in entries {
-                        let name = match e {
-                            fastnbt::Value::String(s) => s.clone(),
+                        let (name, moist) = match e {
+                            fastnbt::Value::String(s) => (s.clone(), 0),
                             fastnbt::Value::Compound(ec) => {
                                 let pick = |k: &str| match ec.get(k) {
                                     Some(fastnbt::Value::String(s)) => Some(s.clone()),
                                     _ => None,
                                 };
-                                pick("Name")
+                                let n = pick("Name")
                                     .or_else(|| pick("id"))
-                                    .or_else(|| pick(""))?
+                                    .or_else(|| pick(""))?;
+                                let m = ec
+                                    .get("Properties")
+                                    .or_else(|| ec.get("properties"))
+                                    .and_then(|p| match p {
+                                        fastnbt::Value::Compound(pc) => {
+                                            pc.get("moisture").or_else(|| pc.get("Moisture"))
+                                        }
+                                        _ => None,
+                                    })
+                                    .and_then(|v| match v {
+                                        fastnbt::Value::String(s) => s.parse::<u8>().ok(),
+                                        fastnbt::Value::Byte(b) => Some(*b as u8),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(0);
+                                (n, m)
                             }
                             _ => continue,
                         };
                         names.push(strip_prefix(&name).into());
+                        moisture.push(moist);
                     }
                 }
                 _ => continue,
@@ -122,7 +143,7 @@ fn parse_chunk_slow(bytes: &[u8]) -> Option<FastChunk> {
                 Some(fastnbt::Value::LongArray(a)) => Some(a.clone().into_inner()),
                 _ => None,
             };
-            sections.push(FastSection { y, names, data, biomes: None });
+            sections.push(FastSection { y, names, moisture, data, biomes: None });
         }
     }
     let longs = |k: &str| match root.get("Heightmaps") {
@@ -240,6 +261,7 @@ fn parse_sections(r: &mut R, chunk: &mut FastChunk) -> Option<()> {
 fn parse_section(r: &mut R, chunk: &mut FastChunk) -> Option<()> {
     let mut y: i8 = 0;
     let mut names: Option<Vec<Box<str>>> = None;
+    let mut moisture: Option<Vec<u8>> = None;
     let mut data: Option<Vec<i64>> = None;
     let mut biomes: Option<FastBiomes> = None;
     loop {
@@ -251,7 +273,7 @@ fn parse_section(r: &mut R, chunk: &mut FastChunk) -> Option<()> {
         match (name, tag) {
             ("Y", 1) => y = r.u8()? as i8,
             ("block_states", 10) => {
-                parse_block_states(r, &mut names, &mut data)?;
+                parse_block_states(r, &mut names, &mut moisture, &mut data)?;
             }
             ("biomes", 10) => {
                 biomes = Some(parse_biomes(r)?);
@@ -263,6 +285,7 @@ fn parse_section(r: &mut R, chunk: &mut FastChunk) -> Option<()> {
         chunk.sections.push(FastSection {
             y,
             names,
+            moisture: moisture.unwrap_or_default(),
             data,
             biomes,
         });
@@ -308,6 +331,7 @@ fn parse_biomes(r: &mut R) -> Option<FastBiomes> {
 fn parse_block_states(
     r: &mut R,
     names: &mut Option<Vec<Box<str>>>,
+    moisture: &mut Option<Vec<u8>>,
     data: &mut Option<Vec<i64>>,
 ) -> Option<()> {
     loop {
@@ -318,7 +342,9 @@ fn parse_block_states(
         let name = r.name()?;
         match (name, tag) {
             ("palette", 9) => {
-                *names = Some(parse_palette(r)?);
+                let (n, m) = parse_palette(r)?;
+                *names = Some(n);
+                *moisture = Some(m);
             }
             ("data", 12) => {
                 *data = Some(r.long_array()?);
@@ -331,18 +357,22 @@ fn parse_block_states(
 
 /// Palette entries across formats: plain name strings (1.21.5+), compounds
 /// `{Name}` (old), `{"": name, ...}` (snapshot), `{id, properties}` (new).
-fn parse_palette(r: &mut R) -> Option<Vec<Box<str>>> {
+/// Returns (names, moisture) — moisture is the farmland `moisture`
+/// property per entry, 0 when absent.
+fn parse_palette(r: &mut R) -> Option<(Vec<Box<str>>, Vec<u8>)> {
     let elem = r.u8()?;
     let len = r.i32()?;
     if len < 0 {
         return None;
     }
     let mut out = Vec::with_capacity(len as usize);
+    let mut moist = Vec::with_capacity(len as usize);
     for _ in 0..len {
-        let name = match elem {
-            8 => Box::from(r.string()?.as_str()),
+        let (name, m) = match elem {
+            8 => (Box::from(r.string()?.as_str()), 0),
             10 => {
                 let mut found: Option<Box<str>> = None;
+                let mut m = 0u8;
                 loop {
                     let tag = r.u8()?;
                     if tag == 0 {
@@ -354,18 +384,33 @@ fn parse_palette(r: &mut R) -> Option<Vec<Box<str>>> {
                             found = Some(r.string()?.into());
                         }
                         ("Properties", 10) | ("properties", 10) => {
-                            r.skip_payload(10)?;
+                            // Compound of string properties; we only want
+                            // farmland's `moisture`.
+                            loop {
+                                let ptag = r.u8()?;
+                                if ptag == 0 {
+                                    break;
+                                }
+                                let pname = r.name()?;
+                                match (pname, ptag) {
+                                    ("moisture", 8) | ("Moisture", 8) => {
+                                        m = r.string()?.parse::<u8>().unwrap_or(0);
+                                    }
+                                    _ => r.skip_payload(ptag)?,
+                                }
+                            }
                         }
                         _ => r.skip_payload(tag)?,
                     }
                 }
-                found?
+                (found?, m)
             }
             _ => return None,
         };
         out.push(strip_prefix(&name).into());
+        moist.push(m);
     }
-    Some(out)
+    Some((out, moist))
 }
 
 fn strip_prefix(name: &str) -> &str {
