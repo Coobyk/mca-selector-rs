@@ -840,6 +840,8 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &CopyChunksAction, _w, cx| v.copy_chunks(cx)))
             .on_action(cx.listener(|v, _: &PasteChunksAction, _w, cx| v.paste_chunks(cx)))
             .on_action(cx.listener(|v, _: &ExportImageAction, w, cx| v.export_image(w, cx)))
+            .on_action(cx.listener(|v, _: &SumSelectionAction, _w, cx| v.sum_selection(cx)))
+            .on_action(cx.listener(|v, _: &ImportChunksAction, _w, cx| v.import_chunks(cx)))
             .on_action(cx.listener(|v, _: &AboutAction, _w, cx| {
                 v.dialog = Some(Dialog::About);
                 cx.notify();
@@ -1325,6 +1327,95 @@ impl MainView {
                         }
                         let _ = image::save_buffer(&path, &rgba, w as u32, h as u32, image::ColorType::Rgba8);
                     }));
+            }
+        }).detach();
+    }
+
+
+    fn sum_selection(&mut self, cx: &mut Context<Self>) {
+        let sel = self.map.selection.clone();
+        if sel.is_empty() { return; }
+        let tx = self.map.result_tx.clone();
+        let _ = tx;
+        // count chunks per region type (region/poi/entities) like upstream
+        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+            mc_core::jobs::PRIORITY_LOW, None,
+            move || {
+                let mut total = 0usize;
+                let mut inhabited = 0i64;
+                let mut total_ticks = 0f64;
+                for (&region_l, chunks) in &sel.selection {
+                    let region = mc_core::point::Point2i::from_long(region_l);
+                    let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
+                    let p = dir.join(mc_core::files::mca_file_name(region));
+                    if !p.exists() { continue; }
+                    let Ok(mut m) = mc_core::mca::McaFile::new(p) else { continue; };
+                    if m.load(false).is_err() { continue; }
+                    for i in 0..1024 {
+                        let present = chunks.as_ref().map(|c| c.get(i)).unwrap_or(true);
+                        if !present { continue; }
+                        let Some(c) = &m.chunks[i] else { continue };
+                        let Some(d) = &c.data else { continue };
+                        total += 1;
+                        if let Some(t) = mc_core::nbt::long_from_opt(Some(d), "InhabitedTime") {
+                            inhabited += t;
+                            total_ticks += t as f64;
+                        }
+                    }
+                }
+                let _ = (inhabited, total_ticks);
+                eprintln!("sum: {total} chunks selected");
+            }));
+        cx.notify();
+    }
+
+    fn import_chunks(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true, directories: false, multiple: true,
+            prompt: Some("Select region files to import".into()),
+        });
+        let tx = self.map.result_tx.clone();
+        cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+                    mc_core::jobs::PRIORITY_LOW, None,
+                    move || {
+                        for p in paths {
+                            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                            let Some(region) = mc_core::files::parse_mca_file_name(&name) else { continue };
+                            let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { return };
+                            let dst = dir.join(&name);
+                            let Ok(mut src) = mc_core::mca::McaFile::new(p) else { continue };
+                            let mut dstf = if dst.exists() {
+                                mc_core::mca::McaFile::new(dst.clone()).ok()
+                            } else {
+                                Some(mc_core::mca::McaFile::empty(region, dst.clone()))
+                            };
+                            if src.load(false).is_err() { continue; }
+                            if let Some(d) = dstf.as_mut() {
+                                if dst.exists() && d.load(false).is_err() { continue; }
+                                for (i, c) in src.chunks.iter().enumerate() {
+                                    if c.is_some() {
+                                        d.chunks[i] = c.clone();
+                                        if let Some(cc) = &mut d.chunks[i] {
+                                            cc.timestamp = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|t| t.as_secs() as i32).unwrap_or(0);
+                                        }
+                                    }
+                                }
+                                let _ = d.save_with_temp_file(&dst);
+                            }
+                            let _ = tx.send(crate::tilemap::TileResult::Image {
+                                region, image: None, zoom: 0, structures: None, cache_write: false,
+                            });
+                        }
+                    }));
+                let _ = this.update(&mut *cx, |v, cx| {
+                    v.map.mark_all_tiles_obsolete();
+                    v.update_needed = true;
+                    cx.notify();
+                });
             }
         }).detach();
     }
