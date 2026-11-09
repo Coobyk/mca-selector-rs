@@ -1503,37 +1503,22 @@ impl MainView {
         self.dialog = Some(Dialog::Confirm {
             msg: "Delete selected chunks?".into(),
             action: Box::new(move |v, _w, cx| {
-                let sel = sel.clone();
-                let tx = v.map.result_tx.clone();
-                mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
-                    mc_core::jobs::PRIORITY_LOW, None,
-                    move || {
-                        let __p = mc_core::jobs::Progress::new("Deleting chunks", sel.selection.len() as i64);
-                        for (&region_l, chunks) in &sel.selection {
-                            let __g = __p.inc_guard();
-                            let region = mc_core::point::Point2i::from_long(region_l);
-                            __p.set_current(mc_core::files::mca_file_name(region));
-                            if __p.is_cancelled() { break; }
-                            let dirs = crate::config::world().and_then(|w| w.dirs.region.clone());
-                            let Some(dir) = dirs else { continue };
-                            let path = dir.join(mc_core::files::mca_file_name(region));
-                            if !path.exists() { continue; }
-                            let Ok(mut m) = mc_core::mca::McaFile::new(path.clone()) else { continue };
-                            if m.load(false).is_err() { continue; }
-                            match chunks {
-                                None => {
-                                    let _ = std::fs::remove_file(&path);
-                                }
-                                Some(cs) => {
-                                    m.delete_chunks(cs);
-                                    let _ = m.save_with_temp_file(&path);
-                                }
+                let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
+                crate::ops::for_each_selected_region(
+                    &sel, dirs, "Deleting chunks", v.map.result_tx.clone(),
+                    |_region, chunks, m, path, _dirs| {
+                        match chunks {
+                            None => {
+                                let _ = std::fs::remove_file(path);
+                                false
                             }
-                            let _ = tx.send(crate::tilemap::TileResult::Image {
-                                region, image: None, zoom: 0, structures: None, cache_write: false,
-                            });
+                            Some(cs) => {
+                                m.delete_chunks(cs);
+                                true
+                            }
                         }
-                    }));
+                    },
+                );
                 v.dialog = None;
                 cx.notify();
             }),
@@ -2030,36 +2015,25 @@ impl MainView {
         let raw = raw.trim().to_string();
         let sel = self.map.selection.clone();
         let tx = self.map.result_tx.clone();
-        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
-            mc_core::jobs::PRIORITY_LOW, None,
-            move || {
+        let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
+        crate::ops::for_each_selected_region(
+            &sel, dirs, "Changing fields", tx,
+            move |_region, chunks, m, _path, _dirs| {
                 let val = match mc_core::nbt::parse_snbt(&raw) {
                     Ok(v) => v,
                     Err(_) => parse_snbt_value(&raw),
                 };
-                let __p = mc_core::jobs::Progress::new("Changing fields", sel.selection.len() as i64);
-                for (&region_l, chunks) in &sel.selection {
-                    let __g = __p.inc_guard();
-                    let region = mc_core::point::Point2i::from_long(region_l);
-                    __p.set_current(mc_core::files::mca_file_name(region));
-                    if __p.is_cancelled() { break; }
-                    let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
-                    let p = dir.join(mc_core::files::mca_file_name(region));
-                    if !p.exists() { continue; }
-                    let Ok(mut m) = mc_core::mca::McaFile::new(p.clone()) else { continue };
-                    if m.load(false).is_err() { continue; }
-                    for i in 0..1024 {
-                        if !chunks.as_ref().map(|c| c.get(i)).unwrap_or(true) { continue; }
-                        let Some(c) = m.chunks[i].as_mut() else { continue };
-                        let Some(d) = c.data.as_mut() else { continue };
-                        set_nbt_path(d, &path, val.clone());
-                    }
-                    let _ = m.save_with_temp_file(&p);
-                    let _ = tx.send(crate::tilemap::TileResult::Image {
-                        region, image: None, zoom: 0, structures: None, cache_write: false,
-                    });
+                let mut changed = false;
+                for i in 0..1024 {
+                    if !chunks.as_ref().map(|c| c.get(i)).unwrap_or(true) { continue; }
+                    let Some(c) = m.chunks[i].as_mut() else { continue };
+                    let Some(d) = c.data.as_mut() else { continue };
+                    set_nbt_path(d, &path, val.clone());
+                    changed = true;
                 }
-            }));
+                changed
+            },
+        );
         cx.notify();
     }
 

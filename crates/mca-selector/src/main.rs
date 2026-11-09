@@ -1,6 +1,7 @@
 mod actions;
 mod config;
 mod nbt_editor;
+mod ops;
 mod tilemap;
 mod view;
 
