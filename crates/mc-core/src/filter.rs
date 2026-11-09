@@ -393,20 +393,19 @@ fn palette_names(data: &Compound) -> Vec<String> {
     if let Some(secs) = get_sections(data) {
         for s in secs {
             let Some(sc) = s.as_compound() else { continue };
-            for key in ["Palette", "palette"] {
-                let mut pal = sc.get(key).and_then(Tag::as_list);
-                if pal.is_none() {
-                    pal = sc
-                        .get("block_states")
+            let pal = ["Palette", "palette"]
+                .iter()
+                .find_map(|k| sc.get(*k).and_then(Tag::as_list))
+                .or_else(|| {
+                    sc.get("block_states")
                         .and_then(Tag::as_compound)
                         .and_then(|b| b.get("palette"))
-                        .and_then(Tag::as_list);
-                }
-                if let Some((_, l)) = pal {
-                    for e in l {
-                        if let Some(name) = palette_name_tag(e) {
-                            out.push(name);
-                        }
+                        .and_then(Tag::as_list)
+                });
+            if let Some((_, l)) = pal {
+                for e in l {
+                    if let Some(name) = palette_name_tag(e) {
+                        out.push(name);
                     }
                 }
             }
@@ -612,7 +611,7 @@ impl Filter {
                 }
             }
             Filter::Custom(path, cmp, val) => {
-                let cur = lookup_path(data, path);
+                let cur = nbt::path_get(data, path);
                 match (cur, val) {
                     (Some(t), _) => tag_cmp(*cmp, t, val),
                     (None, _) => matches!(cmp, Cmp::Ne),
@@ -647,26 +646,21 @@ fn border_missing_neighbors(c: &Chunk, ctx: &mut FilterCtx) -> i64 {
 }
 
 /// entities dimension chunk data for the same position as `c` (1.17+).
-fn entities_chunk<'m>(c: &Chunk, ctx: &'m mut FilterCtx) -> Option<std::rc::Rc<crate::mca::McaFile>> {
+fn entities_chunk<'m>(c: &Chunk, ctx: &'m mut FilterCtx) -> Option<(std::rc::Rc<crate::mca::McaFile>, usize)> {
     let region = c.absolute_location.chunk_to_region().as_long();
     let m = ctx.entities_file(region)?;
     let rel = c.absolute_location.as_relative_chunk();
     let i = rel.z as usize * 32 + rel.x as usize;
     m.chunks.get(i)?.as_ref()?;
-    Some(m)
+    Some((m, i))
 }
 
 /// entity ids: entities-dim chunk `Entities` list, else legacy Level.Entities.
 fn entity_ids(c: &Chunk, ctx: &mut FilterCtx) -> Vec<String> {
-    // entities file chunk
-    if let Some(m) = entities_chunk(c, ctx) {
-        let rel = c.absolute_location.as_relative_chunk();
-        let i = rel.z as usize * 32 + rel.x as usize;
-        if let Some(ec) = m.chunks[i].as_ref() {
-            if let Some(d) = &ec.data {
-                if let Some(ids) = list_names(d, &["Entities", "entities"], "id") {
-                    return ids;
-                }
+    if let Some((m, i)) = entities_chunk(c, ctx) {
+        if let Some(d) = m.chunks[i].as_ref().and_then(|c| c.data.as_ref()) {
+            if let Some(ids) = list_names(d, &["Entities", "entities"], "id") {
+                return ids;
             }
         }
     }
@@ -746,12 +740,8 @@ fn load_player_chunks(
 
 fn read_player_dat(bytes: &[u8]) -> Option<Compound> {
     // player .dat files are gzip-compressed NBT
-    use std::io::Read;
     let raw = if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut d = flate2::read::GzDecoder::new(bytes);
-        let mut v = Vec::new();
-        d.read_to_end(&mut v).ok()?;
-        v
+        crate::mca::decompress(crate::mca::CompressionType::Gzip, bytes).ok()?
     } else {
         bytes.to_vec()
     };
@@ -779,19 +769,7 @@ fn dimension_matches(dim: Option<&Tag>, want: &str) -> bool {
     }
 }
 
-fn lookup_path<'a>(data: &'a Compound, path: &str) -> Option<&'a Tag> {
-    let mut cur: Option<&Tag> = None;
-    let mut c: Option<&Compound> = Some(data);
-    for p in path.split('.') {
-        cur = c.and_then(|cc| cc.get(p));
-        match cur {
-            Some(Tag::Compound(cc)) => c = Some(cc),
-            Some(t) => return Some(t),
-            None => return None,
-        }
-    }
-    cur
-}
+
 
 fn tag_cmp(cmp: Cmp, a: &Tag, b: &Tag) -> bool {
     match cmp {

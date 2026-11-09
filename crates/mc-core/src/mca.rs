@@ -154,7 +154,7 @@ pub fn lz4_compress_blocks(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decompress(compression: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn decompress(compression: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
     Ok(match compression.base() {
         CompressionType::Gzip => {
             let mut v = Vec::new();

@@ -191,7 +191,7 @@ pub fn scan_region_files(region_dir: &Path) -> std::collections::HashSet<i64> {
         for e in rd.flatten() {
             let ok = e
                 .metadata()
-                .map(|m| m.len() > 8192)
+                .map(|m| m.len() > crate::mca::HEADER_SIZE as u64)
                 .unwrap_or(false);
             if !ok {
                 continue;
