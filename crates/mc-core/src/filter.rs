@@ -70,14 +70,97 @@ pub enum Expr {
     },
 }
 
+/// Evaluation context for filters that need filesystem access
+/// (Border neighbor lookups, entities dimension, csv selections, player data).
+pub struct FilterCtx {
+    pub region_dir: Option<std::path::PathBuf>,
+    pub entities_dir: Option<std::path::PathBuf>,
+    chunk_sets: std::collections::HashMap<i64, Option<crate::selection::ChunkSet>>,
+    entities_files: std::collections::HashMap<i64, Option<std::rc::Rc<crate::mca::McaFile>>>,
+    csvs: std::collections::HashMap<std::path::PathBuf, Option<crate::selection::Selection>>,
+    player_sets: std::collections::HashMap<String, std::collections::HashSet<i64>>,
+}
+
+impl FilterCtx {
+    pub fn new(
+        region_dir: Option<std::path::PathBuf>,
+        entities_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            region_dir,
+            entities_dir,
+            chunk_sets: std::collections::HashMap::new(),
+            entities_files: std::collections::HashMap::new(),
+            csvs: std::collections::HashMap::new(),
+            player_sets: std::collections::HashMap::new(),
+        }
+    }
+
+    /// preload the chunk set of the current region (avoid a header reload)
+    pub fn insert_chunk_set(&mut self, region: i64, cs: crate::selection::ChunkSet) {
+        self.chunk_sets.insert(region, Some(cs));
+    }
+
+    /// region header chunk set for Border lookups (cached).
+    fn region_chunk_set(&mut self, region: i64) -> Option<&crate::selection::ChunkSet> {
+        if !self.chunk_sets.contains_key(&region) {
+            let cs = self.region_dir.as_ref().and_then(|dir| {
+                let rp = crate::point::Point2i::from_long(region);
+                let p = dir.join(crate::files::mca_file_name(rp));
+                let mut m = crate::mca::McaFile::new(p).ok()?;
+                m.load_offsets().ok()?;
+                Some(m.offsets_chunk_set())
+            });
+            self.chunk_sets.insert(region, cs);
+        }
+        self.chunk_sets.get(&region)?.as_ref()
+    }
+
+    /// the loaded entities-dim mca file for a region (cached).
+    fn entities_file(&mut self, region: i64) -> Option<std::rc::Rc<crate::mca::McaFile>> {
+        if !self.entities_files.contains_key(&region) {
+            let f = self.entities_dir.as_ref().and_then(|dir| {
+                let rp = crate::point::Point2i::from_long(region);
+                let p = dir.join(crate::files::mca_file_name(rp));
+                if !p.exists() {
+                    return None;
+                }
+                let mut m = crate::mca::McaFile::new(p).ok()?;
+                m.load(false).ok()?;
+                Some(std::rc::Rc::new(m))
+            });
+            self.entities_files.insert(region, f);
+        }
+        self.entities_files.get(&region)?.clone()
+    }
+
+    fn csv_selection(&mut self, path: &std::path::Path) -> Option<&crate::selection::Selection> {
+        if !self.csvs.contains_key(path) {
+            let sel = crate::selection::Selection::read_csv(path).ok();
+            self.csvs.insert(path.to_path_buf(), sel);
+        }
+        self.csvs.get(path)?.as_ref()
+    }
+
+    /// chunk-set of player locations (or spawns) for a playerdata dir+dimension.
+    fn player_set(&mut self, dir: &std::path::Path, dimension: &str, spawn: bool) -> &std::collections::HashSet<i64> {
+        let key = format!("{}:{}:{}", dir.display(), dimension, spawn);
+        if !self.player_sets.contains_key(&key) {
+            let set = load_player_chunks(dir, dimension, spawn);
+            self.player_sets.insert(key.clone(), set);
+        }
+        self.player_sets.get(&key).unwrap()
+    }
+}
+
 impl Expr {
-    pub fn matches(&self, c: &Chunk, dv: i32) -> bool {
+    pub fn matches(&self, c: &Chunk, dv: i32, ctx: &mut FilterCtx) -> bool {
         match self {
-            Expr::Leaf { negated, filter } => filter.matches(c, dv) != *negated,
+            Expr::Leaf { negated, filter } => filter.matches(c, dv, ctx) != *negated,
             Expr::Group { negated, op, parts } => {
                 let r = match op {
-                    Bool::And => parts.iter().all(|p| p.matches(c, dv)),
-                    Bool::Or => parts.iter().any(|p| p.matches(c, dv)),
+                    Bool::And => parts.iter().all(|p| p.matches(c, dv, ctx)),
+                    Bool::Or => parts.iter().any(|p| p.matches(c, dv, ctx)),
                 };
                 r != *negated
             }
@@ -99,10 +182,22 @@ pub enum Filter {
     Biome(Cmp, Vec<String>),
     Compression(Cmp, i64),
     LightPopulated(Cmp, bool),
-    Entities(Cmp, i64),
     TileEntities(Cmp, i64),
     Structures(Cmp, Vec<String>),
-    Circle(Cmp, f64, f64, f64), // cx, cz, radius (block coords)
+    Circle(Cmp, Vec<(i32, i32, i32)>), // (cx, cz, r) in block coords, any-of
+    /// Entities: name list contains/intersects (entity dimension file or
+    /// legacy Level.Entities)
+    EntityNames(Cmp, Vec<String>),
+    /// #Entities: entity count (entities file, falls back to Level.Entities)
+    EntityAmount(Cmp, i64),
+    /// #ProtoEntities: count of the region chunk's proto `entities` list
+    ProtoEntityAmount(Cmp, i64),
+    /// Border: count of missing neighbor chunks (9 when status != full)
+    Border(Cmp, i64),
+    /// Selection: csv file -> chunk-in-selection equality
+    SelectionFile(Cmp, std::path::PathBuf),
+    /// PlayerLocation / PlayerSpawn: "<playerdata dir>:<dimension>"
+    PlayerLocation { cmp: Cmp, dir: std::path::PathBuf, dimension: String, spawn: bool },
     Custom(String, Cmp, Tag),
 }
 
@@ -255,7 +350,7 @@ fn structures(data: &Compound) -> Vec<String> {
 }
 
 impl Filter {
-    pub fn matches(&self, c: &Chunk, dv: i32) -> bool {
+    pub fn matches(&self, c: &Chunk, dv: i32, ctx: &mut FilterCtx) -> bool {
         let Some(data) = &c.data else { return false };
         let l = level(data);
         match self {
@@ -310,8 +405,16 @@ impl Filter {
                     _ => false,
                 }
             }
-            Filter::Entities(cmp, v) => {
-                let n = count_list(data, &["Entities", "entities", "block_entities"]);
+            Filter::EntityNames(cmp, v) => {
+                let ids = entity_ids(c, ctx);
+                set_cmp(*cmp, &ids, v)
+            }
+            Filter::EntityAmount(cmp, v) => {
+                let n = entity_count(c, ctx);
+                num_cmp(*cmp, n, *v)
+            }
+            Filter::ProtoEntityAmount(cmp, v) => {
+                let n = count_list(data, &["entities", "Entities"]);
                 num_cmp(*cmp, n, *v)
             }
             Filter::TileEntities(cmp, v) => {
@@ -322,10 +425,50 @@ impl Filter {
                 let names = structures(data);
                 set_cmp(*cmp, &names, v)
             }
-            Filter::Circle(cmp, cx, cz, r) => {
-                let cpos = c.absolute_location.chunk_to_block();
-                let dist = ((cpos.x as f64 - cx).powi(2) + (cpos.z as f64 - cz).powi(2)).sqrt();
-                num_cmp(*cmp, dist as i64, *r as i64)
+            Filter::Circle(cmp, circles) => {
+                let pos = c.absolute_location.chunk_to_block();
+                let inside = circles.iter().any(|&(cx, cz, r)| {
+                    let dx = pos.x as i64 - cx as i64;
+                    let dz = pos.z as i64 - cz as i64;
+                    dx * dx + dz * dz <= (r as i64) * (r as i64)
+                });
+                match cmp {
+                    Cmp::Eq | Cmp::Contains => inside,
+                    Cmp::Ne | Cmp::ContainsNot => !inside,
+                    _ => false,
+                }
+            }
+            Filter::Border(cmp, v) => {
+                // 9 when no data or status != full (upstream getNumber)
+                let status = nbt::string_or(Some(l), "Status", "");
+                let n = if status != "full" {
+                    9
+                } else {
+                    border_missing_neighbors(c, ctx)
+                };
+                num_cmp(*cmp, n, *v)
+            }
+            Filter::SelectionFile(cmp, path) => {
+                let pos = c.absolute_location;
+                let inside = ctx
+                    .csv_selection(path)
+                    .map(|s| s.is_chunk_selected(pos))
+                    .unwrap_or(false);
+                match cmp {
+                    Cmp::Eq => inside,
+                    Cmp::Ne => !inside,
+                    _ => false,
+                }
+            }
+            Filter::PlayerLocation { cmp, dir, dimension, spawn } => {
+                let inside = ctx
+                    .player_set(dir, dimension, *spawn)
+                    .contains(&c.absolute_location.as_long());
+                match cmp {
+                    Cmp::Contains | Cmp::Eq => inside,
+                    Cmp::ContainsNot | Cmp::Ne => !inside,
+                    _ => false,
+                }
             }
             Filter::Custom(path, cmp, val) => {
                 let cur = lookup_path(data, path);
@@ -335,6 +478,163 @@ impl Filter {
                 }
             }
         }
+    }
+}
+
+/// Border: count of missing neighbor chunks (0-8).
+fn border_missing_neighbors(c: &Chunk, ctx: &mut FilterCtx) -> i64 {
+    let pos = c.absolute_location;
+    let mut count = 0i64;
+    for (dx, dz) in [
+        (0, -1), (1, 0), (0, 1), (-1, 0),
+        (-1, -1), (1, -1), (1, 1), (-1, 1),
+    ] {
+        let n = pos.add(dx, dz);
+        let region = n.chunk_to_region().as_long();
+        let present = ctx
+            .region_chunk_set(region)
+            .map(|cs| {
+                let rel = n.as_relative_chunk();
+                cs.get(rel.z as usize * 32 + rel.x as usize)
+            })
+            .unwrap_or(false);
+        if !present {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// entities dimension chunk data for the same position as `c` (1.17+).
+fn entities_chunk<'m>(c: &Chunk, ctx: &'m mut FilterCtx) -> Option<std::rc::Rc<crate::mca::McaFile>> {
+    let region = c.absolute_location.chunk_to_region().as_long();
+    let m = ctx.entities_file(region)?;
+    let rel = c.absolute_location.as_relative_chunk();
+    let i = rel.z as usize * 32 + rel.x as usize;
+    m.chunks.get(i)?.as_ref()?;
+    Some(m)
+}
+
+/// entity ids: entities-dim chunk `Entities` list, else legacy Level.Entities.
+fn entity_ids(c: &Chunk, ctx: &mut FilterCtx) -> Vec<String> {
+    // entities file chunk
+    if let Some(m) = entities_chunk(c, ctx) {
+        let rel = c.absolute_location.as_relative_chunk();
+        let i = rel.z as usize * 32 + rel.x as usize;
+        if let Some(ec) = m.chunks[i].as_ref() {
+            if let Some(d) = &ec.data {
+                if let Some(ids) = list_names(d, &["Entities", "entities"], "id") {
+                    return ids;
+                }
+            }
+        }
+    }
+    // legacy: region Level.Entities
+    let Some(data) = &c.data else { return Vec::new() };
+    if let Some(level) = data.get("Level").and_then(Tag::as_compound) {
+        if let Some(ids) = list_names(level, &["Entities"], "id") {
+            return ids;
+        }
+    }
+    list_names(data, &["Entities"], "id").unwrap_or_default()
+}
+
+fn list_names(data: &Compound, keys: &[&str], field: &str) -> Option<Vec<String>> {
+    for k in keys {
+        if let Some((_, l)) = data.get(*k).and_then(Tag::as_list) {
+            return Some(
+                l.iter()
+                    .filter_map(|e| e.as_compound())
+                    .filter_map(|e| e.get(field).and_then(Tag::as_string))
+                    .map(|s| s.to_string())
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
+fn entity_count(c: &Chunk, ctx: &mut FilterCtx) -> i64 {
+    entity_ids(c, ctx).len() as i64
+}
+
+/// load player chunk positions from a playerdata directory.
+/// spawn: SpawnX/SpawnZ/SpawnDimension; else Pos/Dimension.
+fn load_player_chunks(
+    dir: &std::path::Path,
+    dimension: &str,
+    spawn: bool,
+) -> std::collections::HashSet<i64> {
+    use std::collections::HashSet;
+    let mut out = HashSet::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".dat") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(e.path()) else { continue };
+        let root = read_player_dat(&bytes);
+        let Some(root) = root else { continue };
+        let (x, z, dim) = if spawn {
+            let x = root.get("SpawnX").and_then(Tag::as_i64);
+            let z = root.get("SpawnZ").and_then(Tag::as_i64);
+            let dim = root.get("SpawnDimension");
+            match (x, z) {
+                (Some(x), Some(z)) => (x, z, dim),
+                _ => continue,
+            }
+        } else {
+            let pos = root.get("Pos").and_then(Tag::as_list);
+            let dim = root.get("Dimension").or_else(|| root.get("dimension"));
+            match pos {
+                Some((_, l)) if l.len() >= 3 => {
+                    (l[0].as_f64().unwrap_or(0.0) as i64, l[2].as_f64().unwrap_or(0.0) as i64, dim)
+                }
+                _ => continue,
+            }
+        };
+        if !dimension_matches(dim, dimension) {
+            continue;
+        }
+        let p = crate::point::Point2i::new(x as i32, z as i32);
+        out.insert(p.block_to_chunk().as_long());
+    }
+    out
+}
+
+fn read_player_dat(bytes: &[u8]) -> Option<Compound> {
+    // player .dat files are gzip-compressed NBT
+    use std::io::Read;
+    let raw = if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut d = flate2::read::GzDecoder::new(bytes);
+        let mut v = Vec::new();
+        d.read_to_end(&mut v).ok()?;
+        v
+    } else {
+        bytes.to_vec()
+    };
+    let mut r = crate::nbt::NbtReader::new(&raw[..]);
+    match r.read().ok()? {
+        Tag::Compound(c) => Some(c),
+        _ => None,
+    }
+}
+
+fn dimension_matches(dim: Option<&Tag>, want: &str) -> bool {
+    let want_num: Option<i64> = want.parse().ok();
+    match dim {
+        Some(Tag::Int(v)) => want_num.map(|w| w == *v as i64).unwrap_or(false),
+        Some(Tag::String(s)) => {
+            let w = match want {
+                "0" | "overworld" | "minecraft:overworld" => "minecraft:overworld",
+                "-1" | "the_nether" | "nether" | "minecraft:the_nether" => "minecraft:the_nether",
+                "1" | "the_end" | "end" | "minecraft:the_end" => "minecraft:the_end",
+                other => other,
+            };
+            s == w || s.strip_prefix("minecraft:") == Some(w.strip_prefix("minecraft:").unwrap_or(w))
+        }
+        _ => want_num.is_none() && want.is_empty(),
     }
 }
 
@@ -539,21 +839,50 @@ fn make_filter(field: &str, cmp: Cmp, value: &str) -> Result<Filter, String> {
         "status" => Filter::Status(cmp, unquote(value)),
         "palette" => Filter::Palette(cmp, split_list(value)),
         "biome" | "biomes" => Filter::Biome(cmp, split_list(value)),
-        "compression" => Filter::Compression(cmp, num(value)?),
+        "compression" => Filter::Compression(cmp, compression_value(value)?),
         "lightpopulated" => Filter::LightPopulated(cmp, matches!(unquote(value).to_ascii_lowercase().as_str(), "true" | "1" | "yes")),
-        "entities" | "entity" => Filter::Entities(cmp, num(value)?),
-        "tileentities" | "blockentities" => Filter::TileEntities(cmp, num(value)?),
+        "entities" | "entity" => {
+            // name list (EntityFilter): contains/intersects on entity ids
+            Filter::EntityNames(cmp, entity_names(value)?)
+        }
+        "#entities" | "entityamount" | "num_entities" => {
+            Filter::EntityAmount(cmp, num(value)?)
+        }
+        "#protoentities" | "protoentities" => {
+            Filter::ProtoEntityAmount(cmp, num(value)?)
+        }
+        "tileentities" | "blockentities" | "#tileentities" => {
+            Filter::TileEntities(cmp, num(value)?)
+        }
+        "border" => Filter::Border(cmp, num(value)?),
+        "selection" => {
+            let p = std::path::PathBuf::from(unquote(value));
+            if !p.is_file() {
+                return Err(format!("selection file not found: {}", p.display()));
+            }
+            Filter::SelectionFile(cmp, p)
+        }
+        "playerlocation" => player_filter(cmp, value, false)?,
+        "playerspawn" => player_filter(cmp, value, true)?,
         "structures" | "structure" => Filter::Structures(cmp, split_list(value)),
         "circle" => {
-            // circle intersects "x,z,r" or circle contains
-            let parts: Vec<f64> = split_list(value)
-                .iter()
-                .filter_map(|p| p.parse::<f64>().ok())
-                .collect();
-            if parts.len() != 3 {
-                return Err(format!("circle expects \"x,z,r\", got {value}"));
+            // Circle contains "x;z;r[,x2;z2;r2,...]"
+            let raw = unquote(value);
+            let mut circles = Vec::new();
+            for cdef in raw.split(',') {
+                let parts: Vec<&str> = cdef.trim().split(';').collect();
+                if parts.len() != 3 {
+                    return Err(format!("circle expects \"x;z;r\", got \"{cdef}\""));
+                }
+                let x: i32 = parts[0].trim().parse().map_err(|_| format!("bad circle x in \"{cdef}\""))?;
+                let z: i32 = parts[1].trim().parse().map_err(|_| format!("bad circle z in \"{cdef}\""))?;
+                let r: i32 = parts[2].trim().parse().map_err(|_| format!("bad circle r in \"{cdef}\""))?;
+                circles.push((x, z, r));
             }
-            Filter::Circle(cmp, parts[0], parts[1], parts[2])
+            if circles.is_empty() {
+                return Err("circle expects at least one \"x;z;r\"".into());
+            }
+            Filter::Circle(cmp, circles)
         }
         _ => {
             // Custom: arbitrary NBT path
@@ -566,5 +895,60 @@ fn make_filter(field: &str, cmp: Cmp, value: &str) -> Result<Filter, String> {
             };
             Filter::Custom(field.to_string(), cmp, val)
         }
+    })
+}
+
+/// CompressionFilter.setFilterValue: enum name (case-insensitive) or byte.
+fn compression_value(raw: &str) -> Result<i64, String> {
+    let r = unquote(raw).trim().to_string();
+    const NAMES: &[(&str, i64)] = &[
+        ("none", 0), ("gzip", 1), ("zlib", 2), ("uncompressed", 3), ("lz4", 4),
+        ("none_ext", -128), ("gzip_ext", -127), ("zlib_ext", -126),
+        ("uncompressed_ext", -125), ("lz4_ext", -124),
+    ];
+    if let Some((_, b)) = NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(&r)) {
+        return Ok(*b);
+    }
+    r.parse::<i64>()
+        .map_err(|_| format!("invalid compression type \"{r}\""))
+}
+
+/// EntityFilter.setFilterValue: comma-separated names; `foo:`/`foo` -> minecraft:foo
+fn entity_names(raw: &str) -> Result<Vec<String>, String> {
+    let unq = unquote(raw);
+    let names: Vec<String> = unq
+        .replace(' ', "")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|n| {
+            let n = n.trim_matches('\'').to_string();
+            if n.contains(':') {
+                n
+            } else {
+                format!("minecraft:{n}")
+            }
+        })
+        .collect();
+    if names.is_empty() {
+        return Err("empty entity list".into());
+    }
+    Ok(names)
+}
+
+/// PlayerLocation/Spawn: "<dir>:<dimension>"
+fn player_filter(cmp: Cmp, raw: &str, spawn: bool) -> Result<Filter, String> {
+    let unq = unquote(raw);
+    let (dir, dim) = unq
+        .rsplit_once(':')
+        .ok_or_else(|| format!("expected \"<playerdata dir>:<dimension>\", got \"{unq}\""))?;
+    let dir = std::path::PathBuf::from(dir);
+    if !dir.is_dir() {
+        return Err(format!("player data directory not found: {}", dir.display()));
+    }
+    Ok(Filter::PlayerLocation {
+        cmp,
+        dir,
+        dimension: dim.to_string(),
+        spawn,
     })
 }

@@ -6,6 +6,7 @@ use crate::config::{self};
 use crate::tilemap::*;
 use gpui::*;
 use mc_core::files;
+use crate::nbt_editor;
 use mc_core::point::{Point2f, Point2i};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +49,19 @@ pub enum Dialog {
     RenderSettings { draft: config::WorldConfig },
     Info { msg: String },
     JobProgress,
+    NbtEditor {
+        region: i64,
+        chunk_abs: Point2i,
+        index: usize,
+        root: mc_core::nbt::Compound,
+        expanded: std::collections::HashSet<String>,
+        sel: usize,
+        /// 0 = none, 1 = value edit, 2 = add child, 3 = rename
+        editing: u8,
+        buf: String,
+        status: String,
+        dirty: bool,
+    },
     TextInput {
         title: String,
         hint: String,
@@ -452,6 +466,11 @@ impl MainView {
             cx.notify();
             return;
         }
+        if matches!(self.dialog, Some(Dialog::NbtEditor { .. })) {
+            self.nbt_editor_key(event, cx);
+            cx.notify();
+            return;
+        }
         if k == "escape" {
             match self.dialog {
                 Some(Dialog::Info { .. }) => {}
@@ -459,6 +478,157 @@ impl MainView {
             }
         }
         cx.notify();
+    }
+
+    /// keyboard handling for the NBT tree editor (NBTTreeView edit mode).
+    fn nbt_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let k = event.keystroke.key.as_str();
+        let ctrl = event.keystroke.modifiers.control;
+        let Some(Dialog::NbtEditor {
+            root, expanded, sel, editing, buf, status, dirty, region, chunk_abs, index,
+        }) = &mut self.dialog
+        else {
+            return;
+        };
+        if *editing != 0 {
+            match k {
+                "enter" => {
+                    let mode = *editing;
+                    let path = nbt_editor::flatten(root, expanded)
+                        .get(*sel)
+                        .map(|r| r.path.clone())
+                        .unwrap_or_default();
+                    let res = match mode {
+                        1 => nbt_editor::apply_value_edit(root, &path, buf),
+                        2 => {
+                            let rows = nbt_editor::flatten(root, expanded);
+                            let container_path: String = rows
+                                .get(*sel)
+                                .map(|r| {
+                                    if r.container {
+                                        r.path.clone()
+                                    } else {
+                                        r.path
+                                            .rsplit_once('.')
+                                            .map(|(p, _)| p.to_string())
+                                            .or_else(|| {
+                                                r.path.rfind('[').map(|i| r.path[..i].to_string())
+                                            })
+                                            .unwrap_or_default()
+                                    }
+                                })
+                                .unwrap_or_default();
+                            nbt_editor::apply_add(root, &container_path, buf)
+                        }
+                        3 => nbt_editor::apply_rename(root, &path, buf),
+                        _ => Ok(()),
+                    };
+                    match res {
+                        Ok(()) => {
+                            *dirty = true;
+                            *status = "modified — ctrl-s to save".into();
+                        }
+                        Err(e) => *status = format!("error: {e}"),
+                    }
+                    *editing = 0;
+                    buf.clear();
+                }
+                "escape" => {
+                    *editing = 0;
+                    buf.clear();
+                }
+                "backspace" => {
+                    buf.pop();
+                }
+                _ => {
+                    if let Some(c) = &event.keystroke.key_char {
+                        buf.push_str(c);
+                    } else if k == "space" {
+                        buf.push(' ');
+                    } else if k.len() == 1 {
+                        buf.push_str(k);
+                    }
+                }
+            }
+            return;
+        }
+        let rows = nbt_editor::flatten(root, expanded);
+        match k {
+            "up" => *sel = sel.saturating_sub(1),
+            "down" => *sel = (*sel + 1).min(rows.len().saturating_sub(1)),
+            "pageup" => *sel = sel.saturating_sub(20),
+            "pagedown" => *sel = (*sel + 20).min(rows.len().saturating_sub(1)),
+            "right" => {
+                if let Some(r) = rows.get(*sel) {
+                    if r.container {
+                        expanded.insert(r.path.clone());
+                    }
+                }
+            }
+            "left" => {
+                if let Some(r) = rows.get(*sel) {
+                    if r.container && r.expanded {
+                        expanded.remove(&r.path);
+                    } else if let Some(pos) = r.path.rfind(|c| c == '.' || c == '[') {
+                        // collapse to parent
+                        let parent = r.path[..pos].to_string();
+                        if let Some(pi) = rows.iter().position(|x| x.path == parent) {
+                            *sel = pi;
+                        }
+                    }
+                }
+            }
+            "enter" | "e" => {
+                if let Some(r) = rows.get(*sel) {
+                    if r.container {
+                        if r.expanded {
+                            expanded.remove(&r.path);
+                        } else {
+                            expanded.insert(r.path.clone());
+                        }
+                    } else {
+                        *editing = 1;
+                        let cur = mc_core::nbt::path_get(root, &r.path)
+                            .map(nbt_editor::tag_edit_text)
+                            .unwrap_or_default();
+                        *buf = cur;
+                    }
+                }
+            }
+            "a" => {
+                *editing = 2;
+                buf.clear();
+                *status = "name = snbt_value".into();
+            }
+            "r" => {
+                if let Some(r) = rows.get(*sel) {
+                    if !r.name.starts_with('[') {
+                        *editing = 3;
+                        *buf = r.name.clone();
+                    }
+                }
+            }
+            "delete" => {
+                if let Some(r) = rows.get(*sel) {
+                    if nbt_editor::apply_delete(root, &r.path) {
+                        *dirty = true;
+                        *sel = sel.saturating_sub(1).min(rows.len().saturating_sub(2));
+                        *status = "deleted — ctrl-s to save".into();
+                    }
+                }
+            }
+            "s" if ctrl => {
+                let _ = (region, chunk_abs, index);
+                let _ = status;
+                let _ = dirty;
+                // handled after borrow ends below
+            }
+            "escape" => self.dialog = None,
+            _ => {}
+        }
+        if k == "s" && ctrl {
+            self.nbt_editor_save(cx);
+        }
     }
 
     fn zoom_key(&mut self, zoom: f32, cx: &mut Context<Self>) {
@@ -711,6 +881,18 @@ impl MainView {
             "taiga_village" => include_bytes!("../resources/img/structure/taiga_village.png").as_slice(),
             "trial_chambers" => include_bytes!("../resources/img/structure/trial_chambers.png").as_slice(),
             "woodland_mansion" => include_bytes!("../resources/img/structure/woodland_mansion.png").as_slice(),
+            "nbt_byte" => include_bytes!("../resources/img/nbt/byte.png").as_slice(),
+            "nbt_short" => include_bytes!("../resources/img/nbt/short.png").as_slice(),
+            "nbt_int" => include_bytes!("../resources/img/nbt/int.png").as_slice(),
+            "nbt_long" => include_bytes!("../resources/img/nbt/long.png").as_slice(),
+            "nbt_float" => include_bytes!("../resources/img/nbt/float.png").as_slice(),
+            "nbt_double" => include_bytes!("../resources/img/nbt/double.png").as_slice(),
+            "nbt_byte_array" => include_bytes!("../resources/img/nbt/byte_array.png").as_slice(),
+            "nbt_int_array" => include_bytes!("../resources/img/nbt/int_array.png").as_slice(),
+            "nbt_long_array" => include_bytes!("../resources/img/nbt/long_array.png").as_slice(),
+            "nbt_string" => include_bytes!("../resources/img/nbt/string.png").as_slice(),
+            "nbt_list" => include_bytes!("../resources/img/nbt/list.png").as_slice(),
+            "nbt_compound" => include_bytes!("../resources/img/nbt/compound.png").as_slice(),
             _ => return None,
         };
         let img = image::load_from_memory(bytes).ok()?.to_rgba8();
@@ -745,6 +927,35 @@ impl MainView {
         parts.push(format!("{} jobs in queue", mc_core::jobs::active_jobs()));
         parts.join(" | ")
     }
+}
+
+/// static nbt type icons (img/nbt/*.png), lazily decoded once.
+fn nbt_icon(type_id: u8) -> Option<Arc<RenderImage>> {
+    static CACHE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u8, Arc<RenderImage>>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(i) = CACHE.lock().unwrap().get(&type_id) {
+        return Some(i.clone());
+    }
+    let name = nbt_editor::icon_name(type_id);
+    let bytes: &[u8] = match name {
+        "byte" => include_bytes!("../resources/img/nbt/byte.png"),
+        "short" => include_bytes!("../resources/img/nbt/short.png"),
+        "int" => include_bytes!("../resources/img/nbt/int.png"),
+        "long" => include_bytes!("../resources/img/nbt/long.png"),
+        "float" => include_bytes!("../resources/img/nbt/float.png"),
+        "double" => include_bytes!("../resources/img/nbt/double.png"),
+        "byte_array" => include_bytes!("../resources/img/nbt/byte_array.png"),
+        "int_array" => include_bytes!("../resources/img/nbt/int_array.png"),
+        "long_array" => include_bytes!("../resources/img/nbt/long_array.png"),
+        "string" => include_bytes!("../resources/img/nbt/string.png"),
+        "list" => include_bytes!("../resources/img/nbt/list.png"),
+        "compound" => include_bytes!("../resources/img/nbt/compound.png"),
+        _ => return None,
+    };
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let r = Arc::new(RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(img), 1)));
+    CACHE.lock().unwrap().insert(type_id, r.clone());
+    Some(r)
 }
 
 /// selection overlay cache: keyed by (region, selection_version)
@@ -936,6 +1147,7 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &SumSelectionAction, _w, cx| v.sum_selection(cx)))
             .on_action(cx.listener(|v, _: &SwapChunksAction, _w, cx| v.swap_chunks(cx)))
             .on_action(cx.listener(|v, _: &FilterChunksAction, _w, cx| v.filter_chunks(cx)))
+            .on_action(cx.listener(|v, _: &EditNBTAction, _w, cx| v.edit_nbt(cx)))
             .on_action(cx.listener(|v, _: &ChangeFieldsAction, _w, cx| v.change_fields(cx)))
             .on_action(cx.listener(|v, _: &ImportChunksAction, _w, cx| v.import_chunks(cx)))
             .on_action(cx.listener(|v, _: &EditOverlaysAction, _w, cx| v.edit_overlays(cx)))
@@ -1644,7 +1856,10 @@ impl MainView {
         mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
             mc_core::jobs::PRIORITY_LOW, None,
             move || {
-                let val = parse_snbt_value(&raw);
+                let val = match mc_core::nbt::parse_snbt(&raw) {
+                    Ok(v) => v,
+                    Err(_) => parse_snbt_value(&raw),
+                };
                 let __p = mc_core::jobs::Progress::new("Changing fields", sel.selection.len() as i64);
                 for (&region_l, chunks) in &sel.selection {
                     let __g = __p.inc_guard();
@@ -1671,6 +1886,107 @@ impl MainView {
         cx.notify();
     }
 
+
+    /// Tools > Edit chunk (upstream editNBT): needs exactly 1 selected chunk.
+    fn edit_nbt(&mut self, cx: &mut Context<Self>) {
+        let sel = &self.map.selection;
+        if sel.inverted || self.map.selected_chunks != 1 {
+            self.dialog = Some(Dialog::Error {
+                msg: "select exactly one chunk to edit".into(),
+            });
+            cx.notify();
+            return;
+        }
+        // find the single selected chunk
+        let mut found: Option<(i64, usize)> = None;
+        for (&rl, cs) in &sel.selection {
+            if let Some(cs) = cs {
+                for i in cs.iter() {
+                    found = Some((rl, i));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        let Some((region_l, index)) = found else {
+            self.dialog = Some(Dialog::Error { msg: "select exactly one chunk to edit".into() });
+            cx.notify();
+            return;
+        };
+        let region = Point2i::from_long(region_l);
+        let rel = Point2i::from_chunk_index(index as i32);
+        let chunk_abs = region.region_to_chunk().add_p(rel);
+        let Some(dir) = config::world().and_then(|w| w.dirs.region.clone()) else { return };
+        let path = dir.join(mc_core::files::mca_file_name(region));
+        let Ok(m) = mc_core::mca::McaFile::new(path) else { return };
+        let loaded = m.load_single_chunk(chunk_abs, false).ok().flatten();
+        let Some(chunk) = loaded else {
+            self.dialog = Some(Dialog::Error { msg: "failed to load chunk".into() });
+            cx.notify();
+            return;
+        };
+        let Some(data) = chunk.data else {
+            self.dialog = Some(Dialog::Error { msg: "chunk has no data".into() });
+            cx.notify();
+            return;
+        };
+        let mut expanded = std::collections::HashSet::new();
+        for k in data.keys() {
+            expanded.insert(k.clone());
+        }
+        self.dialog = Some(Dialog::NbtEditor {
+            region: region_l,
+            chunk_abs,
+            index,
+            root: data,
+            expanded,
+            sel: 0,
+            editing: 0,
+            buf: String::new(),
+            status: "↑↓ navigate  ←→ collapse/expand  enter edit  a add  r rename  del delete  ctrl-s save  esc close".into(),
+            dirty: false,
+        });
+        cx.notify();
+    }
+
+    /// save the edited chunk NBT back to disk through the process pool.
+    fn nbt_editor_save(&mut self, cx: &mut Context<Self>) {
+        let Some(Dialog::NbtEditor { region, chunk_abs, index, root, expanded, sel, status, dirty, .. }) = self.dialog.take() else {
+            return;
+        };
+        self.dialog = Some(Dialog::NbtEditor {
+            region,
+            chunk_abs,
+            index,
+            root: root.clone(),
+            expanded,
+            sel,
+            editing: 0,
+            buf: String::new(),
+            status: if dirty { "saving...".into() } else { status },
+            dirty: false,
+        });
+        let tx = self.map.result_tx.clone();
+        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+            mc_core::jobs::PRIORITY_LOW, None,
+            move || {
+                let rp = Point2i::from_long(region);
+                let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { return };
+                let path = dir.join(mc_core::files::mca_file_name(rp));
+                let Ok(mut m) = mc_core::mca::McaFile::new(path.clone()) else { return };
+                if m.load(false).is_err() { return; }
+                if let Some(c) = m.chunks[index].as_mut() {
+                    c.data = Some(root);
+                    let _ = m.save_with_temp_file(&path);
+                }
+                let _ = tx.send(crate::tilemap::TileResult::Image {
+                    region: rp, image: None, zoom: 0, structures: None, cache_write: false,
+                });
+            }));
+        cx.notify();
+    }
 
     fn edit_overlays(&mut self, cx: &mut Context<Self>) {
         // serialize current overlays as editable lines: "Type min max [data]"
@@ -1736,7 +2052,7 @@ impl MainView {
     fn filter_chunks(&mut self, cx: &mut Context<Self>) {
         self.dialog = Some(Dialog::TextInput {
             title: "Filter chunks".into(),
-            hint: "query e.g.: xPos >= 0 AND Palette contains minecraft:stone".into(),
+            hint: "query e.g.: xPos >= 0 AND Palette contains \"minecraft:stone\"  |  fields: xPos zPos yPos DataVersion InhabitedTime LastUpdate Timestamp Status Palette Biome Compression Entities #Entities #ProtoEntities #TileEntities Structures Circle Border Selection PlayerLocation PlayerSpawn LightPopulated <nbt.path>".into(),
             text: String::new(),
             on_done: Box::new(|v, w, cx, text| {
                 v.apply_filter(text, w, cx);
@@ -1770,6 +2086,11 @@ impl MainView {
                     sel.selection.keys().copied().collect()
                 };
                 let __p = mc_core::jobs::Progress::new("Filtering chunks", regions.len() as i64);
+                let dirs = crate::config::world().map(|w| w.dirs.clone());
+                let mut ctx = mc_core::filter::FilterCtx::new(
+                    dirs.as_ref().and_then(|d| d.region.clone()),
+                    dirs.as_ref().and_then(|d| d.entities.clone()),
+                );
                 for rl in regions {
                     let __g = __p.inc_guard();
                     let region = mc_core::point::Point2i::from_long(rl);
@@ -1780,13 +2101,14 @@ impl MainView {
                     if !p.exists() { continue; }
                     let Ok(mut m) = mc_core::mca::McaFile::new(p) else { continue };
                     if m.load(false).is_err() { continue; }
+                    ctx.insert_chunk_set(rl, m.offsets_chunk_set());
                     for i in 0..1024 {
                         let within = sel.selection.get(&rl).map(|c| c.as_ref().map(|s| s.get(i)).unwrap_or(true)).unwrap_or(sel.is_empty());
                         if !within { continue; }
                         let Some(c) = &m.chunks[i] else { continue };
                         let Some(d) = &c.data else { continue };
                         let dv = mc_core::nbt::data_version(Some(d));
-                        if expr.matches(c, dv) {
+                        if expr.matches(c, dv, &mut ctx) {
                             let chunk = region.region_to_chunk().add_p(mc_core::point::Point2i::from_chunk_index(i as i32));
                             result.add_chunk(chunk);
                         }
@@ -2019,6 +2341,102 @@ impl MainView {
                     cx.notify();
                 })))
             }
+            Dialog::NbtEditor {
+                root, expanded, sel, editing, buf, status, chunk_abs, dirty, ..
+            } => {
+                let rows = nbt_editor::flatten(root, expanded);
+                let n = rows.len();
+                let vis = 22usize;
+                let start = if *sel >= vis { sel + 1 - vis } else { 0 };
+                let end = (start + vis).min(n);
+                let mut list = v_flex()
+                    .h(px(vis as f32 * 20.))
+                    .overflow_hidden()
+                    .gap(px(1.));
+                for (i, r) in rows[start..end].iter().enumerate() {
+                    let idx = start + i;
+                    let selected = idx == *sel;
+                    let indent = r.depth as f32 * 14.0;
+                    let mut row = div()
+                        .id(("row", idx))
+                        .flex()
+                        .items_center()
+                        .pl(px(4. + indent))
+                        .h(px(19.))
+                        .text_size(px(12.))
+                        .bg(if selected { rgb(0x3a5a8a) } else { rgba(0x00000000) })
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |v, _e: &MouseDownEvent, _w, cx| {
+                            cx.stop_propagation();
+                            if let Some(Dialog::NbtEditor { sel, .. }) = &mut v.dialog {
+                                *sel = idx;
+                            }
+                            cx.notify();
+                        }));
+                    if r.container {
+                        row = row.child(text_el(if r.expanded { "▾ " } else { "▸ " }, 11.));
+                    } else {
+                        row = row.child(text_el("  ", 11.));
+                    }
+                    if let Some(ic) = nbt_icon(r.type_id) {
+                        row = row.child(
+                            img(ImageSource::Render(ic))
+                                .size(px(12.))
+                                .mr(px(3.)),
+                        );
+                    }
+                    let label = if r.value.is_empty() {
+                        r.name.clone()
+                    } else if r.name.starts_with('[') {
+                        format!("{} {}", r.name, r.value)
+                    } else {
+                        format!("{}: {}", r.name, r.value)
+                    };
+                    row = row.child(
+                        div()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(label),
+                    );
+                    list = list.child(row);
+                }
+                let edit_line = if *editing != 0 {
+                    let hint = match editing {
+                        1 => "value (snbt)",
+                        2 => "new tag: name = value",
+                        _ => "new name",
+                    };
+                    v_flex().gap_1()
+                        .child(text_el(hint, 10.))
+                        .child(div().w_full().min_w(px(560.)).child(input_box("nbt-edit", buf, true)))
+                        .into_any_element()
+                } else {
+                    div().h(px(0.)).into_any_element()
+                };
+                v_flex()
+                    .w(px(700.))
+                    .bg(rgb(0x2b2b2b))
+                    .border_1()
+                    .border_color(rgb(0x555555))
+                    .rounded_sm()
+                    .p_4()
+                    .gap_2()
+                    .text_color(rgb(0xdddddd))
+                    .child(text_el(
+                        format!("NBT editor — chunk {}, {} {}", chunk_abs.x, chunk_abs.z, if *dirty { "(modified)" } else { "" }),
+                        15.,
+                    ))
+                    .child(list)
+                    .child(edit_line)
+                    .child(text_el(status.clone(), 10.))
+                    .child(
+                        h_flex().gap_2()
+                            .child(button("Save", cx, |v, _w, cx| v.nbt_editor_save(cx)))
+                            .child(button("Close", cx, |v, _w, cx| {
+                                v.dialog = None;
+                                cx.notify();
+                            })),
+                    )
+            }
             Dialog::Info { msg } => panel(
                 v_flex().child(text_el(msg.clone(), 14.)),
             ),
@@ -2073,7 +2491,8 @@ impl MainView {
                 .on_mouse_down(MouseButton::Left, cx.listener(|v, e, _w, cx| {
                     let _ = e;
                     match v.dialog {
-                        Some(Dialog::Confirm { .. }) | Some(Dialog::Info { .. }) | Some(Dialog::Goto { .. }) | Some(Dialog::JobProgress) => {}
+                        Some(Dialog::Confirm { .. }) | Some(Dialog::Info { .. }) | Some(Dialog::Goto { .. })
+                            | Some(Dialog::JobProgress) | Some(Dialog::NbtEditor { .. }) | Some(Dialog::TextInput { .. }) => {}
                         _ => v.dialog = None,
                     }
                     cx.notify();
