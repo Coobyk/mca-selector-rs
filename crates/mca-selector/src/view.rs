@@ -76,7 +76,6 @@ pub struct MainView {
     pressed_keys: u8,
     dialog: Option<Dialog>,
     pub update_needed: bool,
-    pub selection_version: u64,
     icon_cache: std::collections::HashMap<String, Arc<RenderImage>>,
     last_frame: std::time::Instant,
 }
@@ -104,7 +103,6 @@ impl MainView {
             pressed_keys: 0,
             dialog: None,
             update_needed: true,
-            selection_version: 0,
             icon_cache: std::collections::HashMap::new(),
             last_frame: std::time::Instant::now(),
         };
@@ -129,10 +127,7 @@ impl MainView {
             self.map.selection = sel;
             self.map.selected_chunks = n as i64;
             self.map.unsaved_selection = true;
-            self.selection_version += 1;
-            for t in self.map.tiles.values_mut() {
-                t.marked_chunks_image = None;
-            }
+            self.map.selection_version += 1;
             self.dialog = Some(Dialog::Info { msg: format!("filter matched {n} chunks") });
         }
         let changed = self.map.poll_results();
@@ -241,6 +236,7 @@ impl MainView {
         let ws = config::open_world(dirs, dims.clone());
         self.map.regions = files::scan_region_files(ws.region_dir());
         self.map.disabled = false;
+        self.map.clear_selection();
         self.map.unsaved_selection = false;
         self.update_needed = true;
         let mut g = config::global();
@@ -344,11 +340,8 @@ impl MainView {
                                 self.map.selection.remove_chunk(chunk);
                                 self.map.selected_chunks += if self.map.selection.is_inverted() { 1 } else { -1 };
                             }
-                            let region = chunk.chunk_to_region();
-                            self.map.tiles
-                                .entry(region.as_long())
-                                .or_insert_with(|| Tile::new(region))
-                                .marked_chunks_image = None;
+                            // selection_version bump already invalidates the overlay cache
+                            let _ = chunk.chunk_to_region();
                         }
                     } else {
                         let region = self.map.mouse_region(pos.x, pos.z);
@@ -366,7 +359,7 @@ impl MainView {
                         };
                     }
                     self.map.unsaved_selection = true;
-                    self.selection_version += 1;
+                    self.map.selection_version += 1;
                 }
             }
             MouseButton::Right => {
@@ -409,7 +402,7 @@ impl MainView {
                 // upstream: paintMode = SHIFT held (other keys ignored)
                 let paint_mode = event.modifiers.shift;
                 self.map.mark(pos.x, pos.z, mark, self.first, paint_mode);
-                self.selection_version += 1;
+                self.map.selection_version += 1;
             }
         }
         self.previous = pos;
@@ -428,7 +421,7 @@ impl MainView {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         // dialog key input
         if self.dialog.is_some() {
-            self.dialog_key(event, cx);
+            self.dialog_key(event, _window, cx);
             return;
         }
         let k = event.keystroke.key.as_str();
@@ -458,7 +451,7 @@ impl MainView {
         cx.notify();
     }
 
-    fn dialog_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn dialog_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = event.keystroke.key.as_str();
         if let Some(Dialog::Goto { x, z, focus_x }) = &mut self.dialog {
             match k {
@@ -507,7 +500,13 @@ impl MainView {
             match k {
                 "backspace" => { text.pop(); }
                 "escape" => self.dialog = None,
-                "enter" => {}
+                "enter" => {
+                    if let Some(Dialog::TextInput { text, on_done, .. }) = self.dialog.take() {
+                        (on_done)(self, window, cx, text);
+                    }
+                    cx.notify();
+                    return;
+                }
                 _ => {
                     let c = &event.keystroke.key_char;
                     if let Some(c) = c {
@@ -531,10 +530,7 @@ impl MainView {
             if self.map.pasted.is_some() {
                 self.map.cancel_paste();
             }
-            match self.dialog {
-                Some(Dialog::Info { .. }) => {}
-                _ => self.dialog = None,
-            }
+            self.dialog = None;
         }
         cx.notify();
     }
@@ -766,7 +762,7 @@ impl MainView {
                     let _ = window.paint_image(b, px(0.).into(), oi, 0, false);
                 }
             }
-            if let Some(ov) = selection_overlay_image(tile, &self.map.selection, self.selection_version) {
+            if let Some(ov) = selection_overlay_image(tile, &self.map.selection, self.map.selection_version) {
                 let _ = window.paint_image(b, px(0.).into(), ov, 0, false);
             }
             if let Some(cs) = &pasted_cs {
@@ -1376,10 +1372,7 @@ impl MainView {
                                 v.map.selection.merge(&sel);
                                 v.map.selected_chunks = v.map.selection.count() as i64;
                                 v.map.unsaved_selection = true;
-                                for t in v.map.tiles.values_mut() {
-                                    t.marked_chunks_image = None;
-                                }
-                                v.selection_version += 1;
+                                v.map.selection_version += 1;
                             }
                             Err(e) => {
                                 v.dialog = Some(Dialog::Error { msg: e.to_string() });

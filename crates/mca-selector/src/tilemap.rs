@@ -33,7 +33,8 @@ pub fn get_zoom_level(scale: f32) -> i32 {
     if s <= 1 {
         1
     } else {
-        i32::MAX - s.leading_zeros() as i32 + 1 // highestOneBit
+        // Integer.highestOneBit
+        1 << (31 - s.leading_zeros())
     }
 }
 
@@ -43,12 +44,9 @@ pub struct Tile {
     /// argb buffer + its zoom level (image size = 512/zoom)
     pub image: Option<(Vec<u32>, i32)>,
     pub loaded: bool,
-    pub overlay: Option<(Vec<u32>, i32)>,
     pub overlay_data: Option<std::sync::Arc<[i32; 1024]>>,
     pub overlay_loaded: bool,
     pub structures: Option<HashMap<i64, Vec<String>>>,
-    pub marked_chunks_image: Option<Vec<u32>>, // 32x32 argb
-    pub pasted_image: Option<Vec<u32>>, // 32x32 argb paste ghost
     /// gpu-ready image, built when the argb result lands
     pub render_image: Option<std::sync::Arc<gpui::RenderImage>>,
     /// gpu-ready 32x32 overlay image
@@ -61,12 +59,9 @@ impl Tile {
             location,
             image: None,
             loaded: false,
-            overlay: None,
             overlay_data: None,
             overlay_loaded: false,
             structures: None,
-            marked_chunks_image: None,
-            pasted_image: None,
             render_image: None,
             overlay_render_image: None,
         }
@@ -103,10 +98,6 @@ pub enum TileResult {
         /// write to disk cache as well
         cache_write: bool,
     },
-    Structures {
-        region: Point2i,
-        structures: Option<HashMap<i64, Vec<String>>>,
-    },
     /// 32x32 ARGB overlay image (one pixel per chunk)
     Overlay {
         region: Point2i,
@@ -115,16 +106,6 @@ pub enum TileResult {
     },
 }
 
-pub static RESULT_TX: OnceLock<Sender<TileResult>> = OnceLock::new();
-
-pub fn result_sender() -> Sender<TileResult> {
-    RESULT_TX.get_or_init(|| {
-        let (tx, _rx) = channel();
-        // never used without install
-        tx
-    })
-    .clone()
-}
 
 /// upstream pastedChunks state: chunks copied to clipboard dir + drag offset.
 pub struct Pasted {
@@ -146,6 +127,8 @@ pub struct TileMapState {
     pub selection: Selection,
     pub selected_chunks: i64,
     pub unsaved_selection: bool,
+    /// bumped by every selection mutation; overlay caches key on it.
+    pub selection_version: u64,
     pub show_chunk_grid: bool,
     pub show_region_grid: bool,
     pub show_coordinates: bool,
@@ -159,8 +142,6 @@ pub struct TileMapState {
     pub pool: HashMap<i32, HashMap<i64, Vec<u32>>>,
     pub pool_order: HashMap<i32, Vec<i64>>, // insertion order for trim
     pub loading: HashSet<i64>,
-    /// region mca cache (visible regions only, maxLoadedFiles)
-    pub mca_cache: Vec<Point2i>,
     pub results_rx: Option<Receiver<TileResult>>,
     pub result_tx: Sender<TileResult>,
     /// active overlay parser (overlayPool.parser)
@@ -192,6 +173,7 @@ impl TileMapState {
             selection: Selection::new(),
             selected_chunks: 0,
             unsaved_selection: false,
+            selection_version: 0,
             show_chunk_grid: g.show_chunk_grid,
             show_region_grid: g.show_region_grid,
             show_coordinates: g.show_coordinates,
@@ -204,7 +186,6 @@ impl TileMapState {
             pool: HashMap::new(),
             pool_order: HashMap::new(),
             loading: HashSet::new(),
-            mca_cache: Vec::new(),
             results_rx: Some(rx),
             result_tx: tx,
             overlay: None,
@@ -235,15 +216,6 @@ impl TileMapState {
         (min, max)
     }
 
-    /// runOnVisibleRegions — rows, top-left to bottom-right.
-    pub fn for_visible_regions(&self, mut f: impl FnMut(Point2i)) {
-        let (min, max) = self.visible_region_bounds(Point2f::ZERO);
-        for x in min.x..=max.x {
-            for z in min.z..=max.z {
-                f(Point2i::new(x, z));
-            }
-        }
-    }
 
     /// spiral iteration center-out with limit (priorities).
     pub fn for_visible_regions_spiral(&self, limit: usize, mut f: impl FnMut(Point2i)) {
@@ -339,9 +311,7 @@ impl TileMapState {
                 t.render_image = None;
                 t.structures = None;
             }
-            t.marked_chunks_image = None;
             if overlay {
-                t.overlay = None;
             }
             t.loaded = false;
         }
@@ -423,7 +393,6 @@ impl TileMapState {
             .tiles
             .entry(region.as_long())
             .or_insert_with(|| Tile::new(region));
-        t.marked_chunks_image = None;
     }
 
     /// TileMap.setPastedChunks — enter paste mode, offset centered on screen.
@@ -452,7 +421,6 @@ impl TileMapState {
     pub fn cancel_paste(&mut self) {
         self.pasted = None;
         for t in self.tiles.values_mut() {
-            t.pasted_image = None;
         }
     }
 
@@ -465,7 +433,6 @@ impl TileMapState {
             }
         }
         for t in self.tiles.values_mut() {
-            t.pasted_image = None;
         }
     }
 
@@ -532,24 +499,24 @@ impl TileMapState {
         self.selection = Selection::new();
         self.selected_chunks = 0;
         self.unsaved_selection = false;
+        self.selection_version += 1;
         for t in self.tiles.values_mut() {
-            t.marked_chunks_image = None;
         }
     }
 
     pub fn invert_selection(&mut self) {
         self.selection.inverted = !self.selection.inverted;
+        self.selection_version += 1;
         for t in self.tiles.values_mut() {
-            t.marked_chunks_image = None;
         }
     }
 
     pub fn invert_regions_with_selection(&mut self) {
         self.selection.invert_all();
+        self.selection_version += 1;
         self.selected_chunks = self.selection.count() as i64;
         self.unsaved_selection = true;
         for t in self.tiles.values_mut() {
-            t.marked_chunks_image = None;
         }
     }
 
@@ -558,7 +525,6 @@ impl TileMapState {
         self.pool.clear();
         self.pool_order.clear();
         self.loading.clear();
-        self.mca_cache.clear();
     }
 
     /// region file path for a tile
@@ -796,7 +762,6 @@ impl TileMapState {
     /// TileMap.clearOverlay
     pub fn clear_overlay(&mut self) {
         for t in self.tiles.values_mut() {
-            t.overlay = None;
             t.overlay_data = None;
             t.overlay_loaded = false;
             t.overlay_render_image = None;
@@ -976,12 +941,12 @@ impl TileMapState {
         if self.loading.contains(&region.as_long()) {
             return;
         }
-        self.loading.insert(region.as_long());
         let tx = self.result_tx.clone();
         let path = match self.mca_path(region) {
             Some(p) => p,
             None => return,
         };
+        self.loading.insert(region.as_long());
         let cfg = mc_core::render::RenderSettings {
             render_height: ws.cfg.render_height,
             layer_only: ws.cfg.render_layer_only,
@@ -1244,18 +1209,12 @@ impl TileMapState {
                     }
                     self.record_file_time(region);
                 }
-                TileResult::Structures { region, structures } => {
-                    if let Some(t) = self.tiles.get_mut(&region.as_long()) {
-                        t.structures = structures;
-                    }
-                }
                 TileResult::Overlay { region, image, data } => {
                     self.overlay_loading.remove(&region.as_long());
                     if let Some(t) = self.tiles.get_mut(&region.as_long()) {
                         if let Some(img) = image {
                             if self.overlay.is_some() {
                                 t.overlay_render_image = argb_to_render_image(&img, 32);
-                                t.overlay = Some((img, 32));
                                 t.overlay_data = data;
                             }
                         }
