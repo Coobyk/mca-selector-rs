@@ -499,7 +499,7 @@ fn split_escaped(s: &str, sep: char, esc: char) -> Vec<String> {
 }
 
 /// TextHelper.parseDuration — returns seconds. e.g. "1d", "2h30m".
-fn parse_duration(d: &str) -> Result<i64, String> {
+pub(crate) fn parse_duration(d: &str) -> Result<i64, String> {
     const UNITS: &[(&[&str], i64)] = &[
         (&["years", "year", "y"], 31536000),
         (&["months", "month"], 2592000),
@@ -552,7 +552,7 @@ fn parse_duration(d: &str) -> Result<i64, String> {
 }
 
 /// TextHelper.parseTimestamp — "yyyy-MM-dd[ HH[:mm[:ss]]]" → epoch seconds.
-fn parse_timestamp(t: &str) -> Result<i32, String> {
+pub(crate) fn parse_timestamp(t: &str) -> Result<i32, String> {
     let t = t.trim();
     let (date, time) = match t.split_once(' ') {
         Some((d, tm)) => (d, tm),

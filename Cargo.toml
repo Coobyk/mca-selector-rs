@@ -30,3 +30,6 @@ codegen-units = 1
 # libc::ENOATTR — removed from libc on Linux. Vendored fix: ENODATA.
 [patch.crates-io]
 xattr = { path = "patches/xattr" }
+# Vendored gpui 0.2.2 with a fail-soft atlas upload: zero/oversized sprites
+# return None instead of panicking in blade_atlas (upstream unwrap crash).
+gpui = { path = "patches/gpui" }

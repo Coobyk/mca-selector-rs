@@ -833,9 +833,24 @@ fn make_filter(field: &str, cmp: Cmp, value: &str) -> Result<Filter, String> {
         "zpos" => Filter::ZPos(cmp, num(value)? as i32),
         "ypos" => Filter::YPos(cmp, num(value)? as i32),
         "dataversion" => Filter::DataVersion(cmp, num(value)? as i32),
-        "inhabitedtime" => Filter::InhabitedTime(cmp, num(value)?),
-        "lastupdate" => Filter::LastUpdate(cmp, num(value)?),
-        "timestamp" => Filter::Timestamp(cmp, num(value)?),
+        "inhabitedtime" => Filter::InhabitedTime(
+            cmp,
+            num(value).or_else(|_| {
+                crate::overlay::parse_duration(&unquote(value)).map(|d| d * 20)
+            })?,
+        ),
+        "lastupdate" => Filter::LastUpdate(
+            cmp,
+            num(value).or_else(|_| {
+                crate::overlay::parse_duration(&unquote(value)).map(|d| d * 20)
+            })?,
+        ),
+        "timestamp" => Filter::Timestamp(
+            cmp,
+            num(value).or_else(|_| {
+                crate::overlay::parse_timestamp(&unquote(value)).map(|t| t as i64)
+            })?,
+        ),
         "status" => Filter::Status(cmp, unquote(value)),
         "palette" => Filter::Palette(cmp, split_list(value)),
         "biome" | "biomes" => Filter::Biome(cmp, split_list(value)),
