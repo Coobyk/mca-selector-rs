@@ -521,6 +521,7 @@ impl TileMapState {
     }
 
     pub fn clear(&mut self) {
+        self.loading.clear();
         self.tiles.clear();
         self.pool.clear();
         self.pool_order.clear();

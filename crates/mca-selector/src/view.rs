@@ -44,7 +44,7 @@ pub enum Dialog {
     Settings { draft: config::GlobalConfig },
     RenderSettings { draft: config::WorldConfig },
     Info { msg: String },
-    PasteConfirm { ox: i32, oz: i32, overwrite: bool, sel_only: bool, err: String },
+    PasteConfirm { ox: i32, oz: i32, overwrite: bool, sel_only: bool },
     JobProgress,
     NbtEditor {
         region: i64,
@@ -1668,7 +1668,7 @@ impl MainView {
         if self.map.pasted.is_some() {
             let o = self.map.pasted.as_ref().unwrap().offset;
             self.dialog = Some(Dialog::PasteConfirm {
-                ox: o.x, oz: o.z, overwrite: true, sel_only: false, err: String::new(),
+                ox: o.x, oz: o.z, overwrite: true, sel_only: false,
             });
             cx.notify();
             return;
@@ -2307,8 +2307,8 @@ impl MainView {
                     if m.load(false).is_err() { continue; }
                     ctx.insert_chunk_set(rl, m.offsets_chunk_set());
                     for i in 0..1024 {
-                        let abs_chunk = region.region_to_chunk().add(i as i32 % 32, i as i32 / 32);
-                        let within = sel.is_empty() || sel.is_chunk_selected(abs_chunk);
+                        let chunk = region.region_to_chunk().add_p(mc_core::point::Point2i::from_chunk_index(i as i32));
+                        let within = sel.is_empty() || sel.is_chunk_selected(chunk);
                         if !within { continue; }
                         let Some(c) = &m.chunks[i] else { continue };
                         let Some(d) = &c.data else { continue };
