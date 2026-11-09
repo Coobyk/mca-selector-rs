@@ -61,14 +61,18 @@ pub struct GlobalConfig {
     pub structure_icons: BTreeMap<String, bool>,
 }
 
+fn num_cpus() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+}
+
 impl Default for GlobalConfig {
     fn default() -> Self {
         GlobalConfig {
             region_selection_color: Color::new(1.0, 0.45, 0.0, 0.8),
             chunk_selection_color: Color::new(1.0, 0.45, 0.0, 0.8),
             paste_chunks_color: Color::new(0.0, 1.0, 0.0, 0.8),
-            process_threads: 2,
-            write_threads: 4,
+            process_threads: (num_cpus() as i32 - 2).clamp(1, 4),
+            write_threads: (num_cpus() as i32).clamp(1, 4),
             max_loaded_files: 1,
             mc_saves_dir: mc_saves_dir(),
             show_chunk_grid: true,
@@ -164,7 +168,7 @@ impl Default for WorldConfig {
             structure_icon_size: 32,
             structure_icon_border_size: 1,
             render_header_only_zoom_level: 16,
-            zoom_level_lod_color: ((0.0f32) as u32) << 24
+            zoom_level_lod_color: 0xFF00_A300
                 | ((0.64 * 255.0) as u32) << 8
                 | 0xFF00_0000,
         }

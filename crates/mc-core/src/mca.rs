@@ -551,24 +551,45 @@ impl McaFile {
         for chunk in self.chunks.iter().flatten() {
             let Some(data) = &chunk.data else { continue };
             let mut names = Vec::new();
-            if let Some(structures) = data.get("structures").and_then(Tag::as_compound) {
-                if let Some(starts) = structures.get("starts").and_then(Tag::as_compound) {
-                    for (name, tag) in starts {
-                        let valid = tag
-                            .as_compound()
-                            .map(|c| {
-                                let id = nbt::string_or(Some(c), "id", "");
-                                !id.is_empty() && id != "INVALID"
-                            })
-                            .unwrap_or(false);
-                        if valid {
-                            names.push(name.clone());
+            // modern (21w43a+): structures.starts — every compound entry's key
+            if let Some(starts) = data
+                .get("structures")
+                .and_then(Tag::as_compound)
+                .and_then(|st| st.get("starts"))
+                .and_then(Tag::as_compound)
+            {
+                for (name, tag) in starts {
+                    if tag.as_compound().is_some() && !names.contains(name) {
+                        names.push(name.clone());
+                    }
+                }
+            }
+            // legacy (15w32a+): {Level|region}.Structures.Starts — compound with
+            // size>1 and non-null "id" (upstream parseStructureStarts)
+            let level: Option<&Compound> = data
+                .get("Level")
+                .or_else(|| data.get("region"))
+                .and_then(Tag::as_compound)
+                .or(Some(data));
+            if let Some(starts) = level
+                .and_then(|l| l.get("Structures"))
+                .and_then(Tag::as_compound)
+                .and_then(|st| st.get("Starts"))
+                .and_then(Tag::as_compound)
+            {
+                for (_key, tag) in starts {
+                    if let Some(c) = tag.as_compound() {
+                        if c.len() > 1 {
+                            if let Some(id) = c.get("id").and_then(Tag::as_string) {
+                                let id = id.trim_start_matches("minecraft:");
+                                if !names.iter().any(|n| n == id) {
+                                    names.push(id.to_string());
+                                }
+                            }
                         }
                     }
                 }
             }
-            // also collect POI-ish structure references upstream resolves —
-            // keep simple: names found in chunk
             if !names.is_empty() {
                 map.insert(chunk.absolute_location.as_long(), names);
             }

@@ -7,7 +7,7 @@ use mc_core::jobs::{self, Job};
 use mc_core::mca::McaFile;
 use mc_core::point::{Point2f, Point2i};
 use mc_core::render;
-use mc_core::selection::Selection;
+use mc_core::selection::{ChunkSet, Selection};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -44,9 +44,11 @@ pub struct Tile {
     pub image: Option<(Vec<u32>, i32)>,
     pub loaded: bool,
     pub overlay: Option<(Vec<u32>, i32)>,
+    pub overlay_data: Option<std::sync::Arc<[i32; 1024]>>,
     pub overlay_loaded: bool,
     pub structures: Option<HashMap<i64, Vec<String>>>,
     pub marked_chunks_image: Option<Vec<u32>>, // 32x32 argb
+    pub pasted_image: Option<Vec<u32>>, // 32x32 argb paste ghost
     /// gpu-ready image, built when the argb result lands
     pub render_image: Option<std::sync::Arc<gpui::RenderImage>>,
     /// gpu-ready 32x32 overlay image
@@ -60,9 +62,11 @@ impl Tile {
             image: None,
             loaded: false,
             overlay: None,
+            overlay_data: None,
             overlay_loaded: false,
             structures: None,
             marked_chunks_image: None,
+            pasted_image: None,
             render_image: None,
             overlay_render_image: None,
         }
@@ -107,6 +111,7 @@ pub enum TileResult {
     Overlay {
         region: Point2i,
         image: Option<Vec<u32>>,
+        data: Option<std::sync::Arc<[i32; 1024]>>,
     },
 }
 
@@ -119,6 +124,15 @@ pub fn result_sender() -> Sender<TileResult> {
         tx
     })
     .clone()
+}
+
+/// upstream pastedChunks state: chunks copied to clipboard dir + drag offset.
+pub struct Pasted {
+    pub dir: std::path::PathBuf,        // clipboard region dir
+    pub selection: Option<Selection>, // copied selection (from selection.csv)
+    pub offset: Point2i,              // pastedChunksOffset, in chunks
+    pub first_offset: Point2i,
+    pub first_mouse: Option<Point2f>,
 }
 
 pub struct TileMapState {
@@ -139,6 +153,7 @@ pub struct TileMapState {
     pub show_nonexistent_regions: bool,
     pub coordinate_style: CoordinateStyle,
     pub hovered_block: Option<Point2i>,
+    pub pasted: Option<Pasted>,
     pub disabled: bool,
     /// memory image pool: zoomLevel -> lru region->image
     pub pool: HashMap<i32, HashMap<i64, Vec<u32>>>,
@@ -184,6 +199,7 @@ impl TileMapState {
             show_nonexistent_regions: true,
             coordinate_style: CoordinateStyle::Dynamic,
             hovered_block: None,
+            pasted: None,
             disabled: true,
             pool: HashMap::new(),
             pool_order: HashMap::new(),
@@ -410,6 +426,108 @@ impl TileMapState {
         t.marked_chunks_image = None;
     }
 
+    /// TileMap.setPastedChunks — enter paste mode, offset centered on screen.
+    pub fn set_pasted(&mut self, dir: std::path::PathBuf, selection: Option<Selection>, window_size: Point2f) {
+        let (min, max) = selection
+            .as_ref()
+            .and_then(|s| s.bounds())
+            .unwrap_or((Point2i::new(0, 0), Point2i::new(0, 0)));
+        let offset_in_chunks = self.offset.to_point2i().block_to_chunk();
+        let pasted_mid = Point2i::new((max.x - min.x) / 2, (max.z - min.z) / 2);
+        let origin = offset_in_chunks.sub(min).sub(pasted_mid);
+        let screen = Point2i::new(
+            (window_size.x * self.scale / 16.0) as i32 / 2,
+            (window_size.z * self.scale / 16.0) as i32 / 2,
+        );
+        let offset = origin.add_p(screen);
+        self.pasted = Some(Pasted {
+            dir,
+            selection,
+            offset,
+            first_offset: offset,
+            first_mouse: None,
+        });
+    }
+
+    pub fn cancel_paste(&mut self) {
+        self.pasted = None;
+        for t in self.tiles.values_mut() {
+            t.pasted_image = None;
+        }
+    }
+
+    /// TileMap.onMouseDragged while pasting: offset tracks the grab delta.
+    pub fn drag_paste_offset(&mut self, mouse: Point2f) {
+        if let Some(p) = &mut self.pasted {
+            if let Some(first) = p.first_mouse {
+                let diff = mouse.sub(first).mul(self.scale).to_point2i().div(16);
+                p.offset = p.first_offset.add_p(diff);
+            }
+        }
+        for t in self.tiles.values_mut() {
+            t.pasted_image = None;
+        }
+    }
+
+    /// chunks of the pasted selection that land in `region` after offset.
+    pub fn pasted_chunks_for_region(&self, region: Point2i) -> Option<ChunkSet> {
+        let p = self.pasted.as_ref()?;
+        let mut set = ChunkSet::new();
+        let region_first = region.region_to_chunk();
+        let region_last = region_first.add(31, 31);
+        let in_region = |c: Point2i| {
+            c.x >= region_first.x && c.x <= region_last.x && c.z >= region_first.z && c.z <= region_last.z
+        };
+        if let Some(sel) = &p.selection {
+            for (&region_l, cs) in &sel.selection {
+                let base = Point2i::from_long(region_l).region_to_chunk();
+                // effective set = cs or full region; complement when inverted
+                let eff: Option<ChunkSet> = match cs {
+                    Some(c) => Some(if sel.inverted { c.flip() } else { c.clone() }),
+                    None => {
+                        if sel.inverted { Some(ChunkSet::new()) } else { None }
+                    }
+                };
+                match eff {
+                    Some(c) => {
+                        for i in c.iter() {
+                            let pos = base.add(i as i32 % 32, i as i32 / 32).add_p(p.offset);
+                            if in_region(pos) {
+                                set.set(((pos.z - region_first.z) * 32 + (pos.x - region_first.x)) as usize);
+                            }
+                        }
+                    }
+                    None => {
+                        for i in 0..1024i32 {
+                            let pos = base.add(i % 32, i / 32).add_p(p.offset);
+                            if in_region(pos) {
+                                set.set(((pos.z - region_first.z) * 32 + (pos.x - region_first.x)) as usize);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // no selection data: all chunks in all copied regions are pasted.
+            // build from the region file names present in the clipboard dir.
+            if let Ok(rd) = std::fs::read_dir(&p.dir) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if let Some(r) = mc_core::files::parse_mca_file_name(&name) {
+                        let base = r.region_to_chunk();
+                        for i in 0..1024i32 {
+                            let pos = base.add(i % 32, i / 32).add_p(p.offset);
+                            if in_region(pos) {
+                                set.set(((pos.z - region_first.z) * 32 + (pos.x - region_first.x)) as usize);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if set.is_empty() { None } else { Some(set) }
+    }
+
     pub fn clear_selection(&mut self) {
         self.selection = Selection::new();
         self.selected_chunks = 0;
@@ -551,15 +669,35 @@ impl TileMapState {
         let Some(path) = self.mca_path(region) else { return };
         let tx = self.result_tx.clone();
         let priority = self.tile_priority(region);
+        let name = files::mca_file_name(region);
+        let poi_path = crate::config::world()
+            .and_then(|w| w.dirs.poi.clone())
+            .map(|d| d.join(&name));
+        let ent_path = crate::config::world()
+            .and_then(|w| w.dirs.entities.clone())
+            .map(|d| d.join(&name));
         jobs::pools().add_process(Job::new(
             jobs::PRIORITY_MEDIUM,
             Some(Box::new(move || priority)),
             move || {
-                let image = McaFile::new(path)
+                let data = McaFile::new(path)
                     .and_then(|mut m| m.load(true).map(|_| m))
                     .ok()
-                    .map(|m| ov.image(&mc_core::overlay::region_overlay_data(&m, &ov)));
-                let _ = tx.send(TileResult::Overlay { region, image });
+                    .map(|m| {
+                        // Path overlays can read from the poi/entities files
+                        let load = |p: Option<std::path::PathBuf>| -> Option<McaFile> {
+                            p.and_then(|p| {
+                                McaFile::new(p).ok().and_then(|mut f| f.load(true).ok().map(|_| f))
+                            })
+                        };
+                        let poi = if ov.path_root == "poi" { load(poi_path) } else { None };
+                        let ent = if ov.path_root == "entities" { load(ent_path) } else { None };
+                        std::sync::Arc::new(mc_core::overlay::region_overlay_data(
+                            &m, &ov, poi.as_ref(), ent.as_ref(),
+                        ))
+                    });
+                let image = data.as_deref().map(|d| ov.image(d));
+                let _ = tx.send(TileResult::Overlay { region, image, data });
             },
         ));
     }
@@ -659,6 +797,7 @@ impl TileMapState {
     pub fn clear_overlay(&mut self) {
         for t in self.tiles.values_mut() {
             t.overlay = None;
+            t.overlay_data = None;
             t.overlay_loaded = false;
             t.overlay_render_image = None;
         }
@@ -1106,13 +1245,14 @@ impl TileMapState {
                         t.structures = structures;
                     }
                 }
-                TileResult::Overlay { region, image } => {
+                TileResult::Overlay { region, image, data } => {
                     self.overlay_loading.remove(&region.as_long());
                     if let Some(t) = self.tiles.get_mut(&region.as_long()) {
                         if let Some(img) = image {
                             if self.overlay.is_some() {
                                 t.overlay_render_image = argb_to_render_image(&img, 32);
                                 t.overlay = Some((img, 32));
+                                t.overlay_data = data;
                             }
                         }
                         t.overlay_loaded = true;

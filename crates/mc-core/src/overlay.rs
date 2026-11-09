@@ -74,7 +74,7 @@ pub struct Overlay {
     pub min_hue: f32,
     pub max_hue: f32,
     pub multi_values: Vec<String>,
-    path_root: String,
+    pub path_root: String,
     path: Vec<PathNode>,
     path_size: bool,
     pub raw_multi: String,
@@ -205,7 +205,14 @@ impl Overlay {
 
     /// parseValue — one int per chunk. `data` is the region chunk's NBT,
     /// `timestamp` its region timestamp, `dv` the data version.
-    pub fn parse_value(&self, data: &Compound, timestamp: i32, dv: i32) -> i32 {
+    pub fn parse_value(
+        &self,
+        data: &Compound,
+        poi: Option<&Compound>,
+        entities: Option<&Compound>,
+        timestamp: i32,
+        dv: i32,
+    ) -> i32 {
         match self.typ {
             OverlayType::InhabitedTime => {
                 nbt::long_from_opt(Some(data), "InhabitedTime").unwrap_or(0) as i32
@@ -222,10 +229,13 @@ impl Overlay {
             OverlayType::AverageHeight => average_height(data, dv),
             OverlayType::BlockAmount => block_amount(data, &self.multi_values),
             OverlayType::Path => {
-                if self.path_root != "region" {
-                    return 0; // poi/entities not loaded yet
-                }
-                self.path_value(data)
+                let d = match self.path_root.as_str() {
+                    "region" => data,
+                    "poi" => match poi { Some(d) => d, None => return 0 },
+                    "entities" => match entities { Some(d) => d, None => return 0 },
+                    _ => return 0,
+                };
+                self.path_value(d)
             }
             OverlayType::Script => 0,
         }
@@ -280,13 +290,20 @@ impl Overlay {
 }
 
 /// OverlayPool: parse one value per chunk of a loaded region.
-pub fn region_overlay_data(m: &crate::mca::McaFile, ov: &Overlay) -> [i32; 1024] {
+pub fn region_overlay_data(
+    m: &crate::mca::McaFile,
+    ov: &Overlay,
+    poi: Option<&crate::mca::McaFile>,
+    entities: Option<&crate::mca::McaFile>,
+) -> [i32; 1024] {
     let mut out = [0i32; 1024];
     for (i, c) in m.chunks.iter().enumerate() {
         let Some(c) = c else { continue };
         let Some(d) = &c.data else { continue };
+        let pd = poi.and_then(|f| f.chunks[i].as_ref()).and_then(|ch| ch.data.as_ref());
+        let ed = entities.and_then(|f| f.chunks[i].as_ref()).and_then(|ch| ch.data.as_ref());
         let dv = nbt::data_version(Some(d));
-        out[i] = ov.parse_value(d, c.timestamp, dv);
+        out[i] = ov.parse_value(d, pd, ed, c.timestamp, dv);
     }
     out
 }

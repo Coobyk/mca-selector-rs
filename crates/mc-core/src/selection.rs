@@ -452,6 +452,32 @@ impl Selection {
     }
 
     /// CSV export/import (saveToFile / readFromFile).
+    /// min/max chunk bounds across all selected chunks (inclusive).
+    pub fn bounds(&self) -> Option<(Point2i, Point2i)> {
+        let mut min: Option<Point2i> = None;
+        let mut max: Option<Point2i> = None;
+        for (&rl, cs) in &self.selection {
+            let base = Point2i::from_long(rl).region_to_chunk();
+            match cs {
+                Some(c) => {
+                    for i in c.iter() {
+                        let p = base.add(i as i32 % 32, i as i32 / 32);
+                        min = Some(min.map_or(p, |m: Point2i| Point2i::new(m.x.min(p.x), m.z.min(p.z))));
+                        max = Some(max.map_or(p, |m: Point2i| Point2i::new(m.x.max(p.x), m.z.max(p.z))));
+                    }
+                }
+                None => {
+                    for i in 0..1024usize {
+                        let p = base.add((i % 32) as i32, (i / 32) as i32);
+                        min = Some(min.map_or(p, |m: Point2i| Point2i::new(m.x.min(p.x), m.z.min(p.z))));
+                        max = Some(max.map_or(p, |m: Point2i| Point2i::new(m.x.max(p.x), m.z.max(p.z))));
+                    }
+                }
+            }
+        }
+        Some((min?, max?))
+    }
+
     pub fn save_csv(&self, path: &std::path::Path) -> std::io::Result<()> {
         let mut out = String::new();
         if self.inverted {

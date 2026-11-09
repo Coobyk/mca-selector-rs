@@ -70,6 +70,54 @@ pub enum Expr {
     },
 }
 
+/// upstream RegionMatcher.MatchType — whether a whole region can be
+/// classified without loading it (FULL: every chunk matches,
+/// NONE: none matches, PARTIAL: needs per-chunk evaluation).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MatchType {
+    None,
+    Partial,
+    Full,
+}
+
+impl MatchType {
+    fn invert(self) -> Self {
+        match self {
+            MatchType::Full => MatchType::None,
+            MatchType::None => MatchType::Full,
+            m => m,
+        }
+    }
+}
+
+impl Expr {
+    /// AND -> min of parts (NONE dominates), OR -> max (FULL dominates),
+    /// negation flips FULL/NONE.
+    pub fn matches_region(&self, region: crate::point::Point2i, ctx: &mut FilterCtx) -> MatchType {
+        match self {
+            Expr::Leaf { negated, filter } => {
+                let m = filter.matches_region(region, ctx);
+                if *negated { m.invert() } else { m }
+            }
+            Expr::Group { negated, op, parts } => {
+                let m = match op {
+                    Bool::And => parts
+                        .iter()
+                        .map(|p| p.matches_region(region, ctx))
+                        .min()
+                        .unwrap_or(MatchType::Full),
+                    Bool::Or => parts
+                        .iter()
+                        .map(|p| p.matches_region(region, ctx))
+                        .max()
+                        .unwrap_or(MatchType::None),
+                };
+                if *negated { m.invert() } else { m }
+            }
+        }
+    }
+}
+
 /// Evaluation context for filters that need filesystem access
 /// (Border neighbor lookups, entities dimension, csv selections, player data).
 pub struct FilterCtx {
@@ -199,6 +247,99 @@ pub enum Filter {
     /// PlayerLocation / PlayerSpawn: "<playerdata dir>:<dimension>"
     PlayerLocation { cmp: Cmp, dir: std::path::PathBuf, dimension: String, spawn: bool },
     Custom(String, Cmp, Tag),
+}
+
+impl Filter {
+    /// upstream per-filter matchesRegion (only some filters implement it).
+    pub fn matches_region(&self, region: crate::point::Point2i, ctx: &mut FilterCtx) -> MatchType {
+        match self {
+            Filter::XPos(cmp, v) | Filter::ZPos(cmp, v) => {
+                let base = region.region_to_chunk();
+                let c = if matches!(self, Filter::XPos(..)) { base.x } else { base.z };
+                let mut n = 0;
+                for i in 0..32 {
+                    if num_cmp(*cmp, (c + i) as i64, *v as i64) {
+                        n += 1;
+                    }
+                }
+                match n {
+                    0 => MatchType::None,
+                    32 => MatchType::Full,
+                    _ => MatchType::Partial,
+                }
+            }
+            Filter::SelectionFile(cmp, path) => {
+                let Some(sel) = ctx.csv_selection(path).cloned() else {
+                    return MatchType::None;
+                };
+                let n = sel
+                    .selected_chunks(region)
+                    .map(|c| c.map(|s| s.size()).unwrap_or(1024))
+                    .unwrap_or(0);
+                match cmp {
+                    Cmp::Eq => match n {
+                        0 => MatchType::None,
+                        1024 => MatchType::Full,
+                        _ => MatchType::Partial,
+                    },
+                    Cmp::Ne => match n {
+                        0 => MatchType::Full,
+                        1024 => MatchType::None,
+                        _ => MatchType::Partial,
+                    },
+                    _ => MatchType::None,
+                }
+            }
+            Filter::Circle(cmp, circles) => {
+                if *cmp != Cmp::Contains {
+                    return MatchType::Partial;
+                }
+                let tl = region.region_to_chunk();
+                let corners = [
+                    tl,
+                    tl.add(0, 31),
+                    tl.add(31, 31),
+                    tl.add(31, 0),
+                ];
+                for &(cx, cz, r) in circles {
+                    let center = crate::point::Point2i::new(cx, cz).block_to_chunk();
+                    // center in this region, or a corner inside the circle
+                    if center.chunk_to_region() == region {
+                        return MatchType::Partial;
+                    }
+                    for c in corners {
+                        let d2 = ((c.x - center.x) as i64).pow(2) + ((c.z - center.z) as i64).pow(2);
+                        if d2 <= (r as i64 / 16).pow(2) {
+                            return MatchType::Partial;
+                        }
+                    }
+                    // circle overlaps a region edge (axis extremes inside region)
+                    let ext = r / 16;
+                    let extremes = [
+                        center.add(-ext, 0),
+                        center.add(ext, 0),
+                        center.add(0, -ext),
+                        center.add(0, ext),
+                    ];
+                    for e in extremes {
+                        if e.chunk_to_region() == region {
+                            return MatchType::Partial;
+                        }
+                    }
+                }
+                MatchType::None
+            }
+            Filter::PlayerLocation { dir, dimension, spawn, .. } => {
+                let set = ctx.player_set(dir, dimension, *spawn).clone();
+                if set.iter().any(|&l| crate::point::Point2i::from_long(l).chunk_to_region() == region) {
+                    MatchType::Partial
+                } else {
+                    MatchType::None
+                }
+            }
+            _ => MatchType::Partial,
+        }
+    }
 }
 
 fn num_cmp(cmp: Cmp, a: i64, b: i64) -> bool {

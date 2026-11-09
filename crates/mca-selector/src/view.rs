@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Drag {
+    PasteMove,
     None,
     LeftSelect,
     RightSelect,
@@ -48,6 +49,7 @@ pub enum Dialog {
     Settings { draft: config::GlobalConfig },
     RenderSettings { draft: config::WorldConfig },
     Info { msg: String },
+    PasteConfirm { ox: i32, oz: i32, overwrite: bool, sel_only: bool, err: String },
     JobProgress,
     NbtEditor {
         region: i64,
@@ -300,6 +302,17 @@ impl MainView {
         let ctrl = event.modifiers.control || event.modifiers.platform;
         match event.button {
             MouseButton::Left => {
+                if self.map.pasted.is_some() && !ctrl {
+                    self.drag = Drag::PasteMove;
+                    if let Some(p) = &mut self.map.pasted {
+                        p.first_mouse = Some(pos);
+                        p.first_offset = p.offset;
+                    }
+                    self.first = pos;
+                    self.previous = pos;
+                    cx.notify();
+                    return;
+                }
                 self.drag = match (ctrl, shift) {
                     (true, true) => Drag::CtrlShiftLeft,
                     (true, false) => Drag::CtrlLeft,
@@ -342,6 +355,11 @@ impl MainView {
                 }
             }
             MouseButton::Right => {
+                if self.map.pasted.is_some() {
+                    self.map.cancel_paste();
+                    cx.notify();
+                    return;
+                }
                 self.drag = match (ctrl, shift) {
                     (true, true) => Drag::CtrlShiftRight,
                     (false, true) => Drag::ShiftRight,
@@ -365,6 +383,12 @@ impl MainView {
             return;
         }
         let pressed = event.pressed_button;
+        if self.drag == Drag::PasteMove {
+            self.map.drag_paste_offset(pos);
+            self.previous = pos;
+            cx.notify();
+            return;
+        }
         if self.drag.is_move() || pressed == Some(MouseButton::Middle) {
             let dx = (self.previous.x - pos.x) * self.map.scale;
             let dz = (self.previous.z - pos.z) * self.map.scale;
@@ -383,6 +407,9 @@ impl MainView {
     }
 
     fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(p) = &mut self.map.pasted {
+            p.first_mouse = None;
+        }
         self.drag = Drag::None;
         self.update_needed = true;
         cx.notify();
@@ -451,6 +478,21 @@ impl MainView {
             cx.notify();
             return;
         }
+        if let Some(Dialog::PasteConfirm { overwrite, sel_only, .. }) = &mut self.dialog {
+            match k {
+                "enter" => {
+                    if let Some(Dialog::PasteConfirm { ox, oz, overwrite, sel_only, .. }) = self.dialog.take() {
+                        self.do_paste_import(ox, oz, overwrite, sel_only, cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+                "escape" => { self.dialog = None; cx.notify(); return; }
+                "o" => { *overwrite = !*overwrite; cx.notify(); return; }
+                "s" => { *sel_only = !*sel_only; cx.notify(); return; }
+                _ => {}
+            }
+        }
         if let Some(Dialog::TextInput { text, .. }) = &mut self.dialog {
             match k {
                 "backspace" => { text.pop(); }
@@ -476,6 +518,9 @@ impl MainView {
             return;
         }
         if k == "escape" {
+            if self.map.pasted.is_some() {
+                self.map.cancel_paste();
+            }
             match self.dialog {
                 Some(Dialog::Info { .. }) => {}
                 _ => self.dialog = None,
@@ -694,6 +739,7 @@ impl MainView {
                 origin: point(px(offset.x), px(offset.z)),
                 size: size(px(w), px(w)),
             };
+            let pasted_cs = self.map.pasted_chunks_for_region(region);
             let Some(tile) = self.map.tiles.get(&key) else { continue };
             let loaded = tile.image.is_some() && tile.loaded;
             if !loaded {
@@ -712,6 +758,15 @@ impl MainView {
             }
             if let Some(ov) = selection_overlay_image(tile, &self.map.selection, self.selection_version) {
                 let _ = window.paint_image(b, px(0.).into(), ov, 0, false);
+            }
+            if let Some(cs) = &pasted_cs {
+                let _ = cs; let _ = tile;
+                let color = config::global().paste_chunks_color.to_argb();
+                let mut pxa = [0u32; 32 * 32];
+                for i in cs.iter() { pxa[i] = color; }
+                if let Some(pv) = paste_argb_image(&pxa) {
+                    let _ = window.paint_image(b, px(0.).into(), pv, 0, false);
+                }
             }
             if self.map.show_structure_icons {
                 let structures = tile.structures.clone();
@@ -921,7 +976,27 @@ impl MainView {
             parts.push("selection not saved".into());
         }
         if let Some(ov) = &self.map.overlay {
-            parts.push(format!("overlay: {}", ov.typ.display_name()));
+            // upstream: "type(min, max), hoveredValue"
+            let val = self.map.hovered_block.and_then(|h| {
+                let c = h.block_to_chunk();
+                let r = c.chunk_to_region();
+                let rel = c.sub(r.region_to_chunk());
+                self.map
+                    .tiles
+                    .get(&r.as_long())
+                    .and_then(|t| t.overlay_data.as_ref())
+                    .map(|d| d[(rel.z * 32 + rel.x) as usize])
+            });
+            let mm = match (ov.min, ov.max) {
+                (Some(a), Some(b)) => format!("{}, {}", a, b),
+                _ => "-".to_string(),
+            };
+            parts.push(format!(
+                "overlay: {}({}), {}",
+                ov.typ.display_name(),
+                mm,
+                val.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+            ));
         }
         parts.push(format!("{} jobs in queue", mc_core::jobs::active_jobs()));
         parts.join(" | ")
@@ -960,6 +1035,18 @@ fn nbt_icon(type_id: u8) -> Option<Arc<RenderImage>> {
 /// selection overlay cache: keyed by (region, selection_version)
 static OVERLAY_CACHE: std::sync::LazyLock<std::sync::Mutex<(u64, std::collections::HashMap<i64, Arc<RenderImage>>)>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new((0, std::collections::HashMap::new())));
+
+fn paste_argb_image(px: &[u32; 1024]) -> Option<Arc<RenderImage>> {
+    let mut rgba = Vec::with_capacity(32 * 32 * 4);
+    for &p in px.iter() {
+        rgba.push((p >> 16) as u8);
+        rgba.push((p >> 8) as u8);
+        rgba.push(p as u8);
+        rgba.push((p >> 24) as u8);
+    }
+    let img = image::RgbaImage::from_raw(32, 32, rgba)?;
+    Some(Arc::new(RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(img), 1))))
+}
 
 fn selection_overlay_image(tile: &Tile, sel: &mc_core::selection::Selection, version: u64) -> Option<Arc<RenderImage>> {
     let key = tile.location.as_long();
@@ -1141,7 +1228,7 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &DefragmentAction, _w, cx| v.defragment(cx)))
             .on_action(cx.listener(|v, _: &ExportChunksAction, _w, cx| v.export_chunks(cx)))
             .on_action(cx.listener(|v, _: &CopyChunksAction, _w, cx| v.copy_chunks(cx)))
-            .on_action(cx.listener(|v, _: &PasteChunksAction, _w, cx| v.paste_chunks(cx)))
+            .on_action(cx.listener(|v, _: &PasteChunksAction, w, cx| v.paste_chunks(w, cx)))
             .on_action(cx.listener(|v, _: &ExportImageAction, w, cx| v.export_image(w, cx)))
             .on_action(cx.listener(|v, _: &SumSelectionAction, _w, cx| v.sum_selection(cx)))
             .on_action(cx.listener(|v, _: &SwapChunksAction, _w, cx| v.swap_chunks(cx)))
@@ -1546,61 +1633,115 @@ impl MainView {
                         }
                     }
                 }
-                // record origin for offset paste
+                // record origin + selection for offset paste
                 let _ = std::fs::write(clip.join("../origin.txt"), format!("{},{}", origin.x, origin.z));
+                let _ = sel.save_csv(&clip.join("../selection.csv"));
             }));
         cx.notify();
     }
 
-    fn paste_chunks(&mut self, cx: &mut Context<Self>) {
+    fn paste_chunks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.map.pasted.is_some() {
+            let o = self.map.pasted.as_ref().unwrap().offset;
+            self.dialog = Some(Dialog::PasteConfirm {
+                ox: o.x, oz: o.z, overwrite: true, sel_only: false, err: String::new(),
+            });
+            cx.notify();
+            return;
+        }
         let clip = mc_core::files::base_cache_dir().join("clipboard").join("region");
         if !clip.is_dir() { return; }
+        // upstream pastes via SelectionData on the system clipboard — ours is
+        // the clipboard region dir + selection.csv.
+        let sel = mc_core::selection::Selection::read_csv(
+            &mc_core::files::base_cache_dir().join("clipboard").join("selection.csv"),
+        ).ok();
+        let vs = window.window_bounds().get_bounds().size;
+        let size = Point2f::new(f32::from(vs.width), f32::from(vs.height));
+        self.map.set_pasted(clip, sel, size);
+        cx.notify();
+    }
+
+    /// import clipboard chunks at offset (upstream ImportJob via PasteChunks confirm)
+    fn do_paste_import(&mut self, ox: i32, oz: i32, overwrite: bool, sel_only: bool, cx: &mut Context<Self>) {
+        let clip = mc_core::files::base_cache_dir().join("clipboard").join("region");
+        if !clip.is_dir() { return; }
+        let target_sel = if sel_only { Some(self.map.selection.clone()) } else { None };
+        let pasted_sel = self.map.pasted.as_ref().and_then(|p| p.selection.clone());
+        let offset = mc_core::point::Point2i::new(ox, oz);
         let tx = self.map.result_tx.clone();
+        self.map.cancel_paste();
         mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
             mc_core::jobs::PRIORITY_LOW, None,
             move || {
                 let Ok(rd) = std::fs::read_dir(&clip) else { return };
-                let __p = mc_core::jobs::Progress::new("Pasting chunks", -1);
-                for e in rd.flatten() {
+                let files: Vec<_> = rd.flatten().collect();
+                let __p = mc_core::jobs::Progress::new("Importing chunks", files.len() as i64);
+                for e in files {
                     let __g = __p.inc_guard();
                     if __p.is_cancelled() { break; }
                     let name = e.file_name().to_string_lossy().to_string();
                     __p.set_current(name.clone());
-                    let Some(region) = mc_core::files::parse_mca_file_name(&name) else { continue };
-                    let dst_dir = match crate::config::world().and_then(|w| w.dirs.region.clone()) {
-                        Some(d) => d,
-                        None => return,
-                    };
-                    let dst = dst_dir.join(&name);
+                    let Some(src_region) = mc_core::files::parse_mca_file_name(&name) else { continue };
+                    let Some(dst_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { return };
                     let Ok(mut src) = mc_core::mca::McaFile::new(e.path()) else { continue };
-                    let mut dst_file = if dst.exists() {
-                        mc_core::mca::McaFile::new(dst.clone()).ok()
-                    } else {
-                        Some(mc_core::mca::McaFile::empty(region, dst.clone()))
-                    };
                     if src.load(false).is_err() { continue; }
-                    if let Some(d) = dst_file.as_mut() {
-                        if dst.exists() && d.load(false).is_err() { continue; }
-                        for (i, c) in src.chunks.iter().enumerate() {
-                            if c.is_some() {
-                                d.chunks[i] = c.clone();
-                                if let Some(cc) = &mut d.chunks[i] {
-                                    cc.timestamp = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .map(|t| t.as_secs() as i32).unwrap_or(0);
-                                }
+                    // chunks to paste from this region
+                    let sel_cs = pasted_sel.as_ref().and_then(|s| {
+                        if s.inverted {
+                            s.selection.get(&src_region.as_long()).map(|c| {
+                                match c { Some(cc) => cc.clone().flip(), None => mc_core::selection::ChunkSet::new() }
+                            })
+                        } else {
+                            match s.selection.get(&src_region.as_long()) {
+                                Some(Some(c)) => Some(c.clone()),
+                                Some(None) => Some({ let mut f = mc_core::selection::ChunkSet::new(); f.fill(); f }),
+                                None => None,
+                            }
+                        }
+                    }).or_else(|| { let mut f = mc_core::selection::ChunkSet::new(); f.fill(); Some(f) });
+                    let Some(sel_cs) = sel_cs else { continue };
+                    // split by target region (chunks may cross region borders)
+                    let mut targets: std::collections::HashMap<mc_core::point::Point2i, Vec<(usize, mc_core::point::Point2i)>> = std::collections::HashMap::new();
+                    for i in sel_cs.iter() {
+                        let c = src_region.region_to_chunk().add(i as i32 % 32, i as i32 / 32).add_p(offset);
+                        if let Some(ts) = &target_sel {
+                            if !ts.is_chunk_selected(c) { continue; }
+                        }
+                        targets.entry(c.chunk_to_region()).or_default().push((i, c));
+                    }
+                    for (tregion, chunks) in targets {
+                        let dst = dst_dir.join(mc_core::files::mca_file_name(tregion));
+                        let mut d = if dst.exists() {
+                            let Ok(mut m) = mc_core::mca::McaFile::new(dst.clone()) else { continue };
+                            if m.load(false).is_err() { continue; }
+                            m
+                        } else {
+                            mc_core::mca::McaFile::empty(tregion, dst.clone())
+                        };
+                        let trel = tregion.region_to_chunk();
+                        for (i, c) in chunks {
+                            if let Some(chunk) = &src.chunks[i] {
+                                let rel = c.sub(trel);
+                                if rel.x < 0 || rel.x > 31 || rel.z < 0 || rel.z > 31 { continue; }
+                                let di = (rel.z * 32 + rel.x) as usize;
+                                if d.chunks[di].is_some() && !overwrite { continue; }
+                                let mut cc = chunk.clone();
+                                cc.timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|t| t.as_secs() as i32).unwrap_or(0);
+                                d.chunks[di] = Some(cc);
                             }
                         }
                         let _ = d.save_with_temp_file(&dst);
+                        let _ = tx.send(crate::tilemap::TileResult::Image {
+                            region: tregion, image: None, zoom: 0, structures: None, cache_write: false,
+                        });
                     }
-                    let _ = tx.send(crate::tilemap::TileResult::Image {
-                        region, image: None, zoom: 0, structures: None, cache_write: false,
-                    });
                 }
             }));
         cx.notify();
     }
-
     fn export_image(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let sel = self.map.selection.clone();
         if sel.is_empty() {
@@ -2095,6 +2236,33 @@ impl MainView {
                     let region = mc_core::point::Point2i::from_long(rl);
                     __p.set_current(mc_core::files::mca_file_name(region));
                     if __p.is_cancelled() { break; }
+                    // RegionMatcher: classify the whole region without loading
+                    match expr.matches_region(region, &mut ctx) {
+                        mc_core::filter::MatchType::None => continue,
+                        mc_core::filter::MatchType::Full => {
+                            // every chunk matches; apply the within-selection mask
+                            match sel.selection.get(&rl) {
+                                Some(Some(cs)) => {
+                                    let mut set = result.selection.entry(rl).or_insert_with(|| {
+                                        let mut e = mc_core::selection::ChunkSet::new();
+                                        e.clear_all();
+                                        Some(e)
+                                    });
+                                    if let Some(set) = &mut set { set.or(cs); }
+                                }
+                                Some(None) => {
+                                    result.selection.insert(rl, None);
+                                }
+                                None => {
+                                    if sel.is_empty() {
+                                        result.selection.insert(rl, None);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        mc_core::filter::MatchType::Partial => {}
+                    }
                     let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
                     let p = dir.join(mc_core::files::mca_file_name(region));
                     if !p.exists() { continue; }
@@ -2102,7 +2270,8 @@ impl MainView {
                     if m.load(false).is_err() { continue; }
                     ctx.insert_chunk_set(rl, m.offsets_chunk_set());
                     for i in 0..1024 {
-                        let within = sel.selection.get(&rl).map(|c| c.as_ref().map(|s| s.get(i)).unwrap_or(true)).unwrap_or(sel.is_empty());
+                        let abs_chunk = region.region_to_chunk().add(i as i32 % 32, i as i32 / 32);
+                        let within = sel.is_empty() || sel.is_chunk_selected(abs_chunk);
                         if !within { continue; }
                         let Some(c) = &m.chunks[i] else { continue };
                         let Some(d) = &c.data else { continue };
@@ -2199,6 +2368,26 @@ impl MainView {
                         v.dialog = None;
                         cx.notify();
                     })),
+            ),
+            Dialog::PasteConfirm { ox, oz, overwrite, sel_only, .. } => panel(
+                v_flex().gap_2()
+                    .child(text_el(format!("Import chunks at offset ({}, {})", ox, oz), 13.))
+                    .child(text_el(format!("[o] overwrite existing: {}", if *overwrite { "on" } else { "off" }), 12.))
+                    .child(text_el(format!("[s] selection only: {}", if *sel_only { "on" } else { "off" }), 12.))
+                    .child(text_el("(offset = dragged position; enter to import)", 10.))
+                    .child(
+                        h_flex().gap_2()
+                            .child(button("Import", cx, |v, w, cx| {
+                                if let Some(Dialog::PasteConfirm { ox, oz, overwrite, sel_only, .. }) = v.dialog.take() {
+                                    v.do_paste_import(ox, oz, overwrite, sel_only, cx);
+                                }
+                                let _ = w;
+                            }))
+                            .child(button("Cancel", cx, |v, _w, cx| {
+                                v.dialog = None;
+                                cx.notify();
+                            })),
+                    ),
             ),
             Dialog::Confirm { msg, .. } => panel(
                 v_flex().gap_2()
