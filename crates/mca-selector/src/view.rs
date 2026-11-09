@@ -2077,16 +2077,14 @@ impl MainView {
         crate::ops::for_each_selected_region(
             &sel, dirs, "Changing fields", tx,
             move |_region, chunks, m, _path, _dirs| {
-                let val = match mc_core::nbt::parse_snbt(&raw) {
-                    Ok(v) => v,
-                    Err(_) => parse_snbt_value(&raw),
-                };
+                let val = mc_core::nbt::parse_snbt(&raw)
+                    .unwrap_or_else(|_| mc_core::nbt::Tag::String(raw.clone()));
                 let mut changed = false;
                 for i in 0..1024 {
                     if !chunks.as_ref().map(|c| c.get(i)).unwrap_or(true) { continue; }
                     let Some(c) = m.chunks[i].as_mut() else { continue };
                     let Some(d) = c.data.as_mut() else { continue };
-                    set_nbt_path(d, &path, val.clone());
+                    mc_core::nbt::path_set(d, &path, val.clone());
                     changed = true;
                 }
                 changed
@@ -2802,51 +2800,6 @@ fn button(
 fn v_flex() -> Div { div().flex().flex_col() }
 fn h_flex() -> Div { div().flex() }
 
-/// parse a SNBT-ish literal into a Tag
-pub fn parse_snbt_value(raw: &str) -> mc_core::nbt::Tag {
-    use mc_core::nbt::Tag;
-    let r = raw.trim();
-    if r.starts_with('"') && r.ends_with('"') && r.len() >= 2 {
-        return Tag::String(r[1..r.len()-1].to_string());
-    }
-    if let Some(v) = r.strip_suffix('b').and_then(|s| s.parse::<i8>().ok()) { return Tag::Byte(v); }
-    if let Some(v) = r.strip_suffix('s').and_then(|s| s.parse::<i16>().ok()) { return Tag::Short(v); }
-    if let Some(v) = r.strip_suffix('l').and_then(|s| s.parse::<i64>().ok()) { return Tag::Long(v); }
-    if let Some(v) = r.strip_suffix('f').and_then(|s| s.parse::<f32>().ok()) { return Tag::Float(v); }
-    if let Some(v) = r.strip_suffix('d').and_then(|s| s.parse::<f64>().ok()) { return Tag::Double(v); }
-    if let Ok(v) = r.parse::<i32>() { return Tag::Int(v); }
-    if let Ok(v) = r.parse::<f64>() { return Tag::Double(v); }
-    if r == "true" { return Tag::Byte(1); }
-    if r == "false" { return Tag::Byte(0); }
-    Tag::String(r.to_string())
-}
-
-/// set compound key at a dotted path (creates intermediates)
-pub fn set_nbt_path(c: &mut mc_core::nbt::Compound, path: &str, val: mc_core::nbt::Tag) {
-    let mut parts = path.split('.').peekable();
-    let mut cur: &mut mc_core::nbt::Compound = c;
-    while let Some(p) = parts.next() {
-        if parts.peek().is_none() {
-            if val.id() == mc_core::nbt::TAG_END {
-                cur.remove(p);
-            } else {
-                cur.insert(p.to_string(), val.clone());
-            }
-            return;
-        }
-        let entry = cur.entry(p.to_string()).or_insert_with(|| mc_core::nbt::Tag::Compound(Default::default()));
-        match entry {
-            mc_core::nbt::Tag::Compound(cc) => cur = cc,
-            _ => {
-                *entry = mc_core::nbt::Tag::Compound(Default::default());
-                match entry {
-                    mc_core::nbt::Tag::Compound(cc) => cur = cc,
-                    _ => return,
-                }
-            }
-        }
-    }
-}
 
 /// upstream TextHelper.abbreviateCoordinate: K/M/B suffix over 100k.
 fn abbrev_coord(n: i32) -> String {

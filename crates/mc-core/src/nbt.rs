@@ -908,6 +908,37 @@ pub fn path_insert(root: &mut Compound, path: &str, name: &str, tag: Tag) -> Res
 }
 
 
+/// set the leaf tag at a dotted path, creating intermediate compounds.
+/// `TAG_END` value deletes the leaf (upstream ChangeNbt "delete" semantics).
+pub fn path_set(c: &mut Compound, path: &str, val: Tag) {
+    let mut parts = path.split('.').peekable();
+    let mut cur: &mut Compound = c;
+    while let Some(p) = parts.next() {
+        if parts.peek().is_none() {
+            if val.id() == TAG_END {
+                cur.remove(p);
+            } else {
+                cur.insert(p.to_string(), val.clone());
+            }
+            return;
+        }
+        let entry = cur
+            .entry(p.to_string())
+            .or_insert_with(|| Tag::Compound(Default::default()));
+        match entry {
+            Tag::Compound(cc) => cur = cc,
+            _ => {
+                *entry = Tag::Compound(Default::default());
+                if let Tag::Compound(cc) = entry {
+                    cur = cc;
+                } else {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod snbt_tests {
     use super::*;
