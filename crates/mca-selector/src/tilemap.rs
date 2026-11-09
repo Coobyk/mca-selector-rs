@@ -17,6 +17,11 @@ pub const CHUNK_GRID_SCALE: f32 = 1.5;
 pub const TILE_VISIBILITY_THRESHOLD: i32 = 2;
 
 // Tile colors (upstream Tile.* + config defaults)
+/// max regions given tile objects / requests per update tick
+pub const MAX_TILE_REQUESTS: usize = 8192;
+/// max concurrent tile/structure jobs in flight
+pub const MAX_IN_FLIGHT_LOADS: usize = 2048;
+
 pub const REGION_GRID_COLOR: u32 = 0x8000_0000; // (0,0,0,0.5)
 pub const CHUNK_GRID_COLOR: u32 = 0x80A9_A9A9; // (.6627,.6627,.6627,.5)
 pub const COORDINATES_COLOR: u32 = 0xFFFF_FFFF;
@@ -451,27 +456,26 @@ impl TileMapState {
     /// assign priorities center-out, request images.
     pub fn update(&mut self) {
         let Some(ws) = crate::config::world() else { return };
-        // unload invisible tiles
-        let scale = self.scale;
-        let _ = scale;
+        // unload invisible tiles — pixels stay in `pool`, so offscreen tiles
+        // are dropped entirely (bounds live GPU textures to the viewport).
         let mut to_remove = Vec::new();
         for (k, t) in &self.tiles {
             if !t.is_visible(self, TILE_VISIBILITY_THRESHOLD) {
-                if t.image.is_none() {
-                    to_remove.push(*k);
-                }
+                to_remove.push(*k);
             }
         }
         for k in to_remove {
             self.tiles.remove(&k);
         }
 
-        // priorities + image requests, spiral order
+        // priorities + image requests, spiral order. cap the request count —
+        // at max zoom-out a huge screen can see >100k regions; loading all of
+        // them exhausts file descriptors, the job queue and the GPU atlas.
         let zoom_level = get_zoom_level(self.scale);
         let mut new_prios = HashMap::new();
         let mut prio = 1i64;
         let mut requests: Vec<Point2i> = Vec::new();
-        self.for_visible_regions_spiral(usize::MAX, |region| {
+        self.for_visible_regions_spiral(MAX_TILE_REQUESTS, |region| {
             new_prios.insert(region.as_long(), prio);
             prio += 1;
             requests.push(region);
@@ -740,6 +744,9 @@ impl TileMapState {
         }
 
         if self.loading.contains(&region.as_long()) {
+            return;
+        }
+        if self.loading.len() >= MAX_IN_FLIGHT_LOADS {
             return;
         }
 

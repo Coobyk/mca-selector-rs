@@ -672,19 +672,19 @@ impl MainView {
         }
 
         let scale = self.map.scale;
-        let mut tiles: Vec<(i64, Point2i, bool)> = self
-            .map
-            .tiles
-            .iter()
-            .map(|(k, t)| (*k, t.location, t.image.is_some() && t.loaded))
-            .collect();
-        tiles.sort_by(|a, b| self.map.tile_priority(a.1).cmp(&self.map.tile_priority(b.1)));
-        tiles.sort_by_key(|t| !t.2);
-
         let show_empty = self.map.show_nonexistent_regions
             && config::world().map(|w| w.cfg.show_nonexistent_regions).unwrap_or(true);
+        // upstream draws the empty tile image under every unloaded/missing
+        // region — one fullscreen quad does the same job.
+        if show_empty {
+            window.paint_quad(fill(bounds, rgba(EMPTY_COLOR)));
+        }
 
-        for (key, region, loaded) in tiles {
+        let (vmin, vmax) = self.map.visible_region_bounds(Point2f::ZERO);
+        for rx in vmin.x..=vmax.x {
+            for rz in vmin.z..=vmax.z {
+            let region = Point2i::new(rx, rz);
+            let key = region.as_long();
             let offset = Point2f::new(
                 region.x as f32 * TILE_SIZE as f32 - self.map.offset.x,
                 region.z as f32 * TILE_SIZE as f32 - self.map.offset.z,
@@ -694,16 +694,11 @@ impl MainView {
                 origin: point(px(offset.x), px(offset.z)),
                 size: size(px(w), px(w)),
             };
-            if !self.map.regions.contains(&key) {
-                if show_empty {
-                    window.paint_quad(fill(b, rgba(EMPTY_COLOR)));
-                }
-                continue;
-            }
+            let Some(tile) = self.map.tiles.get(&key) else { continue };
+            let loaded = tile.image.is_some() && tile.loaded;
             if !loaded {
                 continue;
             }
-            let tile = self.map.tiles.get(&key).unwrap();
             if b.size.width < px(0.5) || b.size.height < px(0.5) {
                 continue;
             }
@@ -724,9 +719,9 @@ impl MainView {
                     self.paint_structure_icons(&st, region, scale, window);
                 }
             }
+            }
         }
 
-        let (vmin, vmax) = self.map.visible_region_bounds(Point2f::ZERO);
         self.paint_grids(bounds, vmin, vmax, window);
 
         // coordinates: region coords at grid intersections (TileMap.drawCoordinates)

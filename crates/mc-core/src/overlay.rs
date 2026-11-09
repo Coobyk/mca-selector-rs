@@ -271,9 +271,11 @@ impl Overlay {
         hsb_to_rgb(self.min_hue + pct * (self.max_hue - self.min_hue), 1.0, 1.0)
     }
 
-    /// 32x32 ARGB overlay image for a region
+    /// 32x32 ARGB overlay image for a region (upstream draws at alpha 0.5).
     pub fn image(&self, data: &[i32; 1024]) -> Vec<u32> {
-        data.iter().map(|&v| self.color_grade(v)).collect()
+        data.iter()
+            .map(|&v| (self.color_grade(v) & 0x00FF_FFFF) | 0x8000_0000)
+            .collect()
     }
 }
 
