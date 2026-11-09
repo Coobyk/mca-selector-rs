@@ -92,9 +92,6 @@ impl BlockStates {
             None => false,
         }
     }
-    pub fn waterlogged_bit(&self) -> usize {
-        self.waterlogged
-    }
 }
 
 /// Biome tints [grass, foliage, water, dry_foliage].

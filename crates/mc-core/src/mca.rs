@@ -616,13 +616,6 @@ fn write_chunk_data<W: std::io::Write>(
     }
 }
 
-/// Region = region + poi + entities MCA files (io.mca.Region).
-pub struct Region {
-    pub location: Point2i,
-    pub region: Option<McaFile>,
-    pub poi: Option<McaFile>,
-    pub entities: Option<McaFile>,
-}
 
 #[derive(Clone, Debug)]
 pub struct RegionDirectories {
@@ -639,32 +632,7 @@ pub struct WorldDirectories {
     pub entities: Option<PathBuf>,
 }
 
-impl Region {
-    pub fn load(dirs: &RegionDirectories, raw: bool) -> Result<Region> {
-        let mut r = Region {
-            location: dirs.location,
-            region: None,
-            poi: None,
-            entities: None,
-        };
-        if let Some(p) = &dirs.region {
-            let mut m = McaFile::new(p.clone())?;
-            m.load(raw)?;
-            r.region = Some(m);
-        }
-        if let Some(p) = &dirs.poi {
-            let mut m = McaFile::new(p.clone())?;
-            m.load(raw)?;
-            r.poi = Some(m);
-        }
-        if let Some(p) = &dirs.entities {
-            let mut m = McaFile::new(p.clone())?;
-            m.load(raw)?;
-            r.entities = Some(m);
-        }
-        Ok(r)
-    }
-}
+
 
 /// ChunkData bundles region+poi+entities chunks of one coordinate.
 #[derive(Default)]

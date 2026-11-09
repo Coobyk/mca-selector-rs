@@ -154,19 +154,4 @@ pub struct Point3i {
     pub z: i32,
 }
 
-impl Point3i {
-    pub const ZERO: Point3i = Point3i { x: 0, y: 0, z: 0 };
 
-    pub const fn new(x: i32, y: i32, z: i32) -> Self {
-        Point3i { x, y, z }
-    }
-
-    pub fn to_point2i(&self) -> Point2i {
-        Point2i::new(self.x, self.z)
-    }
-
-    /// sectionToBlock: each component << 4
-    pub fn section_to_block(&self) -> Point3i {
-        Point3i::new(self.x << 4, self.y << 4, self.z << 4)
-    }
-}
