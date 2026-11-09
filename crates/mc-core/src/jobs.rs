@@ -78,6 +78,13 @@ pub struct Pools {
 }
 
 static POOLS: std::sync::OnceLock<Pools> = std::sync::OnceLock::new();
+static PROCESS_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// app-configured process pool size (upstream Config.processThreads); must be
+/// called before first pools() use.
+pub fn set_process_threads(n: usize) {
+    let _ = PROCESS_THREADS.set(n.max(1));
+}
 
 pub fn pools() -> &'static Pools {
     POOLS.get_or_init(|| {
