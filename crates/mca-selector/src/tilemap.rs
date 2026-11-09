@@ -770,7 +770,6 @@ impl TileMapState {
     /// ImagePool.requestImage.
     pub fn request_image(&mut self, region: Point2i, zoom_level: i32) {
         let Some(ws) = crate::config::world() else { return };
-        // no mca file -> nothing to load
         if !self.regions.contains(&region.as_long()) {
             if let Some(t) = self.tiles.get_mut(&region.as_long()) {
                 t.loaded = true;
@@ -784,7 +783,6 @@ impl TileMapState {
             return;
         }
 
-        // memory pool exact zoom
         if let Some(img) = self.pool.get(&zoom_level).and_then(|m| m.get(&region.as_long())) {
             let img = img.clone();
             let t = self.tiles.get_mut(&region.as_long()).unwrap();
@@ -794,7 +792,6 @@ impl TileMapState {
             self.fetch_or_parse_structures(region);
             return;
         }
-        // memory pool other zooms
         for zl in (1..=crate::config::MAX_ZOOM_LEVEL).step_by(1) {
             if (zl & (zl - 1)) != 0 || zl == zoom_level {
                 continue;
@@ -825,7 +822,6 @@ impl TileMapState {
             }
         }
 
-        // disk cache: exact zoom png (zoom<32), lod db image (zoom>=32)
         if zoom_level >= 32 {
             if let Some((img, _)) = cache::get_lod_image(&ws.uuid, region) {
                 self.push_pool(zoom_level, region, img.clone());
@@ -849,7 +845,6 @@ impl TileMapState {
                 }
             }
         }
-        // disk cache: any zoom
         for zl in [1, 2, 4, 8, 16, 32] {
             if zl == zoom_level {
                 continue;
@@ -935,7 +930,6 @@ impl TileMapState {
             return;
         }
 
-        // generate from mca
         if self.loading.contains(&region.as_long()) {
             return;
         }

@@ -172,7 +172,6 @@ fn main() {
         cx.set_menus(menus(cx));
         cx.bind_keys(bindings());
 
-        // periodic menu refresh (recent worlds change)
         let bounds = Bounds::centered(None, size(px(800.), px(600.)), cx);
         let opts = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),

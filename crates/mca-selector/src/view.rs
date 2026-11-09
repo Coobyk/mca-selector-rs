@@ -340,7 +340,6 @@ impl MainView {
                                 self.map.selection.remove_chunk(chunk);
                                 self.map.selected_chunks += if self.map.selection.is_inverted() { 1 } else { -1 };
                             }
-                            // selection_version bump already invalidates the overlay cache
                             let _ = chunk.chunk_to_region();
                         }
                     } else {
@@ -419,7 +418,6 @@ impl MainView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        // dialog key input
         if self.dialog.is_some() {
             self.dialog_key(event, _window, cx);
             return;
@@ -625,7 +623,6 @@ impl MainView {
                     if r.container && r.expanded {
                         expanded.remove(&r.path);
                     } else if let Some(pos) = r.path.rfind(|c| c == '.' || c == '[') {
-                        // collapse to parent
                         let parent = r.path[..pos].to_string();
                         if let Some(pi) = rows.iter().position(|x| x.path == parent) {
                             *sel = pi;
@@ -1389,7 +1386,6 @@ impl MainView {
                     let size = TILE_SIZE;
                     let mut img = vec![0u32; size * size];
                     // render visible tiles into a screenshot at current zoom=1? upstream
-                    // screenshots the currently visible area as a png of the map pixels
                     let cfg = config::world().map(|w| w.cfg.clone());
                     let Some(cfg) = cfg else { return };
                     let rs = mc_core::render::RenderSettings {
@@ -1826,8 +1822,7 @@ impl MainView {
         let _ = tx;
         cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
             if let Ok(Ok(Some(path))) = rx.await {
-                // compute bounds
-                let mut minx = i32::MAX; let mut minz = i32::MAX;
+                        let mut minx = i32::MAX; let mut minz = i32::MAX;
                 let mut maxx = i32::MIN; let mut maxz = i32::MIN;
                 for &region_l in sel.selection.keys() {
                     let r = mc_core::point::Point2i::from_long(region_l);
@@ -2111,7 +2106,6 @@ impl MainView {
             cx.notify();
             return;
         }
-        // find the single selected chunk
         let mut found: Option<(i64, usize)> = None;
         for (&rl, cs) in &sel.selection {
             if let Some(cs) = cs {

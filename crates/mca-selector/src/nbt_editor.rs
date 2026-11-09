@@ -134,7 +134,6 @@ pub fn apply_rename(root: &mut Compound, path: &str, new_name: &str) -> Result<(
         return Err("empty name".into());
     }
     let Some(sep) = path.rfind('.') else {
-        // top-level key
         let old_key = path.to_string();
         let Some(v) = root.shift_remove(&old_key) else {
             return Err(format!("no tag at '{path}'"));
