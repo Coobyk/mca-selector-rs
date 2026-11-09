@@ -1499,7 +1499,14 @@ impl MainView {
     }
 
 
-    fn toggle_render(&self, label: &'static str, val: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// toggle button for a RenderSettings draft field; `set` picks the field.
+    fn toggle_render(
+        &self,
+        label: &'static str,
+        val: bool,
+        set: fn(&mut crate::config::WorldConfig) -> &mut bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         div()
             .id(SharedString::from(format!("rs-{label}")))
             .px_2().py_1()
@@ -1511,23 +1518,21 @@ impl MainView {
             .child(format!("{}: {}", label, if val { "on" } else { "off" }))
             .on_click(cx.listener(move |v, _, _w, cx| {
                 if let Some(Dialog::RenderSettings { draft }) = &mut v.dialog {
-                    match label {
-                        "Shade" => draft.shade = !draft.shade,
-                        "Water" => draft.shade_water = !draft.shade_water,
-                        "Altitude" => draft.shade_altitude = !draft.shade_altitude,
-                        "Smooth render" => draft.smooth_rendering = !draft.smooth_rendering,
-                        "Smooth overlays" => draft.smooth_overlays = !draft.smooth_overlays,
-                        "Layer only" => draft.render_layer_only = !draft.render_layer_only,
-                        "Caves" => draft.render_caves = !draft.render_caves,
-                        "Nonexistent" => draft.show_nonexistent_regions = !draft.show_nonexistent_regions,
-                        _ => {}
-                    }
+                    let f = set(draft);
+                    *f = !*f;
                 }
                 cx.notify();
             }))
     }
 
-    fn toggle_global(&self, label: &'static str, val: bool, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// toggle button for a GlobalConfig draft field; `set` picks the field.
+    fn toggle_global(
+        &self,
+        label: &'static str,
+        val: bool,
+        set: fn(&mut crate::config::GlobalConfig) -> &mut bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         div()
             .id(SharedString::from(format!("gs-{label}")))
             .px_2().py_1()
@@ -1539,13 +1544,8 @@ impl MainView {
             .child(format!("{}: {}", label, if val { "on" } else { "off" }))
             .on_click(cx.listener(move |v, _, _w, cx| {
                 if let Some(Dialog::Settings { draft }) = &mut v.dialog {
-                    match label {
-                        "Chunk grid" => draft.show_chunk_grid = !draft.show_chunk_grid,
-                        "Region grid" => draft.show_region_grid = !draft.show_region_grid,
-                        "Coordinates" => draft.show_coordinates = !draft.show_coordinates,
-                        "Debug" => draft.debug = !draft.debug,
-                        _ => {}
-                    }
+                    let f = set(draft);
+                    *f = !*f;
                 }
                 cx.notify();
             }))
@@ -2480,10 +2480,10 @@ impl MainView {
                     .child(text_el(format!("Minecraft saves dir: {}", draft.mc_saves_dir), 12.))
                     .child(
                         h_flex().gap_1().flex_wrap()
-                            .child(self.toggle_global("Chunk grid", draft.show_chunk_grid, cx))
-                            .child(self.toggle_global("Region grid", draft.show_region_grid, cx))
-                            .child(self.toggle_global("Coordinates", draft.show_coordinates, cx))
-                            .child(self.toggle_global("Debug", draft.debug, cx)),
+                            .child(self.toggle_global("Chunk grid", draft.show_chunk_grid, |d| &mut d.show_chunk_grid, cx))
+                            .child(self.toggle_global("Region grid", draft.show_region_grid, |d| &mut d.show_region_grid, cx))
+                            .child(self.toggle_global("Coordinates", draft.show_coordinates, |d| &mut d.show_coordinates, cx))
+                            .child(self.toggle_global("Debug", draft.debug, |d| &mut d.debug, cx)),
                     )
                     .child(
                         h_flex().gap_2()
@@ -2506,20 +2506,20 @@ impl MainView {
                     .child(text_el(format!("Render height: {}", draft.render_height), 12.))
                     .child(
                         h_flex().gap_1().flex_wrap()
-                            .child(self.toggle_render("Shade", draft.shade, cx))
-                            .child(self.toggle_render("Water", draft.shade_water, cx))
-                            .child(self.toggle_render("Altitude", draft.shade_altitude, cx)),
+                            .child(self.toggle_render("Shade", draft.shade, |d| &mut d.shade, cx))
+                            .child(self.toggle_render("Water", draft.shade_water, |d| &mut d.shade_water, cx))
+                            .child(self.toggle_render("Altitude", draft.shade_altitude, |d| &mut d.shade_altitude, cx)),
                     )
                     .child(
                         h_flex().gap_1().flex_wrap()
-                            .child(self.toggle_render("Smooth render", draft.smooth_rendering, cx))
-                            .child(self.toggle_render("Smooth overlays", draft.smooth_overlays, cx)),
+                            .child(self.toggle_render("Smooth render", draft.smooth_rendering, |d| &mut d.smooth_rendering, cx))
+                            .child(self.toggle_render("Smooth overlays", draft.smooth_overlays, |d| &mut d.smooth_overlays, cx)),
                     )
                     .child(
                         h_flex().gap_1().flex_wrap()
-                            .child(self.toggle_render("Layer only", draft.render_layer_only, cx))
-                            .child(self.toggle_render("Caves", draft.render_caves, cx))
-                            .child(self.toggle_render("Nonexistent", draft.show_nonexistent_regions, cx)),
+                            .child(self.toggle_render("Layer only", draft.render_layer_only, |d| &mut d.render_layer_only, cx))
+                            .child(self.toggle_render("Caves", draft.render_caves, |d| &mut d.render_caves, cx))
+                            .child(self.toggle_render("Nonexistent", draft.show_nonexistent_regions, |d| &mut d.show_nonexistent_regions, cx)),
                     )
                     .child(text_el(format!("Header-only zoom: {}", draft.render_header_only_zoom_level), 12.))
                     .child(
