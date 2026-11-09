@@ -303,6 +303,10 @@ impl TileMapState {
             // instant downscale or a fresh render — clearing them here makes
             // the map flash black on every wheel tick.
             jobs::pools().clear_queues();
+            // dropped jobs never send results; clear the in-flight flags so
+            // update() can re-request at the new zoom.
+            self.loading.clear();
+            self.overlay_loading.clear();
         }
         changed
     }
@@ -1052,9 +1056,13 @@ impl TileMapState {
                     cache_write,
                 } => {
                     self.loading.remove(&region.as_long());
-                    // drop renders at a stale zoom level (queue was cleared
-                    // mid-flight); update() will re-request at the new zoom.
+                    // renders that landed at a stale zoom are still valid
+                    // data — keep them in the pool but don't clobber the
+                    // tile's current-zoom image.
                     if image.is_some() && zoom != get_zoom_level(self.scale) {
+                        if let Some(img) = &image {
+                            self.push_pool(zoom, region, img.clone());
+                        }
                         continue;
                     }
                     if let Some(img) = &image {
