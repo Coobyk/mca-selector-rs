@@ -17,7 +17,7 @@ fn menus(cx: &App) -> Vec<Menu> {
         .map(|r| {
             MenuItem::action(
                 r.world.display().to_string(),
-                OpenRecentAction,
+                OpenRecentWorld { path: r.world.to_string_lossy().to_string() },
             )
         })
         .collect();

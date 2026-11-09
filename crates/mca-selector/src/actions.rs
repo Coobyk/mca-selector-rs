@@ -47,3 +47,10 @@ actions!(
         AboutAction,
     ]
 );
+
+/// data-carrying action so each recent-world menu item opens its own path.
+#[derive(gpui::Action, serde::Deserialize, serde::Serialize, Clone, PartialEq, gpui::private::schemars::JsonSchema)]
+#[action(namespace = mca_selector)]
+pub struct OpenRecentWorld {
+    pub path: String,
+}

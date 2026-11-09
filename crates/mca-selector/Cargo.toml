@@ -17,6 +17,7 @@ env_logger = "0.11"
 smol = "2"
 smallvec = "1"
 parking_lot.workspace = true
+schemars = "1.0"
 
 [[bin]]
 name = "mca-selector"

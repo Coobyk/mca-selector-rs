@@ -3261,6 +3261,7 @@ dependencies = [
  "mc-core",
  "parking_lot",
  "rayon",
+ "schemars",
  "serde",
  "serde_json",
  "smallvec",

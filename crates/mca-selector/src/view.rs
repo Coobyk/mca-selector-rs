@@ -1136,6 +1136,9 @@ impl Render for MainView {
             }))
             .on_action(cx.listener(|v, _: &OpenWorldAction, w, cx| v.open_world_dialog(w, cx)))
             .on_action(cx.listener(|v, _: &OpenRecentAction, w, cx| v.open_recent_dialog(w, cx)))
+            .on_action(cx.listener(|v, a: &OpenRecentWorld, _w, cx| {
+                v.open_world_at(std::path::PathBuf::from(&a.path), cx);
+            }))
             .on_action(cx.listener(|v, _: &OpenDimensionAction, w, cx| v.open_dimension_dialog(w, cx)))
             .on_action(cx.listener(|v, _: &SettingsAction, _w, cx| {
                 v.dialog = Some(Dialog::Settings { draft: config::global() });
