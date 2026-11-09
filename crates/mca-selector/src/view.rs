@@ -46,7 +46,8 @@ pub enum Dialog {
     SelectDimension { dims: Vec<PathBuf> },
     Settings { draft: config::GlobalConfig },
     RenderSettings { draft: config::WorldConfig },
-    Progress { msg: String },
+    Info { msg: String },
+    JobProgress,
     TextInput {
         title: String,
         hint: String,
@@ -118,14 +119,22 @@ impl MainView {
             for t in self.map.tiles.values_mut() {
                 t.marked_chunks_image = None;
             }
-            self.dialog = Some(Dialog::Progress { msg: format!("filter matched {n} chunks") });
+            self.dialog = Some(Dialog::Info { msg: format!("filter matched {n} chunks") });
         }
         let changed = self.map.poll_results();
         if self.update_needed || changed {
             self.map.update();
             self.update_needed = false;
         }
-        if self.pressed_keys != 0 || self.drag.is_move() {
+        let busy = mc_core::jobs::current_progress().is_some();
+        if busy && self.dialog.is_none() {
+            self.dialog = Some(Dialog::JobProgress);
+        } else if !busy && matches!(self.dialog, Some(Dialog::JobProgress)) {
+            self.dialog = None;
+        }
+        if self.pressed_keys != 0 || self.drag.is_move() || busy
+            || matches!(self.dialog, Some(Dialog::JobProgress)) || mc_core::jobs::active_jobs() > 0
+        {
             cx.notify();
         }
     }
@@ -445,7 +454,7 @@ impl MainView {
         }
         if k == "escape" {
             match self.dialog {
-                Some(Dialog::Progress { .. }) => {}
+                Some(Dialog::Info { .. }) => {}
                 _ => self.dialog = None,
             }
         }
@@ -526,6 +535,11 @@ impl MainView {
             }
             if let Some(ri) = tile.render_image.clone() {
                 let _ = window.paint_image(b, px(0.).into(), ri, 0, false);
+            }
+            if self.map.overlay.is_some() {
+                if let Some(oi) = tile.overlay_render_image.clone() {
+                    let _ = window.paint_image(b, px(0.).into(), oi, 0, false);
+                }
             }
             if let Some(ov) = selection_overlay_image(tile, &self.map.selection, self.selection_version) {
                 let _ = window.paint_image(b, px(0.).into(), ov, 0, false);
@@ -725,6 +739,9 @@ impl MainView {
         if self.map.unsaved_selection {
             parts.push("selection not saved".into());
         }
+        if let Some(ov) = &self.map.overlay {
+            parts.push(format!("overlay: {}", ov.typ.display_name()));
+        }
         parts.push(format!("{} jobs in queue", mc_core::jobs::active_jobs()));
         parts.join(" | ")
     }
@@ -921,6 +938,15 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &FilterChunksAction, _w, cx| v.filter_chunks(cx)))
             .on_action(cx.listener(|v, _: &ChangeFieldsAction, _w, cx| v.change_fields(cx)))
             .on_action(cx.listener(|v, _: &ImportChunksAction, _w, cx| v.import_chunks(cx)))
+            .on_action(cx.listener(|v, _: &EditOverlaysAction, _w, cx| v.edit_overlays(cx)))
+            .on_action(cx.listener(|v, _: &NextOverlayAction, _w, cx| {
+                v.map.next_overlay();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|v, _: &NextOverlayTypeAction, _w, cx| {
+                v.map.next_overlay_type();
+                cx.notify();
+            }))
             .on_action(cx.listener(|v, _: &AboutAction, _w, cx| {
                 v.dialog = Some(Dialog::About);
                 cx.notify();
@@ -1160,8 +1186,12 @@ impl MainView {
                 mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
                     mc_core::jobs::PRIORITY_LOW, None,
                     move || {
+                        let __p = mc_core::jobs::Progress::new("Deleting chunks", sel.selection.len() as i64);
                         for (&region_l, chunks) in &sel.selection {
+                            let __g = __p.inc_guard();
                             let region = mc_core::point::Point2i::from_long(region_l);
+                            __p.set_current(mc_core::files::mca_file_name(region));
+                            if __p.is_cancelled() { break; }
                             let dirs = crate::config::world().and_then(|w| w.dirs.region.clone());
                             let Some(dir) = dirs else { continue };
                             let path = dir.join(mc_core::files::mca_file_name(region));
@@ -1199,8 +1229,12 @@ impl MainView {
                 mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
                     mc_core::jobs::PRIORITY_LOW, None,
                     move || {
+                        let __p = mc_core::jobs::Progress::new("Defragmenting", sel.selection.len() as i64);
                         for &region_l in sel.selection.keys() {
+                            let __g = __p.inc_guard();
                             let region = mc_core::point::Point2i::from_long(region_l);
+                            __p.set_current(mc_core::files::mca_file_name(region));
+                            if __p.is_cancelled() { break; }
                             let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
                             let path = dir.join(mc_core::files::mca_file_name(region));
                             if !path.exists() { continue; }
@@ -1236,8 +1270,12 @@ impl MainView {
                     mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
                         mc_core::jobs::PRIORITY_LOW, None,
                         move || {
+                            let __p = mc_core::jobs::Progress::new("Exporting chunks", sel.selection.len() as i64);
                             for (&region_l, chunks) in &sel.selection {
+                                let __g = __p.inc_guard();
                                 let region = mc_core::point::Point2i::from_long(region_l);
+                                __p.set_current(mc_core::files::mca_file_name(region));
+                                if __p.is_cancelled() { break; }
                                 let Some(src_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
                                 let src = src_dir.join(mc_core::files::mca_file_name(region));
                                 let dst = region_dir.join(mc_core::files::mca_file_name(region));
@@ -1271,26 +1309,35 @@ impl MainView {
         let origin = sel.selection.keys().next().copied();
         let Some(origin_l) = origin else { return };
         let origin = mc_core::point::Point2i::from_long(origin_l);
-        for (&region_l, chunks) in &sel.selection {
-            let region = mc_core::point::Point2i::from_long(region_l);
-            let Some(src_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
-            let src = src_dir.join(mc_core::files::mca_file_name(region));
-            let dst = clip.join(mc_core::files::mca_file_name(region));
-            if !src.exists() { continue; }
-            match chunks {
-                None => { let _ = std::fs::copy(&src, &dst); }
-                Some(cs) => {
-                    let mut m = match mc_core::mca::McaFile::new(src) { Ok(m) => m, Err(_) => continue };
-                    if m.load(false).is_err() { continue; }
-                    let mut keep = mc_core::selection::ChunkSet::new();
-                    for i in 0..1024 { if !cs.get(i) { keep.set(i); } }
-                    m.delete_chunks(&keep);
-                    let _ = m.save_with_temp_file(&dst);
+        let total = sel.selection.len() as i64;
+        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+            mc_core::jobs::PRIORITY_LOW, None,
+            move || {
+                let __p = mc_core::jobs::Progress::new("Copying chunks", total);
+                for (&region_l, chunks) in &sel.selection {
+                    let __g = __p.inc_guard();
+                    let region = mc_core::point::Point2i::from_long(region_l);
+                    __p.set_current(mc_core::files::mca_file_name(region));
+                    if __p.is_cancelled() { break; }
+                    let Some(src_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
+                    let src = src_dir.join(mc_core::files::mca_file_name(region));
+                    let dst = clip.join(mc_core::files::mca_file_name(region));
+                    if !src.exists() { continue; }
+                    match chunks {
+                        None => { let _ = std::fs::copy(&src, &dst); }
+                        Some(cs) => {
+                            let mut m = match mc_core::mca::McaFile::new(src) { Ok(m) => m, Err(_) => continue };
+                            if m.load(false).is_err() { continue; }
+                            let mut keep = mc_core::selection::ChunkSet::new();
+                            for i in 0..1024 { if !cs.get(i) { keep.set(i); } }
+                            m.delete_chunks(&keep);
+                            let _ = m.save_with_temp_file(&dst);
+                        }
+                    }
                 }
-            }
-        }
-        // record origin for offset paste
-        let _ = std::fs::write(clip.join("../origin.txt"), format!("{},{}", origin.x, origin.z));
+                // record origin for offset paste
+                let _ = std::fs::write(clip.join("../origin.txt"), format!("{},{}", origin.x, origin.z));
+            }));
         cx.notify();
     }
 
@@ -1302,8 +1349,12 @@ impl MainView {
             mc_core::jobs::PRIORITY_LOW, None,
             move || {
                 let Ok(rd) = std::fs::read_dir(&clip) else { return };
+                let __p = mc_core::jobs::Progress::new("Pasting chunks", -1);
                 for e in rd.flatten() {
+                    let __g = __p.inc_guard();
+                    if __p.is_cancelled() { break; }
                     let name = e.file_name().to_string_lossy().to_string();
+                    __p.set_current(name.clone());
                     let Some(region) = mc_core::files::parse_mca_file_name(&name) else { continue };
                     let dst_dir = match crate::config::world().and_then(|w| w.dirs.region.clone()) {
                         Some(d) => d,
@@ -1378,10 +1429,14 @@ impl MainView {
                 mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
                     mc_core::jobs::PRIORITY_LOW, None,
                     move || {
+                        let __p = mc_core::jobs::Progress::new("Exporting image", sel2.selection.len() as i64);
                         let mut px = vec![0u32; w * h];
                         let corrupted = [0u32; 256];
                         for &region_l in sel2.selection.keys() {
+                            let __g = __p.inc_guard();
                             let region = mc_core::point::Point2i::from_long(region_l);
+                            __p.set_current(mc_core::files::mca_file_name(region));
+                            if __p.is_cancelled() { break; }
                             let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
                             let p = dir.join(mc_core::files::mca_file_name(region));
                             if !p.exists() { continue; }
@@ -1459,8 +1514,12 @@ impl MainView {
                 mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
                     mc_core::jobs::PRIORITY_LOW, None,
                     move || {
+                        let __p = mc_core::jobs::Progress::new("Importing chunks", paths.len() as i64);
                         for p in paths {
+                            let __g = __p.inc_guard();
+                            if __p.is_cancelled() { break; }
                             let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                            __p.set_current(name.clone());
                             let Some(region) = mc_core::files::parse_mca_file_name(&name) else { continue };
                             let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { return };
                             let dst = dir.join(&name);
@@ -1586,8 +1645,12 @@ impl MainView {
             mc_core::jobs::PRIORITY_LOW, None,
             move || {
                 let val = parse_snbt_value(&raw);
+                let __p = mc_core::jobs::Progress::new("Changing fields", sel.selection.len() as i64);
                 for (&region_l, chunks) in &sel.selection {
+                    let __g = __p.inc_guard();
                     let region = mc_core::point::Point2i::from_long(region_l);
+                    __p.set_current(mc_core::files::mca_file_name(region));
+                    if __p.is_cancelled() { break; }
                     let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
                     let p = dir.join(mc_core::files::mca_file_name(region));
                     if !p.exists() { continue; }
@@ -1608,6 +1671,67 @@ impl MainView {
         cx.notify();
     }
 
+
+    fn edit_overlays(&mut self, cx: &mut Context<Self>) {
+        // serialize current overlays as editable lines: "Type min max [data]"
+        let cur: Vec<String> = self
+            .map
+            .overlays
+            .iter()
+            .flatten()
+            .map(|o| {
+                let mut l = format!(
+                    "{} {} {}",
+                    o.typ.display_name(),
+                    o.min.map(|v| v.to_string()).unwrap_or_default(),
+                    o.max.map(|v| v.to_string()).unwrap_or_default(),
+                );
+                if !o.raw_multi.is_empty() {
+                    l.push(' ');
+                    l.push_str(&o.raw_multi);
+                }
+                l
+            })
+            .collect();
+        self.dialog = Some(Dialog::TextInput {
+            title: "Edit overlays".into(),
+            hint: "one per line, '|' separated: Type min max [data]  e.g. InhabitedTime 0 1000 | Blocks 0 500 minecraft:stone | Custom 0 10 region/sections.size".into(),
+            text: cur.join(" | "),
+            on_done: Box::new(|v, w, cx, text| {
+                v.apply_overlays(text, w, cx);
+            }),
+        });
+        cx.notify();
+    }
+
+    fn apply_overlays(&mut self, text: String, _w: &mut Window, cx: &mut Context<Self>) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            self.map.set_overlays(Vec::new());
+            cx.notify();
+            return;
+        }
+        let mut list = Vec::new();
+        for line in text.split(['|', '\n']) {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match mc_core::overlay::parse_overlay_line(line) {
+                Ok(o) => list.push(o),
+                Err(e) => {
+                    self.dialog = Some(Dialog::Error { msg: format!("{e} (in '{line}')") });
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        self.map.set_overlays(list);
+        // select the first valid overlay like upstream's initial selection flow:
+        // cycling with N activates it
+        self.map.set_overlay(None);
+        cx.notify();
+    }
 
     fn filter_chunks(&mut self, cx: &mut Context<Self>) {
         self.dialog = Some(Dialog::TextInput {
@@ -1645,8 +1769,12 @@ impl MainView {
                 } else {
                     sel.selection.keys().copied().collect()
                 };
+                let __p = mc_core::jobs::Progress::new("Filtering chunks", regions.len() as i64);
                 for rl in regions {
+                    let __g = __p.inc_guard();
                     let region = mc_core::point::Point2i::from_long(rl);
+                    __p.set_current(mc_core::files::mca_file_name(region));
+                    if __p.is_cancelled() { break; }
                     let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
                     let p = dir.join(mc_core::files::mca_file_name(region));
                     if !p.exists() { continue; }
@@ -1891,9 +2019,35 @@ impl MainView {
                     cx.notify();
                 })))
             }
-            Dialog::Progress { msg } => panel(
+            Dialog::Info { msg } => panel(
                 v_flex().child(text_el(msg.clone(), 14.)),
             ),
+            Dialog::JobProgress => {
+                let pr = mc_core::jobs::current_progress();
+                let (title, frac, cur) = match &pr {
+                    Some(p) => {
+                        (p.title.clone(), p.fraction(), p.current.lock().clone())
+                    }
+                    None => ("Working".to_string(), -1.0, String::new()),
+                };
+                let pct = if frac < 0.0 { "".to_string() } else { format!(" {:.0}%", frac * 100.0) };
+                let bar_w = 280.0_f32;
+                let fill_w = if frac < 0.0 { 0.0 } else { bar_w * frac };
+                panel(
+                    v_flex().gap_2()
+                        .child(text_el(format!("{title}{pct}"), 14.))
+                        .child(
+                            div().w(px(bar_w)).h(px(10.)).bg(rgb(0x2a2a2a))
+                                .child(div().w(px(fill_w)).h_full().bg(rgb(0x3a7bd5)))
+                        )
+                        .child(text_el(cur, 10.))
+                        .child(button("Cancel", cx, |v, _w, cx| {
+                            mc_core::jobs::cancel_progress();
+                            v.dialog = None;
+                            cx.notify();
+                        })),
+                )
+            }
             Dialog::TextInput { title, hint, text, .. } => panel(
                 v_flex().gap_2()
                     .child(text_el(title.clone(), 16.))
@@ -1919,7 +2073,7 @@ impl MainView {
                 .on_mouse_down(MouseButton::Left, cx.listener(|v, e, _w, cx| {
                     let _ = e;
                     match v.dialog {
-                        Some(Dialog::Confirm { .. }) | Some(Dialog::Progress { .. }) | Some(Dialog::Goto { .. }) => {}
+                        Some(Dialog::Confirm { .. }) | Some(Dialog::Info { .. }) | Some(Dialog::Goto { .. }) | Some(Dialog::JobProgress) => {}
                         _ => v.dialog = None,
                     }
                     cx.notify();

@@ -178,3 +178,76 @@ impl Pools {
         }
     }
 }
+
+// -- progress tracking --------------------------------------------------------
+
+/// Shared progress state for a batch operation (port of upstream `Progress`).
+pub struct Progress {
+    pub title: String,
+    pub total: AtomicI64,
+    pub done: AtomicI64,
+    pub current: Mutex<String>,
+    pub cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl Progress {
+    pub fn new(title: impl Into<String>, total: i64) -> Arc<Self> {
+        let p = Arc::new(Self {
+            title: title.into(),
+            total: AtomicI64::new(total.max(0)),
+            done: AtomicI64::new(0),
+            current: Mutex::new(String::new()),
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        });
+        *CURRENT.lock() = Arc::downgrade(&p);
+        p
+    }
+
+    pub fn set_current(&self, s: impl Into<String>) {
+        *self.current.lock() = s.into();
+    }
+
+    pub fn inc(&self) {
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    /// fraction done in [0,1]; total==0 => indeterminate (returns -1).
+    pub fn fraction(&self) -> f32 {
+        let t = self.total.load(Ordering::Relaxed);
+        if t <= 0 { return -1.0; }
+        (self.done.load(Ordering::Relaxed) as f32 / t as f32).clamp(0.0, 1.0)
+    }
+
+    /// guard that increments `done` when the iteration ends (drop, continue or break).
+    pub fn inc_guard(&self) -> IncGuard<'_> {
+        IncGuard(self)
+    }
+}
+
+pub struct IncGuard<'a>(&'a Progress);
+impl Drop for IncGuard<'_> {
+    fn drop(&mut self) {
+        self.0.inc();
+    }
+}
+
+static CURRENT: Mutex<std::sync::Weak<Progress>> = Mutex::new(std::sync::Weak::new());
+
+/// the in-flight batch progress, if the owning job is still alive.
+pub fn current_progress() -> Option<Arc<Progress>> {
+    CURRENT.lock().upgrade()
+}
+
+pub fn cancel_progress() {
+    if let Some(p) = CURRENT.lock().upgrade() {
+        p.cancel();
+    }
+}

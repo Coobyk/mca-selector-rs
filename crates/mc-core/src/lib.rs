@@ -8,6 +8,7 @@ pub mod filter;
 pub mod jobs;
 pub mod mca;
 pub mod nbt;
+pub mod overlay;
 pub mod point;
 pub mod registry;
 pub mod render;

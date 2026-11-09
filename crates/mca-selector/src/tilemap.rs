@@ -44,6 +44,8 @@ pub struct Tile {
     pub marked_chunks_image: Option<Vec<u32>>, // 32x32 argb
     /// gpu-ready image, built when the argb result lands
     pub render_image: Option<std::sync::Arc<gpui::RenderImage>>,
+    /// gpu-ready 32x32 overlay image
+    pub overlay_render_image: Option<std::sync::Arc<gpui::RenderImage>>,
 }
 
 impl Tile {
@@ -57,6 +59,7 @@ impl Tile {
             structures: None,
             marked_chunks_image: None,
             render_image: None,
+            overlay_render_image: None,
         }
     }
     pub fn image_zoom_level(&self) -> i32 {
@@ -94,6 +97,11 @@ pub enum TileResult {
     Structures {
         region: Point2i,
         structures: Option<HashMap<i64, Vec<String>>>,
+    },
+    /// 32x32 ARGB overlay image (one pixel per chunk)
+    Overlay {
+        region: Point2i,
+        image: Option<Vec<u32>>,
     },
 }
 
@@ -135,8 +143,11 @@ pub struct TileMapState {
     pub mca_cache: Vec<Point2i>,
     pub results_rx: Option<Receiver<TileResult>>,
     pub result_tx: Sender<TileResult>,
-    /// current overlay id (unused until overlays ported)
-    pub overlay: Option<String>,
+    /// active overlay parser (overlayPool.parser)
+    pub overlay: Option<mc_core::overlay::Overlay>,
+    /// configured overlays, sorted by type, terminated by None (overlay list)
+    pub overlays: Vec<Option<mc_core::overlay::Overlay>>,
+    pub overlay_loading: HashSet<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -176,6 +187,8 @@ impl TileMapState {
             results_rx: Some(rx),
             result_tx: tx,
             overlay: None,
+            overlays: vec![None],
+            overlay_loading: HashSet::new(),
         }
     }
 
@@ -464,6 +477,8 @@ impl TileMapState {
             if !self.tiles.contains_key(&region.as_long()) {
                 self.tiles.insert(region.as_long(), Tile::new(region));
             }
+            let need_overlay = self.overlay.is_some()
+                && !self.tiles.get(&region.as_long()).map(|t| t.overlay_loaded).unwrap_or(false);
             let tile = self.tiles.get_mut(&region.as_long()).unwrap();
             if tile.image.is_some() && tile.loaded {
                 let img_zoom = tile.image_zoom_level();
@@ -495,7 +510,143 @@ impl TileMapState {
             } else if !tile.loaded {
                 self.request_image(region, zoom_level);
             }
+            if need_overlay {
+                self.request_overlay(region);
+            }
         }
+    }
+
+    /// OverlayPool.requestImage: parse overlay data for a region and send back
+    /// the 32x32 color-graded image.
+    fn request_overlay(&mut self, region: Point2i) {
+        let Some(ov) = self.overlay.clone() else { return };
+        if !ov.is_valid() || !ov.active {
+            return;
+        }
+        if !self.regions.contains(&region.as_long()) {
+            if let Some(t) = self.tiles.get_mut(&region.as_long()) {
+                t.overlay_loaded = true;
+            }
+            return;
+        }
+        if !self.overlay_loading.insert(region.as_long()) {
+            return;
+        }
+        let Some(path) = self.mca_path(region) else { return };
+        let tx = self.result_tx.clone();
+        let priority = self.tile_priority(region);
+        jobs::pools().add_process(Job::new(
+            jobs::PRIORITY_MEDIUM,
+            Some(Box::new(move || priority)),
+            move || {
+                let image = McaFile::new(path)
+                    .and_then(|mut m| m.load(true).map(|_| m))
+                    .ok()
+                    .map(|m| ov.image(&mc_core::overlay::region_overlay_data(&m, &ov)));
+                let _ = tx.send(TileResult::Overlay { region, image });
+            },
+        ));
+    }
+
+    /// TileMap.setOverlays
+    pub fn set_overlays(&mut self, list: Vec<mc_core::overlay::Overlay>) {
+        self.overlays = {
+            let mut v: Vec<Option<mc_core::overlay::Overlay>> =
+                list.into_iter().map(Some).collect();
+            v.sort_by_key(|o| o.as_ref().map(|o| o.typ));
+            v.push(None);
+            v
+        };
+        self.set_overlay(None);
+        jobs::pools().cancel_parser_queue();
+    }
+
+    /// TileMap.setOverlay
+    pub fn set_overlay(&mut self, ov: Option<mc_core::overlay::Overlay>) {
+        self.overlay = ov;
+        self.clear_overlay();
+    }
+
+    /// TileMap.nextOverlay — cycle within the same overlay type.
+    pub fn next_overlay(&mut self) {
+        let Some(cur) = &self.overlay else { return };
+        if self.disabled { return; }
+        let cur_typ = cur.typ;
+        let mut index = self
+            .overlays
+            .iter()
+            .position(|o| o.as_ref() == Some(cur))
+            .unwrap_or(self.overlays.len() - 1);
+        loop {
+            index += 1;
+            if index == self.overlays.len() {
+                index = 0;
+            }
+            let p = &self.overlays[index];
+            if let Some(o) = p {
+                if o.active && o.is_valid() && o.typ == cur_typ {
+                    let o = o.clone();
+                    self.set_overlay(Some(o));
+                    break;
+                }
+            }
+            if index == self.overlays.len() - 1 {
+                break; // wrapped past the None terminator without match
+            }
+        }
+        jobs::pools().cancel_parser_queue();
+    }
+
+    /// TileMap.nextOverlayType — cycle to next overlay of a different type
+    /// (None = overlay off).
+    pub fn next_overlay_type(&mut self) {
+        if self.disabled { return; }
+        let cur_typ = self.overlay.as_ref().map(|o| o.typ);
+        let mut index = match &self.overlay {
+            Some(cur) => self
+                .overlays
+                .iter()
+                .position(|o| o.as_ref() == Some(cur))
+                .unwrap_or(self.overlays.len() - 1),
+            None => self.overlays.len() - 1,
+        };
+        loop {
+            index += 1;
+            if index == self.overlays.len() {
+                index = 0;
+            }
+            match &self.overlays[index] {
+                None => {
+                    self.set_overlay(None);
+                    break;
+                }
+                Some(o) => {
+                    if o.active && o.is_valid() && Some(o.typ) != cur_typ {
+                        let o = o.clone();
+                        self.set_overlay(Some(o));
+                        break;
+                    }
+                }
+            }
+            if index == self.overlays.len() - 1 && self.overlays.len() <= 1 {
+                break;
+            }
+            // guard against infinite loop when nothing valid exists
+            if self.overlays[index].is_none() && cur_typ.is_none() {
+                break;
+            }
+        }
+        jobs::pools().cancel_parser_queue();
+    }
+
+    /// TileMap.clearOverlay
+    pub fn clear_overlay(&mut self) {
+        for t in self.tiles.values_mut() {
+            t.overlay = None;
+            t.overlay_loaded = false;
+            t.overlay_render_image = None;
+        }
+        self.overlay_loading.clear();
     }
 
     /// ImagePool.requestImage.
@@ -925,6 +1076,18 @@ impl TileMapState {
                 TileResult::Structures { region, structures } => {
                     if let Some(t) = self.tiles.get_mut(&region.as_long()) {
                         t.structures = structures;
+                    }
+                }
+                TileResult::Overlay { region, image } => {
+                    self.overlay_loading.remove(&region.as_long());
+                    if let Some(t) = self.tiles.get_mut(&region.as_long()) {
+                        if let Some(img) = image {
+                            if self.overlay.is_some() {
+                                t.overlay_render_image = argb_to_render_image(&img, 32);
+                                t.overlay = Some((img, 32));
+                            }
+                        }
+                        t.overlay_loaded = true;
                     }
                 }
             }

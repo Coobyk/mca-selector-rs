@@ -233,7 +233,7 @@ pub fn chunk_format(data_version: i32) -> ChunkFormat {
 // helpers
 
 #[inline]
-fn packed_get(data: Option<&[u8]>, index: usize, bits: usize, indexes_per_long: usize) -> u64 {
+pub(crate) fn packed_get(data: Option<&[u8]>, index: usize, bits: usize, indexes_per_long: usize) -> u64 {
     let Some(d) = data else { return 0 };
     let li = index / indexes_per_long;
     let start_bit = (index % indexes_per_long) * bits;
@@ -241,7 +241,7 @@ fn packed_get(data: Option<&[u8]>, index: usize, bits: usize, indexes_per_long: 
     (v >> start_bit) & ((1u64 << bits) - 1)
 }
 
-fn palette_name<'a>(entry: Option<&'a Tag>, format: ChunkFormat) -> &'a str {
+pub(crate) fn palette_name<'a>(entry: Option<&'a Tag>, format: ChunkFormat) -> &'a str {
     match entry {
         Some(Tag::Compound(c)) => {
             if format == ChunkFormat::P26_3s7 {
