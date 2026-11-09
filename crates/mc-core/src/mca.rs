@@ -221,6 +221,12 @@ pub struct McaFile {
     pub sectors: [u8; 1024],
 }
 
+/// 3-byte big-endian chunk-offset decode (header i-th entry)
+fn offset_at(buf: &[u8], i: usize) -> i32 {
+    let o = i * 4;
+    ((buf[o] as i32) << 16) | ((buf[o + 1] as i32) << 8) | (buf[o + 2] as i32)
+}
+
 impl McaFile {
     pub fn new(file: PathBuf) -> Result<Self> {
         let location = crate::files::parse_mca_file_name(
@@ -261,9 +267,7 @@ impl McaFile {
             return Ok(());
         }
         for i in 0..1024 {
-            let o = i * 4;
-            self.offsets[i] =
-                ((data[o] as i32) << 16) | ((data[o + 1] as i32) << 8) | (data[o + 2] as i32);
+            self.offsets[i] = offset_at(&data, i);
         }
         Ok(())
     }
@@ -271,8 +275,7 @@ impl McaFile {
     fn parse_header(&mut self, hdr: &[u8]) {
         for i in 0..1024 {
             let o = i * 4;
-            self.offsets[i] =
-                ((hdr[o] as i32) << 16) | ((hdr[o + 1] as i32) << 8) | (hdr[o + 2] as i32);
+            self.offsets[i] = offset_at(hdr, i);
             self.sectors[i] = hdr[o + 3];
             self.timestamps[i] = i32::from_be_bytes([
                 hdr[4096 + o],
@@ -353,9 +356,8 @@ impl McaFile {
         }
         let rel = chunk.as_relative_chunk();
         let idx = rel.z as usize * 32 + rel.x as usize;
+        let offset = offset_at(&data, idx);
         let o = idx * 4;
-        let offset =
-            ((data[o] as i32) << 16) | ((data[o + 1] as i32) << 8) | (data[o + 2] as i32);
         let timestamp = i32::from_be_bytes(data[4096 + o..4096 + o + 4].try_into().unwrap());
         let abs = self.location.region_to_chunk().add_p(rel);
         if offset <= 0 {
