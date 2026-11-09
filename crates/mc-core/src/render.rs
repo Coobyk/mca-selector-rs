@@ -50,9 +50,9 @@ pub fn generate_image(
     mca: &McaFile,
     scale: i32,
     cfg: &RenderSettings,
-    _corrupted: &[u32; 256],
+    corrupted: &[u32; 256],
 ) -> Option<Vec<u32>> {
-    let _size = TILE_SIZE / scale as usize;
+    let size = TILE_SIZE / scale as usize;
     let chunk_size = CHUNK_SIZE / scale as usize;
     let pixels = TILE_SIZE * TILE_SIZE / (scale * scale) as usize;
 
@@ -72,20 +72,40 @@ pub fn generate_image(
             let cm = version::color_mapping(data_version);
             let x = cx * chunk_size;
             let z = cz * chunk_size;
-            let mut out = RenderOut {
-                pixel_buffer: &mut pixel_buffer,
-                water_pixels: if shade_water { Some(&mut water_pixels) } else { None },
-                terrain_heights: &mut terrain_heights,
-                water_heights: if shade_water { Some(&mut water_heights) } else { None },
-                water: cfg.shade && cfg.shade_water,
-                height: cfg.render_height,
-            };
-            if cfg.caves {
-                version::draw_caves(data, &cm, format, x, z, scale, out.pixel_buffer, out.terrain_heights, cfg.render_height);
-            } else if cfg.layer_only {
-                version::draw_layer(data, &cm, format, x, z, scale, out.pixel_buffer, cfg.render_height);
-            } else {
-                version::draw_chunk(data, &cm, format, x, z, scale, &mut out);
+            // upstream wraps each chunk's draw in try/catch and paints the
+            // corrupted overlay on failure — catch_unwind is the equivalent.
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut out = RenderOut {
+                    pixel_buffer: &mut pixel_buffer,
+                    water_pixels: if shade_water { Some(&mut water_pixels) } else { None },
+                    terrain_heights: &mut terrain_heights,
+                    water_heights: if shade_water { Some(&mut water_heights) } else { None },
+                    water: cfg.shade && cfg.shade_water,
+                    height: cfg.render_height,
+                };
+                if cfg.caves {
+                    version::draw_caves(data, &cm, format, x, z, scale, out.pixel_buffer, out.terrain_heights, cfg.render_height);
+                } else if cfg.layer_only {
+                    version::draw_layer(data, &cm, format, x, z, scale, out.pixel_buffer, cfg.render_height);
+                } else {
+                    version::draw_chunk(data, &cm, format, x, z, scale, &mut out);
+                }
+            }));
+            if res.is_err() {
+                // corruptedChunkOverlay + heights = 64 (upstream drawChunkImage)
+                for cy in 0..CHUNK_SIZE {
+                    for cxi in 0..CHUNK_SIZE {
+                        let src = cy * CHUNK_SIZE + cxi;
+                        let dst = (z + cy / scale as usize) * size + (x + cxi / scale as usize);
+                        if dst < pixels {
+                            pixel_buffer[dst] = corrupted[src];
+                            terrain_heights[dst] = 64;
+                            if !water_heights.is_empty() {
+                                water_heights[dst] = 64;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
