@@ -1080,13 +1080,15 @@ fn selection_overlay_image(tile: &Tile, sel: &mc_core::selection::Selection, ver
         return Some(i.clone());
     }
     let g = config::global();
-    let color = g.chunk_selection_color.to_argb();
     let mut px = [0u32; 32 * 32];
     if sel.is_region_selected(key) {
+        // upstream: whole-region selection fills with regionSelectionColor
+        let color = g.region_selection_color.to_argb();
         for p in px.iter_mut() {
             *p = color;
         }
     } else if let Some(Some(cs)) = sel.selected_chunks(tile.location) {
+        let color = g.chunk_selection_color.to_argb();
         for i in cs.iter() {
             px[i] = color;
         }
