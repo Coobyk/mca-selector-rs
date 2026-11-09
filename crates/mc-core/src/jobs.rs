@@ -84,8 +84,10 @@ pub fn pools() -> &'static Pools {
         let cpus = thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
-        let process_threads = (cpus.saturating_sub(2).max(1)).min(4);
-        let write_threads = cpus.min(4);
+        let process_threads = PROCESS_THREADS
+            .get()
+            .copied()
+            .unwrap_or((cpus.saturating_sub(2).max(1)).min(4));
         Pools {
             process: spawn_pool(process_threads, "processPool"),
         }

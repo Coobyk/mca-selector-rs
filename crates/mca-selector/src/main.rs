@@ -167,6 +167,7 @@ fn bindings() -> Vec<KeyBinding> {
 fn main() {
     env_logger::init();
     config::set_global(config::GlobalConfig::load());
+    mc_core::jobs::set_process_threads(config::global().process_threads as usize);
     Application::new().run(|cx: &mut App| {
         cx.set_menus(menus(cx));
         cx.bind_keys(bindings());

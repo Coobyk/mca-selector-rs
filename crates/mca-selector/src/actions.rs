@@ -17,7 +17,6 @@ actions!(
         CoordStyleEdgeAction,
         CoordStyleGridAction,
         StructureIconsAction,
-        SelectStructuresAction,
         GotoAction,
         ResetZoomAction,
         SaveScreenshotAction,
