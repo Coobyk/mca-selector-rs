@@ -34,6 +34,14 @@ impl Drag {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum NbtEdit {
+    None,
+    Value,
+    Add,
+    Rename,
+}
+
 pub enum Dialog {
     Goto { x: String, z: String, focus_x: bool },
     About,
@@ -54,7 +62,7 @@ pub enum Dialog {
         expanded: std::collections::HashSet<String>,
         sel: usize,
         /// 0 = none, 1 = value edit, 2 = add child, 3 = rename
-        editing: u8,
+        editing: NbtEdit,
         buf: String,
         status: String,
         dirty: bool,
@@ -543,7 +551,7 @@ impl MainView {
         else {
             return;
         };
-        if *editing != 0 {
+        if *editing != NbtEdit::None {
             match k {
                 "enter" => {
                     let mode = *editing;
@@ -552,8 +560,8 @@ impl MainView {
                         .map(|r| r.path.clone())
                         .unwrap_or_default();
                     let res = match mode {
-                        1 => nbt_editor::apply_value_edit(root, &path, buf),
-                        2 => {
+                        NbtEdit::Value => nbt_editor::apply_value_edit(root, &path, buf),
+                        NbtEdit::Add => {
                             let rows = nbt_editor::flatten(root, expanded);
                             let container_path: String = rows
                                 .get(*sel)
@@ -573,8 +581,8 @@ impl MainView {
                                 .unwrap_or_default();
                             nbt_editor::apply_add(root, &container_path, buf)
                         }
-                        3 => nbt_editor::apply_rename(root, &path, buf),
-                        _ => Ok(()),
+                        NbtEdit::Rename => nbt_editor::apply_rename(root, &path, buf),
+                        NbtEdit::None => Ok(()),
                     };
                     match res {
                         Ok(()) => {
@@ -583,11 +591,11 @@ impl MainView {
                         }
                         Err(e) => *status = format!("error: {e}"),
                     }
-                    *editing = 0;
+                    *editing = NbtEdit::None;
                     buf.clear();
                 }
                 "escape" => {
-                    *editing = 0;
+                    *editing = NbtEdit::None;
                     buf.clear();
                 }
                 "backspace" => {
@@ -639,7 +647,7 @@ impl MainView {
                             expanded.insert(r.path.clone());
                         }
                     } else {
-                        *editing = 1;
+                        *editing = NbtEdit::Value;
                         let cur = mc_core::nbt::path_get(root, &r.path)
                             .map(nbt_editor::tag_edit_text)
                             .unwrap_or_default();
@@ -648,14 +656,14 @@ impl MainView {
                 }
             }
             "a" => {
-                *editing = 2;
+                *editing = NbtEdit::Add;
                 buf.clear();
                 *status = "name = snbt_value".into();
             }
             "r" => {
                 if let Some(r) = rows.get(*sel) {
                     if !r.name.starts_with('[') {
-                        *editing = 3;
+                        *editing = NbtEdit::Rename;
                         *buf = r.name.clone();
                     }
                 }
@@ -2149,7 +2157,7 @@ impl MainView {
             root: data,
             expanded,
             sel: 0,
-            editing: 0,
+            editing: NbtEdit::None,
             buf: String::new(),
             status: "↑↓ navigate  ←→ collapse/expand  enter edit  a add  r rename  del delete  ctrl-s save  esc close".into(),
             dirty: false,
@@ -2169,7 +2177,7 @@ impl MainView {
             root: root.clone(),
             expanded,
             sel,
-            editing: 0,
+            editing: NbtEdit::None,
             buf: String::new(),
             status: if dirty { "saving...".into() } else { status },
             dirty: false,
@@ -2651,10 +2659,10 @@ impl MainView {
                     );
                     list = list.child(row);
                 }
-                let edit_line = if *editing != 0 {
+                let edit_line = if *editing != NbtEdit::None {
                     let hint = match editing {
-                        1 => "value (snbt)",
-                        2 => "new tag: name = value",
+                        NbtEdit::Value => "value (snbt)",
+                        NbtEdit::Add => "new tag: name = value",
                         _ => "new name",
                     };
                     v_flex().gap_1()
