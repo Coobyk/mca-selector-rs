@@ -449,16 +449,18 @@ fn biome_names(data: &Compound) -> Vec<String> {
     out
 }
 
+/// first matching list's length across root and Level (upstream VersionHandler
+/// picks exactly one source; summing would double-count).
 fn count_list(data: &Compound, keys: &[&str]) -> i64 {
-    let mut n = 0;
+    let level = nbt::level_from_root(data);
     for k in keys {
-        for c in [Some(data), nbt::level_from_root(data)] {
+        for c in [Some(data), level] {
             if let Some(Some((_, l))) = c.map(|cc| cc.get(*k).and_then(Tag::as_list)) {
-                n += l.len() as i64;
+                return l.len() as i64;
             }
         }
     }
-    n
+    0
 }
 
 fn structures(data: &Compound) -> Vec<String> {

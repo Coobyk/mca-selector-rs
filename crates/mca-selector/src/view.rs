@@ -2622,7 +2622,7 @@ impl MainView {
                         .flex()
                         .items_center()
                         .pl(px(4. + indent))
-                        .h(px(19.))
+                        .h(px(20.))
                         .text_size(px(12.))
                         .bg(if selected { rgb(0x3a5a8a) } else { rgba(0x00000000) })
                         .on_mouse_down(MouseButton::Left, cx.listener(move |v, _e: &MouseDownEvent, _w, cx| {
