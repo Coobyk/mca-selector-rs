@@ -109,6 +109,17 @@ impl MainView {
     }
 
     fn poll_tick(&mut self, cx: &mut Context<Self>) {
+        if let Some(sel) = self.map.take_filter_result() {
+            let n = sel.count();
+            self.map.selection = sel;
+            self.map.selected_chunks = n as i64;
+            self.map.unsaved_selection = true;
+            self.selection_version += 1;
+            for t in self.map.tiles.values_mut() {
+                t.marked_chunks_image = None;
+            }
+            self.dialog = Some(Dialog::Progress { msg: format!("filter matched {n} chunks") });
+        }
         let changed = self.map.poll_results();
         if self.update_needed || changed {
             self.map.update();
@@ -907,6 +918,7 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &ExportImageAction, w, cx| v.export_image(w, cx)))
             .on_action(cx.listener(|v, _: &SumSelectionAction, _w, cx| v.sum_selection(cx)))
             .on_action(cx.listener(|v, _: &SwapChunksAction, _w, cx| v.swap_chunks(cx)))
+            .on_action(cx.listener(|v, _: &FilterChunksAction, _w, cx| v.filter_chunks(cx)))
             .on_action(cx.listener(|v, _: &ChangeFieldsAction, _w, cx| v.change_fields(cx)))
             .on_action(cx.listener(|v, _: &ImportChunksAction, _w, cx| v.import_chunks(cx)))
             .on_action(cx.listener(|v, _: &AboutAction, _w, cx| {
@@ -1592,6 +1604,74 @@ impl MainView {
                         region, image: None, zoom: 0, structures: None, cache_write: false,
                     });
                 }
+            }));
+        cx.notify();
+    }
+
+
+    fn filter_chunks(&mut self, cx: &mut Context<Self>) {
+        self.dialog = Some(Dialog::TextInput {
+            title: "Filter chunks".into(),
+            hint: "query e.g.: xPos >= 0 AND Palette contains minecraft:stone".into(),
+            text: String::new(),
+            on_done: Box::new(|v, w, cx, text| {
+                v.apply_filter(text, w, cx);
+            }),
+        });
+        cx.notify();
+    }
+
+    fn apply_filter(&mut self, query: String, _w: &mut Window, cx: &mut Context<Self>) {
+        let expr = match mc_core::filter::parse(&query) {
+            Ok(e) => e,
+            Err(e) => {
+                self.dialog = Some(Dialog::Error { msg: e });
+                cx.notify();
+                return;
+            }
+        };
+        let tx = self.map.result_tx.clone();
+        let sel = self.map.selection.clone();
+        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+            mc_core::jobs::PRIORITY_LOW, None,
+            move || {
+                // evaluate over all regions of the current world (filtered to
+                // current selection if non-empty)
+                let mut result = mc_core::selection::Selection::new();
+                let regions: Vec<i64> = if sel.is_empty() {
+                    crate::config::world()
+                        .map(|w| files::scan_region_files(w.region_dir()).into_iter().collect())
+                        .unwrap_or_default()
+                } else {
+                    sel.selection.keys().copied().collect()
+                };
+                for rl in regions {
+                    let region = mc_core::point::Point2i::from_long(rl);
+                    let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
+                    let p = dir.join(mc_core::files::mca_file_name(region));
+                    if !p.exists() { continue; }
+                    let Ok(mut m) = mc_core::mca::McaFile::new(p) else { continue };
+                    if m.load(false).is_err() { continue; }
+                    for i in 0..1024 {
+                        let within = sel.selection.get(&rl).map(|c| c.as_ref().map(|s| s.get(i)).unwrap_or(true)).unwrap_or(sel.is_empty());
+                        if !within { continue; }
+                        let Some(c) = &m.chunks[i] else { continue };
+                        let Some(d) = &c.data else { continue };
+                        let dv = mc_core::nbt::data_version(Some(d));
+                        if expr.matches(c, dv) {
+                            let chunk = region.region_to_chunk().add_p(mc_core::point::Point2i::from_chunk_index(i as i32));
+                            result.add_chunk(chunk);
+                        }
+                    }
+                    let _ = tx.send(crate::tilemap::TileResult::Image {
+                        region, image: None, zoom: 0, structures: None, cache_write: false,
+                    });
+                }
+                // send the resulting selection back through a tile result? use a
+                // dedicated mechanism: store into a shared slot
+                crate::tilemap::FILTER_RESULT.with(|r| {
+                    *r.borrow_mut() = Some(result);
+                });
             }));
         cx.notify();
     }

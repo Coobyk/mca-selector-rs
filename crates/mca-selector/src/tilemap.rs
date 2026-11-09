@@ -869,6 +869,11 @@ impl TileMapState {
 
     /// Drain async tile results (call every UI tick).
     /// Returns true if anything changed.
+    /// take a completed filter result
+    pub fn take_filter_result(&mut self) -> Option<Selection> {
+        FILTER_RESULT.with(|r| r.borrow_mut().take())
+    }
+
     pub fn poll_results(&mut self) -> bool {
         let mut changed = false;
         let mut pending = Vec::new();
@@ -992,4 +997,9 @@ pub fn argb_to_render_image(argb: &[u32], size: usize) -> Option<std::sync::Arc<
     Some(std::sync::Arc::new(gpui::RenderImage::new(
         smallvec::SmallVec::from_elem(image::Frame::new(buf), 1),
     )))
+}
+
+thread_local! {
+    /// completed filter query result, consumed by the view
+    pub static FILTER_RESULT: std::cell::RefCell<Option<Selection>> = const { std::cell::RefCell::new(None) };
 }
