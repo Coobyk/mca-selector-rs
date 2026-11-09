@@ -27,7 +27,6 @@ pub struct Job {
 
 impl Job {
     pub fn new(base: i64, prio: Option<Box<dyn Fn() -> i64 + Send>>, work: impl FnOnce() + Send + 'static) -> Self {
-        ACTIVE.fetch_add(1, Ordering::Relaxed);
         Job {
             id: JOB_ID.fetch_add(1, Ordering::Relaxed),
             base,
@@ -126,17 +125,21 @@ fn spawn_pool(n: usize, name: &str) -> Arc<Queue> {
 
 impl Pools {
     pub fn add_job(&self, job: Job) {
+        ACTIVE.fetch_add(1, Ordering::Relaxed);
         self.process.heap.lock().push(HeapEntry { job });
         self.process.cv.notify_one();
     }
+    /// upstream ProcessDataWriterPool.
     pub fn add_process(&self, job: Job) {
         self.add_job(job);
     }
     pub fn save(&self, job: Job) {
+        ACTIVE.fetch_add(1, Ordering::Relaxed);
         self.save.heap.lock().push(HeapEntry { job });
         self.save.cv.notify_one();
     }
     pub fn parse(&self, job: Job) {
+        ACTIVE.fetch_add(1, Ordering::Relaxed);
         self.parse.heap.lock().push(HeapEntry { job });
         self.parse.cv.notify_one();
     }

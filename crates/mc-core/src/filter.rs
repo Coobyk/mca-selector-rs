@@ -1057,13 +1057,8 @@ fn make_filter(field: &str, cmp: Cmp, value: &str) -> Result<Filter, String> {
 /// CompressionFilter.setFilterValue: enum name (case-insensitive) or byte.
 fn compression_value(raw: &str) -> Result<i64, String> {
     let r = unquote(raw).trim().to_string();
-    const NAMES: &[(&str, i64)] = &[
-        ("none", 0), ("gzip", 1), ("zlib", 2), ("uncompressed", 3), ("lz4", 4),
-        ("none_ext", -128), ("gzip_ext", -127), ("zlib_ext", -126),
-        ("uncompressed_ext", -125), ("lz4_ext", -124),
-    ];
-    if let Some((_, b)) = NAMES.iter().find(|(n, _)| n.eq_ignore_ascii_case(&r)) {
-        return Ok(*b);
+    if let Some(c) = crate::mca::CompressionType::from_name(&r) {
+        return Ok(c.to_byte() as i8 as i64);
     }
     r.parse::<i64>()
         .map_err(|_| format!("invalid compression type \"{r}\""))

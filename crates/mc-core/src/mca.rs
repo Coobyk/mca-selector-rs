@@ -40,6 +40,22 @@ impl CompressionType {
             _ => bail!("invalid compression type {}", b as i8),
         })
     }
+    /// enum name (case-insensitive), e.g. "zlib" / "zlib_ext"
+    pub fn from_name(n: &str) -> Option<Self> {
+        Some(match n.to_ascii_lowercase().as_str() {
+            "none" => Self::None,
+            "gzip" => Self::Gzip,
+            "zlib" => Self::Zlib,
+            "uncompressed" => Self::Uncompressed,
+            "lz4" => Self::Lz4,
+            "none_ext" => Self::NoneExt,
+            "gzip_ext" => Self::GzipExt,
+            "zlib_ext" => Self::ZlibExt,
+            "uncompressed_ext" => Self::UncompressedExt,
+            "lz4_ext" => Self::Lz4Ext,
+            _ => return None,
+        })
+    }
     pub fn is_external(&self) -> bool {
         (self.to_byte() as i8) < -120
     }

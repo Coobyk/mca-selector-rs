@@ -1064,15 +1064,7 @@ static OVERLAY_CACHE: std::sync::LazyLock<std::sync::Mutex<(u64, std::collection
     std::sync::LazyLock::new(|| std::sync::Mutex::new((0, std::collections::HashMap::new())));
 
 fn paste_argb_image(px: &[u32; 1024]) -> Option<Arc<RenderImage>> {
-    let mut rgba = Vec::with_capacity(32 * 32 * 4);
-    for &p in px.iter() {
-        rgba.push((p >> 16) as u8);
-        rgba.push((p >> 8) as u8);
-        rgba.push(p as u8);
-        rgba.push((p >> 24) as u8);
-    }
-    let img = image::RgbaImage::from_raw(32, 32, rgba)?;
-    Some(Arc::new(RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(img), 1))))
+    crate::tilemap::argb_to_render_image(px, 32)
 }
 
 fn selection_overlay_image(tile: &Tile, sel: &mc_core::selection::Selection, version: u64) -> Option<Arc<RenderImage>> {
@@ -1100,15 +1092,7 @@ fn selection_overlay_image(tile: &Tile, sel: &mc_core::selection::Selection, ver
             px[i] = color;
         }
     }
-    let mut rgba = Vec::with_capacity(32 * 32 * 4);
-    for &p in px.iter() {
-        rgba.push((p >> 16) as u8);
-        rgba.push((p >> 8) as u8);
-        rgba.push(p as u8);
-        rgba.push((p >> 24) as u8);
-    }
-    let img = image::RgbaImage::from_raw(32, 32, rgba)?;
-    let r = Arc::new(RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(img), 1)));
+    let r = crate::tilemap::argb_to_render_image(&px, 32)?;
     cache.1.insert(key, r.clone());
     Some(r)
 }
