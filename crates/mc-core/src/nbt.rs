@@ -370,6 +370,9 @@ fn write_payload<W: Write>(w: &mut W, tag: &Tag) -> io::Result<()> {
         Tag::Float(v) => w.write_all(&v.to_be_bytes()),
         Tag::Double(v) => w.write_all(&v.to_be_bytes()),
         Tag::ByteArray(b) => {
+            // raw_arrays load turns int/long arrays into ByteArray too — those
+            // paths are read-only (rendering). writing them back would emit a
+            // byte[] tag with the wrong element width.
             w.write_all(&(b.len() as i32).to_be_bytes())?;
             w.write_all(b)
         }
