@@ -92,9 +92,7 @@ impl Point2i {
         Point2i::new(self.x - x, self.z - z)
     }
 
-    pub fn mul(&self, m: i32) -> Point2i {
-        Point2i::new(self.x * m, self.z * m)
-    }
+    
 
     pub fn div(&self, d: i32) -> Point2i {
         Point2i::new(self.x / d, self.z / d)

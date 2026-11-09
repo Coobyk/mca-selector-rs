@@ -198,9 +198,4 @@ pub fn scale_down(img: &[u32], from_size: usize, to_size: usize) -> Vec<u32> {
     out
 }
 
-/// The grey "empty tile" (EMPTY_COLOR = 0.2,0.2,0.2 alpha 1) — drawn when a
-/// region doesn't exist and showNonexistentRegions is on.
-pub fn empty_tile_argb() -> u32 {
-    let v = (0.2f32 * 255.0) as u32;
-    0xFF00_0000 | v << 16 | v << 8 | v
-}
+

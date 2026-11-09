@@ -126,15 +126,9 @@ impl Tag {
 // ---------------------------------------------------------------------------
 // Compound helpers mirroring net.querz.mcaselector.version.Helper
 
-pub fn compound_get<'a>(c: &'a Compound, key: &str) -> Option<&'a Tag> {
-    c.get(key)
-}
-pub fn compound_get_mut<'a>(c: &'a mut Compound, key: &str) -> Option<&'a mut Tag> {
-    c.get_mut(key)
-}
-pub fn tag_compound<'a>(t: Option<&'a Tag>, key: &str) -> Option<&'a Tag> {
-    t.and_then(Tag::as_compound)?.get(key)
-}
+
+
+
 pub fn int_from(c: Option<&Compound>, key: &str, def: i32) -> i32 {
     c.and_then(|c| c.get(key))
         .and_then(|t| t.as_i32())
@@ -146,21 +140,14 @@ pub fn int_from_opt(c: Option<&Compound>, key: &str) -> Option<i32> {
 pub fn long_from_opt(c: Option<&Compound>, key: &str) -> Option<i64> {
     c.and_then(|c| c.get(key)).and_then(|t| t.as_i64())
 }
-pub fn byte_from_opt(c: Option<&Compound>, key: &str) -> Option<i8> {
-    c.and_then(|c| c.get(key)).and_then(|t| match t {
-        Tag::Byte(b) => Some(*b),
-        _ => t.as_i64().map(|v| v as i8),
-    })
-}
+
 pub fn string_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<&'a str> {
     c.and_then(|c| c.get(key)).and_then(|t| t.as_string())
 }
 pub fn string_or<'a>(c: Option<&'a Compound>, key: &str, def: &'a str) -> &'a str {
     string_from(c, key).unwrap_or(def)
 }
-pub fn list_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<(u8, &'a Vec<Tag>)> {
-    c.and_then(|c| c.get(key)).and_then(Tag::as_list)
-}
+
 /// sections list: returns None when missing or when it is a LongArray
 /// (Helper.getSectionsFromCompound).
 pub fn sections_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<(u8, &'a Vec<Tag>)> {
@@ -169,24 +156,12 @@ pub fn sections_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<(u8, &'a 
         _ => None,
     }
 }
-pub fn compound_list<'a>(l: &'a (u8, Vec<Tag>)) -> impl Iterator<Item = &'a Compound> {
-    l.1.iter().filter_map(|t| t.as_compound())
-}
+
 pub fn byte_array_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<&'a [u8]> {
     c.and_then(|c| c.get(key)).and_then(|t| t.as_bytes())
 }
-pub fn long_array_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<&'a [i64]> {
-    match c.and_then(|c| c.get(key)) {
-        Some(Tag::LongArray(v)) => Some(v),
-        _ => None,
-    }
-}
-pub fn int_array_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<&'a [i32]> {
-    match c.and_then(|c| c.get(key)) {
-        Some(Tag::IntArray(v)) => Some(v),
-        _ => None,
-    }
-}
+
+
 
 /// Level wrapper for pre-1.18 chunks (Helper.levelFromRoot).
 pub fn level_from_root<'a>(root: &'a Compound) -> Option<&'a Compound> {
@@ -206,10 +181,7 @@ pub fn data_version(root: Option<&Compound>) -> i32 {
 
 /// Read a BE i64 out of a raw byte slice (raw long[] data).
 #[inline]
-pub fn raw_i64(data: &[u8], idx: usize) -> i64 {
-    let o = idx * 8;
-    i64::from_be_bytes(data[o..o + 8].try_into().unwrap())
-}
+
 #[inline]
 pub fn raw_i64_or(data: &[u8], idx: usize, def: i64) -> i64 {
     let o = idx * 8;
@@ -220,10 +192,7 @@ pub fn raw_i64_or(data: &[u8], idx: usize, def: i64) -> i64 {
     }
 }
 #[inline]
-pub fn raw_i32(data: &[u8], idx: usize) -> i32 {
-    let o = idx * 4;
-    i32::from_be_bytes(data[o..o + 4].try_into().unwrap())
-}
+
 #[inline]
 pub fn raw_i32_or(data: &[u8], idx: usize, def: i32) -> i32 {
     let o = idx * 4;
@@ -294,16 +263,7 @@ impl<R: Read> NbtReader<R> {
         Ok(String::from_utf8_lossy(&raw).into_owned())
     }
 
-    /// Reads a named root tag; returns (name, tag). Errors if root is not a compound.
-    pub fn read_named(&mut self) -> io::Result<(String, Tag)> {
-        let ty = self.u8()?;
-        if ty == TAG_END {
-            return Ok((String::new(), Tag::Compound(Compound::default())));
-        }
-        let name = self.string()?;
-        let tag = self.payload(ty)?;
-        Ok((name, tag))
-    }
+    
 
     /// Reads the root tag; upstream NBTReader.read returns the root tag itself.
     pub fn read(&mut self) -> io::Result<Tag> {
@@ -779,18 +739,6 @@ impl<'a> SnbtParser<'a> {
     }
 }
 
-fn utf8_len(b: u8) -> usize {
-    if b >= 0xF0 {
-        4
-    } else if b >= 0xE0 {
-        3
-    } else if b >= 0xC0 {
-        2
-    } else {
-        1
-    }
-}
-
 /// parse a scalar SNBT token: typed suffix (b/s/l/f/d) or inferred int/double/string.
 pub fn snbt_scalar(tok: &str) -> Result<Tag, String> {
     if tok.is_empty() {
@@ -835,6 +783,20 @@ pub fn snbt_scalar(tok: &str) -> Result<Tag, String> {
     }
     Ok(Tag::String(tok.to_string()))
 }
+
+fn utf8_len(b: u8) -> usize {
+    if b >= 0xF0 {
+        4
+    } else if b >= 0xE0 {
+        3
+    } else if b >= 0xC0 {
+        2
+    } else {
+        1
+    }
+}
+
+
 
 // ---------------------------------------------------------------------------
 // path mutation: "a.b[0].c" (names and [index] list access)

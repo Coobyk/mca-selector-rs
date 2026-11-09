@@ -101,14 +101,7 @@ impl Overlay {
         matches!((self.min, self.max), (Some(a), Some(b)) if a < b)
     }
 
-    /// cache id (upstream keys cache by name + multiValuesID)
-    pub fn cache_id(&self) -> String {
-        let mut s = self.typ.name().to_string();
-        for v in &self.multi_values {
-            s.push_str(v);
-        }
-        s
-    }
+    
 
     /// setMin/setMax: plain int, or duration ("1d2h") for InhabitedTime/LastUpdate
     /// (seconds*20), or timestamp ("yyyy-MM-dd HH:mm:ss") for Timestamp.
@@ -320,24 +313,7 @@ fn list_size(data: &Compound, keys: &[&str]) -> i32 {
     0
 }
 
-fn is_air_entry(entry: Option<&Tag>, format: version::ChunkFormat) -> bool {
-    // air/cave_air/barrier/structure_void with no Properties (size == 1)
-    match entry {
-        Some(Tag::Compound(c)) => {
-            let name = if format == version::ChunkFormat::P26_3s7 {
-                c.get("").or_else(|| c.get("id")).and_then(Tag::as_string).unwrap_or("")
-            } else {
-                c.get("Name").and_then(Tag::as_string).unwrap_or("")
-            };
-            matches!(name, "minecraft:air" | "minecraft:cave_air" | "minecraft:barrier" | "minecraft:structure_void")
-                && c.len() == 1
-        }
-        Some(Tag::String(s)) => {
-            matches!(s.as_str(), "minecraft:air" | "minecraft:cave_air" | "minecraft:barrier" | "minecraft:structure_void")
-        }
-        _ => false,
-    }
-}
+
 
 struct Sec {
     y: i32,

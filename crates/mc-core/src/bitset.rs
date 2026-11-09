@@ -48,9 +48,7 @@ impl BitSet {
         }
         s
     }
-    pub fn to_base64(&self) -> String {
-        base64::engine::general_purpose::STANDARD.encode(self.to_bytes())
-    }
+    
     pub fn from_base64(s: &str) -> Option<Self> {
         let b = base64::engine::general_purpose::STANDARD.decode(s).ok()?;
         Some(Self::from_bytes(&b))

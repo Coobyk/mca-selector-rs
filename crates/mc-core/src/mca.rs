@@ -236,15 +236,7 @@ impl McaFile {
         Ok(std::fs::read(&self.file)?)
     }
 
-    /// loadHeader: offsets + sectors + timestamps.
-    pub fn load_header(&mut self) -> Result<()> {
-        let data = self.read_file()?;
-        if data.len() < HEADER_SIZE {
-            return Ok(());
-        }
-        self.parse_header(&data[..HEADER_SIZE]);
-        Ok(())
-    }
+    
 
     /// loadOffsets: only the offset table.
     pub fn load_offsets(&mut self) -> Result<()> {
@@ -365,39 +357,9 @@ impl McaFile {
         }
     }
 
-    /// loadBorderChunks: top/bottom rows + left/right rows.
-    pub fn load_border_chunks(&mut self) -> Result<()> {
-        let data = self.read_file()?;
-        if data.len() <= HEADER_SIZE {
-            return Ok(());
-        }
-        self.parse_header(&data[..HEADER_SIZE]);
-        let origin = self.location.region_to_chunk();
-        let load = |i: usize, chunks: &mut Vec<Option<Chunk>>| {
-            if self.offsets[i] == 0 {
-                return;
-            }
-            let loc = origin.add_p(Point2i::from_chunk_index(i as i32));
-            let pos = self.offsets[i] as usize * 4096;
-            if let Ok(Some(mut c)) = Self::parse_chunk(&data, pos, loc, &self.file, false) {
-                c.timestamp = self.timestamps[i];
-                chunks[i] = Some(c);
-            }
-        };
-        for x in 0..32usize {
-            load(x, &mut self.chunks);
-            load(x + 992, &mut self.chunks);
-        }
-        for z in 1..31usize {
-            load(z * 32, &mut self.chunks);
-            load(31 + z * 32, &mut self.chunks);
-        }
-        Ok(())
-    }
+    
 
-    pub fn has_chunk_index(&self, i: usize) -> bool {
-        self.offsets[i] != 0
-    }
+    
 
     /// ChunkSet of present chunks (offsets > 0).
     pub fn offsets_chunk_set(&self) -> crate::selection::ChunkSet {
@@ -597,20 +559,7 @@ impl McaFile {
         map
     }
 
-    /// minimizeForRendering: drop everything except the fields the renderer
-    /// and structure extraction need.
-    pub fn minimize_for_rendering(&mut self) {
-        for c in self.chunks.iter_mut().flatten() {
-            let Some(data) = c.data.take() else { continue };
-            let mut m = Compound::default();
-            for k in ["DataVersion", "sections", "Status", "structures", "xPos", "zPos", "Level"] {
-                if let Some(v) = data.get(k) {
-                    m.insert(k.to_string(), v.clone());
-                }
-            }
-            c.data = Some(m);
-        }
-    }
+    
 }
 
 /// write a single chunk at the writer's current position (length + type + data).

@@ -127,11 +127,7 @@ impl Selection {
             None => self.inverted,
         }
     }
-    pub fn is_chunk_selected_xy(&self, x: i32, z: i32) -> bool {
-        let c = Point2i::new(x, z);
-        let r = c.chunk_to_region();
-        self.chunk_selected(r.as_long(), c.as_chunk_index())
-    }
+    
     pub fn is_chunk_selected(&self, chunk: Point2i) -> bool {
         self.chunk_selected(chunk.chunk_to_region().as_long(), chunk.as_chunk_index())
     }

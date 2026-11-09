@@ -141,22 +141,7 @@ impl Pools {
         self.parse.cv.notify_one();
     }
 
-    /// remove queued jobs matching predicate (process + parse pools).
-    /// Cancelled jobs are dropped without running (ACTIVE decremented).
-    pub fn validate_jobs(&self, p: impl Fn(&Job) -> bool) {
-        for q in [&self.process, &self.parse] {
-            let mut h = q.heap.lock();
-            let mut keep = BinaryHeap::new();
-            for e in h.drain() {
-                if p(&e.job) {
-                    ACTIVE.fetch_sub(1, Ordering::Relaxed);
-                } else {
-                    keep.push(e);
-                }
-            }
-            *h = keep;
-        }
-    }
+    
 
     pub fn clear_queues(&self) {
         for q in [&self.process, &self.save, &self.parse] {

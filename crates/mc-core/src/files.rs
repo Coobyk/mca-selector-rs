@@ -20,9 +20,7 @@ pub fn parse_mca_file_name(name: &str) -> Option<Point2i> {
 pub fn mca_file_name(r: Point2i) -> String {
     format!("r.{}.{}.mca", r.x, r.z)
 }
-pub fn mcc_file_name(c: Point2i) -> String {
-    format!("c.{}.{}.mcc", c.x, c.z)
-}
+
 pub fn png_file_name(r: Point2i) -> String {
     format!("r.{}.{}.png", r.x, r.z)
 }
@@ -70,14 +68,7 @@ pub fn base_config_dir() -> PathBuf {
     p
 }
 
-pub fn base_log_dir() -> PathBuf {
-    let dir = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| env_or("HOME", "~").join(".local/share"));
-    let p = dir.join("mcaselector/log");
-    let _ = std::fs::create_dir_all(&p);
-    p
-}
+
 
 /// world cache dir: base_cache_dir/<world-uuid>
 pub fn world_cache_dir(region_dir: &Path) -> PathBuf {
