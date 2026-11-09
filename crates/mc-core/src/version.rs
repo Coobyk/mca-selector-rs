@@ -107,7 +107,7 @@ impl ColorMap {
             ColorMap::Config(c) => {
                 let biome_name = match biome {
                     BiomeKey::Name(s) => s,
-                    BiomeKey::Idx(_) => "minecraft:plains",
+                    BiomeKey::Idx(id) => biome_id_to_name(id),
                 };
                 c.get_color(name, biome_name, props).color | 0xFF00_0000
             }
@@ -305,6 +305,22 @@ fn get_biome_packed<'a>(s: &'a IndexedSection<'a>, x: usize, y: usize, z: usize,
     let index = (y >> 2 & 0xF) * 16 + (z >> 2 & 0xF) * 4 + (x >> 2 & 0xF);
     let pal_idx = packed_get(s.biome_data, index, s.biome_bits, s.biome_indexes_per_long) as usize;
     palette_name(s.biome_palette.get(pal_idx).copied(), format)
+}
+
+fn biome_id_to_name(id: i32) -> &'static str {
+    static M: std::sync::OnceLock<std::collections::HashMap<i32, &'static str>> =
+        std::sync::OnceLock::new();
+    let m = M.get_or_init(|| {
+        crate::registry::biome_name_to_id()
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(k, v)| v.as_i64().map(|i| (i as i32, k.as_str())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    m.get(&id).copied().unwrap_or("minecraft:plains")
 }
 
 fn biome_int(biomes: Option<&[u8]>, x: usize, y: i32, z: usize, format: ChunkFormat, y_min: i32) -> i32 {
