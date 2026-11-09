@@ -47,6 +47,12 @@ pub enum Dialog {
     Settings { draft: config::GlobalConfig },
     RenderSettings { draft: config::WorldConfig },
     Progress { msg: String },
+    TextInput {
+        title: String,
+        hint: String,
+        text: String,
+        on_done: Box<dyn Fn(&mut MainView, &mut Window, &mut Context<MainView>, String) + 'static>,
+    },
 }
 
 pub struct MainView {
@@ -407,6 +413,25 @@ impl MainView {
             cx.notify();
             return;
         }
+        if let Some(Dialog::TextInput { text, .. }) = &mut self.dialog {
+            match k {
+                "backspace" => { text.pop(); }
+                "escape" => self.dialog = None,
+                "enter" => {}
+                _ => {
+                    let c = &event.keystroke.key_char;
+                    if let Some(c) = c {
+                        for ch in c.chars() { text.push(ch); }
+                    } else if k.len() == 1 {
+                        text.push_str(k);
+                    } else if k == "space" {
+                        text.push(' ');
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
         if k == "escape" {
             match self.dialog {
                 Some(Dialog::Progress { .. }) => {}
@@ -485,6 +510,9 @@ impl MainView {
                 continue;
             }
             let tile = self.map.tiles.get(&key).unwrap();
+            if b.size.width < px(0.5) || b.size.height < px(0.5) {
+                continue;
+            }
             if let Some(ri) = tile.render_image.clone() {
                 let _ = window.paint_image(b, px(0.).into(), ri, 0, false);
             }
@@ -501,6 +529,41 @@ impl MainView {
 
         let (vmin, vmax) = self.map.visible_region_bounds(Point2f::ZERO);
         self.paint_grids(bounds, vmin, vmax, window);
+
+        // coordinates: region coords at grid intersections (TileMap.drawCoordinates)
+        if self.map.show_coordinates && scale > 1.0 {
+            let ts = window.text_system().clone();
+            for rx in vmin.x..=vmax.x + 1 {
+                for rz in vmin.z..=vmax.z + 1 {
+                    let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
+                    let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
+                    if sx < 0.0 || sz < 0.0 || sx > self.map.width || sz > self.map.height {
+                        continue;
+                    }
+                    let label = SharedString::from(format!("{}, {}", rx, rz));
+                    let line = ts.shape_line(
+                        label,
+                        px(12.),
+                        &[TextRun {
+                            len: usize::MAX,
+                            font: Font {
+                                family: "Sans".into(),
+                                features: FontFeatures::default(),
+                                weight: FontWeight::NORMAL,
+                                style: FontStyle::Normal,
+                                fallbacks: None,
+                            },
+                            color: rgba(COORDINATES_COLOR).into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    );
+                    let _ = line.paint(point(px(sx), px(sz)), px(14.), window, _cx);
+                }
+            }
+        }
     }
 
     fn paint_grids(&mut self, bounds: Bounds<Pixels>, rmin: Point2i, rmax: Point2i, window: &mut Window) {
@@ -581,7 +644,9 @@ impl MainView {
                         ),
                         size: size(px(icon_size), px(icon_size)),
                     };
-                    let _ = window.paint_image(b, px(0.).into(), icon, 0, false);
+                    if b.size.width >= px(0.5) {
+                        let _ = window.paint_image(b, px(0.).into(), icon, 0, false);
+                    }
                 }
                 break;
             }
@@ -841,6 +906,8 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &PasteChunksAction, _w, cx| v.paste_chunks(cx)))
             .on_action(cx.listener(|v, _: &ExportImageAction, w, cx| v.export_image(w, cx)))
             .on_action(cx.listener(|v, _: &SumSelectionAction, _w, cx| v.sum_selection(cx)))
+            .on_action(cx.listener(|v, _: &SwapChunksAction, _w, cx| v.swap_chunks(cx)))
+            .on_action(cx.listener(|v, _: &ChangeFieldsAction, _w, cx| v.change_fields(cx)))
             .on_action(cx.listener(|v, _: &ImportChunksAction, _w, cx| v.import_chunks(cx)))
             .on_action(cx.listener(|v, _: &AboutAction, _w, cx| {
                 v.dialog = Some(Dialog::About);
@@ -1420,6 +1487,115 @@ impl MainView {
         }).detach();
     }
 
+
+    fn swap_chunks(&mut self, cx: &mut Context<Self>) {
+        // swap the two selected chunks (upstream dialog asks for the pair;
+        // we swap the first two chunks in selection order)
+        let sel = self.map.selection.clone();
+        let mut coords: Vec<(i64, usize)> = Vec::new();
+        for (&r, c) in &sel.selection {
+            match c {
+                None => {}
+                Some(cs) => { for i in cs.iter() { coords.push((r, i)); } }
+            }
+            if coords.len() >= 2 { break; }
+        }
+        if coords.len() < 2 {
+            self.dialog = Some(Dialog::Error { msg: "select exactly two chunks".into() });
+            cx.notify();
+            return;
+        }
+        let (r1, i1) = coords[0];
+        let (r2, i2) = coords[1];
+        self.dialog = Some(Dialog::Confirm {
+            msg: "Swap selected chunks?".into(),
+            action: Box::new(move |v, _w, cx| {
+                let tx = v.map.result_tx.clone();
+                mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+                    mc_core::jobs::PRIORITY_LOW, None,
+                    move || {
+                        let load = |rl: i64| -> Option<(mc_core::point::Point2i, std::path::PathBuf, mc_core::mca::McaFile)> {
+                            let r = mc_core::point::Point2i::from_long(rl);
+                            let dir = crate::config::world()?.dirs.region.clone()?;
+                            let p = dir.join(mc_core::files::mca_file_name(r));
+                            let mut m = mc_core::mca::McaFile::new(p.clone()).ok()?;
+                            m.load(false).ok()?;
+                            Some((r, p, m))
+                        };
+                        let (r1p, p1, mut m1) = match load(r1) { Some(v) => v, None => return };
+                        let (r2p, p2, mut m2) = match load(r2) { Some(v) => v, None => return };
+                        let _ = (r1p, r2p);
+                        let c1 = m1.chunks[i1].take();
+                        let c2 = m2.chunks[i2].take();
+                        m2.chunks[i2] = c1;
+                        m1.chunks[i1] = c2;
+                        let _ = m1.save_with_temp_file(&p1);
+                        let _ = m2.save_with_temp_file(&p2);
+                        let _ = tx.send(crate::tilemap::TileResult::Image {
+                            region: mc_core::point::Point2i::from_long(r1), image: None, zoom: 0, structures: None, cache_write: false,
+                        });
+                        let _ = tx.send(crate::tilemap::TileResult::Image {
+                            region: mc_core::point::Point2i::from_long(r2), image: None, zoom: 0, structures: None, cache_write: false,
+                        });
+                    }));
+                v.dialog = None;
+                cx.notify();
+            }),
+        });
+        cx.notify();
+    }
+
+    fn change_fields(&mut self, cx: &mut Context<Self>) {
+        // upstream dialog edits NBT fields on selected chunks (ChangeFieldsDialog);
+        // we accept "path = snbt_value" typed inline
+        self.dialog = Some(Dialog::TextInput {
+            title: "Change fields".into(),
+            hint: "path = value (e.g. Status = \"minecraft:full\")".into(),
+            text: String::new(),
+            on_done: Box::new(|v, w, cx, text| {
+                v.apply_change_fields(text, w, cx);
+            }),
+        });
+        cx.notify();
+    }
+
+    fn apply_change_fields(&mut self, text: String, _w: &mut Window, cx: &mut Context<Self>) {
+        // parse "path = value" where value is SNBT literal
+        let Some((path, raw)) = text.split_once('=') else {
+            self.dialog = Some(Dialog::Error { msg: "expected: path = value".into() });
+            cx.notify();
+            return;
+        };
+        let path = path.trim().to_string();
+        let raw = raw.trim().to_string();
+        let sel = self.map.selection.clone();
+        let tx = self.map.result_tx.clone();
+        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+            mc_core::jobs::PRIORITY_LOW, None,
+            move || {
+                let val = parse_snbt_value(&raw);
+                for (&region_l, chunks) in &sel.selection {
+                    let region = mc_core::point::Point2i::from_long(region_l);
+                    let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
+                    let p = dir.join(mc_core::files::mca_file_name(region));
+                    if !p.exists() { continue; }
+                    let Ok(mut m) = mc_core::mca::McaFile::new(p.clone()) else { continue };
+                    if m.load(false).is_err() { continue; }
+                    for i in 0..1024 {
+                        if !chunks.as_ref().map(|c| c.get(i)).unwrap_or(true) { continue; }
+                        let Some(c) = m.chunks[i].as_mut() else { continue };
+                        let Some(d) = c.data.as_mut() else { continue };
+                        set_nbt_path(d, &path, val.clone());
+                    }
+                    let _ = m.save_with_temp_file(&p);
+                    let _ = tx.send(crate::tilemap::TileResult::Image {
+                        region, image: None, zoom: 0, structures: None, cache_write: false,
+                    });
+                }
+            }));
+        cx.notify();
+    }
+
     fn render_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let d = self.dialog.as_ref()?;
         let overlay = div()
@@ -1638,6 +1814,25 @@ impl MainView {
             Dialog::Progress { msg } => panel(
                 v_flex().child(text_el(msg.clone(), 14.)),
             ),
+            Dialog::TextInput { title, hint, text, .. } => panel(
+                v_flex().gap_2()
+                    .child(text_el(title.clone(), 16.))
+                    .child(text_el(hint.clone(), 11.))
+                    .child(input_box("input", text, true))
+                    .child(
+                        h_flex().gap_2()
+                            .child(button("OK", cx, |v, w, cx| {
+                                if let Some(Dialog::TextInput { text, on_done, .. }) = v.dialog.take() {
+                                    (on_done)(v, w, cx, text);
+                                }
+                                cx.notify();
+                            }))
+                            .child(button("Cancel", cx, |v, _w, cx| {
+                                v.dialog = None;
+                                cx.notify();
+                            })),
+                    ),
+            ),
         };
         Some(
             overlay
@@ -1699,3 +1894,49 @@ fn button(
 
 fn v_flex() -> Div { div().flex().flex_col() }
 fn h_flex() -> Div { div().flex() }
+
+/// parse a SNBT-ish literal into a Tag
+pub fn parse_snbt_value(raw: &str) -> mc_core::nbt::Tag {
+    use mc_core::nbt::Tag;
+    let r = raw.trim();
+    if r.starts_with('"') && r.ends_with('"') && r.len() >= 2 {
+        return Tag::String(r[1..r.len()-1].to_string());
+    }
+    if let Some(v) = r.strip_suffix('b').and_then(|s| s.parse::<i8>().ok()) { return Tag::Byte(v); }
+    if let Some(v) = r.strip_suffix('s').and_then(|s| s.parse::<i16>().ok()) { return Tag::Short(v); }
+    if let Some(v) = r.strip_suffix('l').and_then(|s| s.parse::<i64>().ok()) { return Tag::Long(v); }
+    if let Some(v) = r.strip_suffix('f').and_then(|s| s.parse::<f32>().ok()) { return Tag::Float(v); }
+    if let Some(v) = r.strip_suffix('d').and_then(|s| s.parse::<f64>().ok()) { return Tag::Double(v); }
+    if let Ok(v) = r.parse::<i32>() { return Tag::Int(v); }
+    if let Ok(v) = r.parse::<f64>() { return Tag::Double(v); }
+    if r == "true" { return Tag::Byte(1); }
+    if r == "false" { return Tag::Byte(0); }
+    Tag::String(r.to_string())
+}
+
+/// set compound key at a dotted path (creates intermediates)
+pub fn set_nbt_path(c: &mut mc_core::nbt::Compound, path: &str, val: mc_core::nbt::Tag) {
+    let mut parts = path.split('.').peekable();
+    let mut cur: &mut mc_core::nbt::Compound = c;
+    while let Some(p) = parts.next() {
+        if parts.peek().is_none() {
+            if val.id() == mc_core::nbt::TAG_END {
+                cur.remove(p);
+            } else {
+                cur.insert(p.to_string(), val.clone());
+            }
+            return;
+        }
+        let entry = cur.entry(p.to_string()).or_insert_with(|| mc_core::nbt::Tag::Compound(Default::default()));
+        match entry {
+            mc_core::nbt::Tag::Compound(cc) => cur = cc,
+            _ => {
+                *entry = mc_core::nbt::Tag::Compound(Default::default());
+                match entry {
+                    mc_core::nbt::Tag::Compound(cc) => cur = cc,
+                    _ => return,
+                }
+            }
+        }
+    }
+}
