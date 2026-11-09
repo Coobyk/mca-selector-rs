@@ -430,7 +430,7 @@ impl MainView {
             "a" | "left" => self.pressed_keys |= 2,
             "s" | "down" => self.pressed_keys |= 4,
             "d" | "right" => self.pressed_keys |= 8,
-            "shift" => self.pressed_keys |= 16,
+
             "+" | "=" => self.zoom_key(2.0, cx),
             "-" => self.zoom_key(0.5, cx),
             "escape" => {}
@@ -445,7 +445,7 @@ impl MainView {
             "a" | "left" => self.pressed_keys &= !2,
             "s" | "down" => self.pressed_keys &= !4,
             "d" | "right" => self.pressed_keys &= !8,
-            "shift" => self.pressed_keys &= !16,
+
             _ => {}
         }
         cx.notify();
@@ -941,18 +941,17 @@ impl MainView {
             "taiga_village" => include_bytes!("../resources/img/structure/taiga_village.png").as_slice(),
             "trial_chambers" => include_bytes!("../resources/img/structure/trial_chambers.png").as_slice(),
             "woodland_mansion" => include_bytes!("../resources/img/structure/woodland_mansion.png").as_slice(),
-            "nbt_byte" => include_bytes!("../resources/img/nbt/byte.png").as_slice(),
-            "nbt_short" => include_bytes!("../resources/img/nbt/short.png").as_slice(),
-            "nbt_int" => include_bytes!("../resources/img/nbt/int.png").as_slice(),
-            "nbt_long" => include_bytes!("../resources/img/nbt/long.png").as_slice(),
-            "nbt_float" => include_bytes!("../resources/img/nbt/float.png").as_slice(),
-            "nbt_double" => include_bytes!("../resources/img/nbt/double.png").as_slice(),
-            "nbt_byte_array" => include_bytes!("../resources/img/nbt/byte_array.png").as_slice(),
-            "nbt_int_array" => include_bytes!("../resources/img/nbt/int_array.png").as_slice(),
-            "nbt_long_array" => include_bytes!("../resources/img/nbt/long_array.png").as_slice(),
-            "nbt_string" => include_bytes!("../resources/img/nbt/string.png").as_slice(),
-            "nbt_list" => include_bytes!("../resources/img/nbt/list.png").as_slice(),
-            "nbt_compound" => include_bytes!("../resources/img/nbt/compound.png").as_slice(),
+
+
+
+
+
+
+
+
+
+
+
             _ => return None,
         };
         let img = image::load_from_memory(bytes).ok()?.to_rgba8();
@@ -1853,7 +1852,10 @@ impl MainView {
                         let ed = em.as_ref().and_then(|m| m.chunks[i].as_ref()).and_then(|ch| ch.data.as_ref());
                         let dv = mc_core::nbt::data_version(Some(d));
                         sum += ov.parse_value(d, pd, ed, c.timestamp, dv) as i64;
-                        if sum < 0 { break 'regions; }
+                        if sum < 0 {
+                            *crate::tilemap::SUM_RESULT.lock().unwrap() = Some(-1);
+                            break 'regions;
+                        }
                     }
                 }
                 *crate::tilemap::SUM_RESULT.lock().unwrap() = Some(sum);

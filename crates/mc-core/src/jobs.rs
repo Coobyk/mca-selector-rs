@@ -75,8 +75,6 @@ impl Ord for HeapEntry {
 
 pub struct Pools {
     process: Arc<Queue>,
-    save: Arc<Queue>,
-    parse: Arc<Queue>,
 }
 
 static POOLS: std::sync::OnceLock<Pools> = std::sync::OnceLock::new();
@@ -90,8 +88,6 @@ pub fn pools() -> &'static Pools {
         let write_threads = cpus.min(4);
         Pools {
             process: spawn_pool(process_threads, "processPool"),
-            save: spawn_pool(write_threads, "savePool"),
-            parse: spawn_pool(1, "parsePool"),
         }
     })
 }
@@ -133,32 +129,11 @@ impl Pools {
     pub fn add_process(&self, job: Job) {
         self.add_job(job);
     }
-    pub fn save(&self, job: Job) {
-        ACTIVE.fetch_add(1, Ordering::Relaxed);
-        self.save.heap.lock().push(HeapEntry { job });
-        self.save.cv.notify_one();
-    }
-    pub fn parse(&self, job: Job) {
-        ACTIVE.fetch_add(1, Ordering::Relaxed);
-        self.parse.heap.lock().push(HeapEntry { job });
-        self.parse.cv.notify_one();
-    }
 
     
 
     pub fn clear_queues(&self) {
-        for q in [&self.process, &self.save, &self.parse] {
-            let mut h = q.heap.lock();
-            let n = h.len();
-            h.clear();
-            if n > 0 {
-                ACTIVE.fetch_sub(n, Ordering::Relaxed);
-            }
-        }
-    }
-
-    pub fn cancel_parser_queue(&self) {
-        let mut h = self.parse.heap.lock();
+        let mut h = self.process.heap.lock();
         let n = h.len();
         h.clear();
         if n > 0 {

@@ -679,7 +679,6 @@ impl TileMapState {
             v
         };
         self.set_overlay(None);
-        jobs::pools().cancel_parser_queue();
     }
 
     /// TileMap.setOverlay
@@ -715,7 +714,6 @@ impl TileMapState {
                 break; // wrapped past the None terminator without match
             }
         }
-        jobs::pools().cancel_parser_queue();
     }
 
     /// TileMap.nextOverlayType — cycle to next overlay of a different type
@@ -757,7 +755,6 @@ impl TileMapState {
                 break;
             }
         }
-        jobs::pools().cancel_parser_queue();
     }
 
     /// TileMap.clearOverlay
@@ -1233,7 +1230,7 @@ impl TileMapState {
         let Some(t) = self.tiles.get(&region.as_long()) else { return };
         let Some((img, _)) = &t.image else { return };
         if zoom >= 32 {
-            cache::set_lod_image(&ws.uuid, region, img, TILE_SIZE / zoom as usize);
+            cache::set_lod_image(&ws.uuid, region, img);
         } else {
             let size = TILE_SIZE / zoom as usize;
             let path = files::png_cache_path(&ws.cache_dir, zoom, region);

@@ -87,12 +87,15 @@ pub fn get_lod_image(world_uuid: &str, r: Point2i) -> Option<(Vec<u32>, usize)> 
         .chunks_exact(4)
         .map(|c| ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)
         .collect();
-    Some((px, 16))
+    Some((px, LOD_IMAGE_SIZE))
 }
 
-pub fn set_lod_image(world_uuid: &str, r: Point2i, argb: &[u32], _size: usize) {
-    let mut b = Vec::with_capacity(16 * 16 * 4);
-    for &p in argb.iter().take(256) {
+/// fixed-resolution LOD image: one pixel per 2x2 chunks (upstream lodLevel).
+pub const LOD_IMAGE_SIZE: usize = 16;
+
+pub fn set_lod_image(world_uuid: &str, r: Point2i, argb: &[u32]) {
+    let mut b = Vec::with_capacity(LOD_IMAGE_SIZE * LOD_IMAGE_SIZE * 4);
+    for &p in argb.iter().take(LOD_IMAGE_SIZE * LOD_IMAGE_SIZE) {
         b.push((p >> 16) as u8);
         b.push((p >> 8) as u8);
         b.push(p as u8);
