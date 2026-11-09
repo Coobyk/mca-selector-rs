@@ -152,7 +152,9 @@ impl Selection {
                 Some(v) => Some(Some(
                     v.clone().map(|c| c.flip()).unwrap_or_default(),
                 )),
-                None => None,
+                // inverted + unmarked region = all chunks selected (whole-region
+                // sentinel, matching is_chunk_selected)
+                None => Some(None),
             }
         } else {
             match self.selection.get(&region.as_long()) {
