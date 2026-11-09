@@ -164,6 +164,18 @@ pub fn byte_array_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<&'a [u8
 
 
 /// Level wrapper for pre-1.18 chunks (Helper.levelFromRoot).
+/// format-agnostic section-list locator: `Sections`/`sections` at root or
+/// under `Level`, in that priority order (all call sites need "any sections").
+pub fn section_tags<'a>(root: &'a Compound) -> Option<&'a Vec<Tag>> {
+    let level = level_from_root(root).unwrap_or(root);
+    for (c, k) in [(level, "Sections"), (root, "sections"), (level, "sections")] {
+        if let Some((_, l)) = c.get(k).and_then(Tag::as_list) {
+            return Some(l);
+        }
+    }
+    None
+}
+
 pub fn level_from_root<'a>(root: &'a Compound) -> Option<&'a Compound> {
     root.get("Level").and_then(Tag::as_compound)
 }

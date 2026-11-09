@@ -324,12 +324,7 @@ struct Sec {
 }
 
 fn sections_of(data: &Compound, format: version::ChunkFormat) -> Vec<Sec> {
-    let modern = matches!(
-        format,
-        version::ChunkFormat::P21w37a
-            | version::ChunkFormat::P21w43a
-            | version::ChunkFormat::P26_3s7
-    );
+    let modern = version::is_modern(format);
     let root = if modern {
         Some(data)
     } else {

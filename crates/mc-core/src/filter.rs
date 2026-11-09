@@ -377,15 +377,7 @@ fn level<'a>(root: &'a Compound) -> &'a Compound {
 }
 
 fn get_sections<'a>(data: &'a Compound) -> Option<&'a Vec<Tag>> {
-    // both Level.Sections and root.sections
-    let l = level(data);
-    if let Some(l) = l.get("Sections").and_then(Tag::as_list) {
-        return Some(l.1);
-    }
-    if let Some(l) = data.get("sections").and_then(Tag::as_list) {
-        return Some(l.1);
-    }
-    l.get("sections").and_then(Tag::as_list).map(|t| t.1)
+    nbt::section_tags(data)
 }
 
 fn palette_names(data: &Compound) -> Vec<String> {
@@ -637,7 +629,7 @@ fn border_missing_neighbors(c: &Chunk, ctx: &mut FilterCtx) -> i64 {
             .region_chunk_set(region)
             .map(|cs| {
                 let rel = n.as_relative_chunk();
-                cs.get(rel.z as usize * 32 + rel.x as usize)
+                cs.get(rel.as_chunk_index())
             })
             .unwrap_or(false);
         if !present {
@@ -652,7 +644,7 @@ fn entities_chunk<'m>(c: &Chunk, ctx: &'m mut FilterCtx) -> Option<(std::rc::Rc<
     let region = c.absolute_location.chunk_to_region().as_long();
     let m = ctx.entities_file(region)?;
     let rel = c.absolute_location.as_relative_chunk();
-    let i = rel.z as usize * 32 + rel.x as usize;
+    let i = rel.as_chunk_index();
     m.chunks.get(i)?.as_ref()?;
     Some((m, i))
 }

@@ -361,7 +361,8 @@ fn sections_and_level<'a>(
     }
 }
 
-fn is_modern(format: ChunkFormat) -> bool {
+/// modern chunk NBT layout (sections/biomes at root, not under Level).
+pub fn is_modern(format: ChunkFormat) -> bool {
     matches!(
         format,
         ChunkFormat::P21w37a | ChunkFormat::P21w43a | ChunkFormat::P26_3s7

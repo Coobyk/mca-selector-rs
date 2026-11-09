@@ -355,7 +355,7 @@ impl McaFile {
             return Ok(None);
         }
         let rel = chunk.as_relative_chunk();
-        let idx = rel.z as usize * 32 + rel.x as usize;
+        let idx = rel.as_chunk_index();
         let offset = offset_at(&data, idx);
         let o = idx * 4;
         let timestamp = i32::from_be_bytes(data[4096 + o..4096 + o + 4].try_into().unwrap());
