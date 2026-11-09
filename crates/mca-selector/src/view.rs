@@ -272,18 +272,22 @@ impl MainView {
         if self.map.disabled || self.dialog.is_some() {
             return;
         }
-        let delta = match event.delta {
-            ScrollDelta::Pixels(p) => -f32::from(p.y),
-            ScrollDelta::Lines(l) => -l.y * 20.0,
+        // upstream: dy>0 (up) -> scale /= 1.03+dy/1000; dy<0 -> scale /= 0.97+dy/1000
+        // (JavaFX deltaY ~40/notch; gpui lines are ~1/notch -> scale them up)
+        let dy = match event.delta {
+            ScrollDelta::Pixels(p) => f32::from(p.y),
+            ScrollDelta::Lines(l) => l.y * 40.0,
         };
-        let zoom = 1.03 + delta / 1000.0;
-        let old = self.map.scale;
-        self.map.scale = if delta > 0.0 { old * zoom } else { old / zoom };
-        let pos = Point2f::new(f32::from(event.position.x), f32::from(event.position.y));
-        if self.map.update_scale(old, pos) {
-            self.update_needed = true;
+        if dy != 0.0 {
+            let factor = if dy > 0.0 { 1.03 + dy / 1000.0 } else { 0.97 + dy / 1000.0 };
+            let old = self.map.scale;
+            self.map.scale /= factor;
+            let pos = Point2f::new(f32::from(event.position.x), f32::from(event.position.y));
+            if self.map.update_scale(old, pos) {
+                self.update_needed = true;
+            }
+            cx.notify();
         }
-        cx.notify();
     }
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {

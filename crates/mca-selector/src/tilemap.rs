@@ -299,7 +299,9 @@ impl TileMapState {
         self.offset = self.offset.add_p(diff);
         let changed = get_zoom_level(old_scale) != get_zoom_level(self.scale);
         if changed {
-            self.unload_tiles(true, true);
+            // keep the stale tile images: update() replaces them with an
+            // instant downscale or a fresh render — clearing them here makes
+            // the map flash black on every wheel tick.
             jobs::pools().clear_queues();
         }
         changed
@@ -486,11 +488,17 @@ impl TileMapState {
                     if zoom_level >= header_zoom && img_zoom < header_zoom {
                         self.request_image(region, zoom_level);
                     } else if img_zoom < zoom_level {
-                        // image larger than needed: scale down immediately
+                        // image larger than needed: scale down immediately.
+                        // use the actual pixel count as the source size — LOD
+                        // tiles don't follow the 512/zoom rule.
                         if let Some((img, iz)) = tile.image.take() {
-                            let from = TILE_SIZE / iz as usize;
+                            let from = (img.len() as f64).sqrt() as usize;
                             let to = TILE_SIZE / zoom_level as usize;
-                            let scaled = render::scale_down(&img, from, to);
+                            let scaled = if from > to && to > 0 {
+                                render::scale_down(&img, from, to)
+                            } else {
+                                img
+                            };
                             let mut rgba = Vec::with_capacity(to * to * 4);
                             for &p in scaled.iter() {
                                 rgba.push((p >> 16) as u8);
@@ -1044,6 +1052,11 @@ impl TileMapState {
                     cache_write,
                 } => {
                     self.loading.remove(&region.as_long());
+                    // drop renders at a stale zoom level (queue was cleared
+                    // mid-flight); update() will re-request at the new zoom.
+                    if image.is_some() && zoom != get_zoom_level(self.scale) {
+                        continue;
+                    }
                     if let Some(img) = &image {
                         self.push_pool(zoom, region, img.clone());
                     }
