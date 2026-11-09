@@ -188,6 +188,19 @@ impl MainView {
     }
 
     pub fn open_world_at(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        // upstream: confirm before discarding an unsaved selection
+        if self.map.unsaved_selection {
+            let d = dir.clone();
+            self.dialog = Some(Dialog::Confirm {
+                msg: "There is an unsaved selection. Open the world anyway?".into(),
+                action: Box::new(move |v, _w, cx| {
+                    v.map.unsaved_selection = false;
+                    v.open_world_at(d.clone(), cx);
+                }),
+            });
+            cx.notify();
+            return;
+        }
         // upstream showWorldDialog: if not a valid dimension itself, scan it;
         // if it contains multiple dims, open dimension dialog; else open.
         if files::is_valid_dimension(&dir) {
