@@ -61,7 +61,17 @@ fn menus(cx: &App) -> Vec<Menu> {
                     ],
                 }),
                 MenuItem::action("Structures", StructureIconsAction),
-                MenuItem::action("Select Structures", SelectStructuresAction),
+                MenuItem::submenu(Menu {
+                    name: "Select Structures".into(),
+                    items: mc_core::structures::structures()
+                        .display_names
+                        .iter()
+                        .map(|(display, id)| MenuItem::action(
+                            display.clone(),
+                            ToggleStructureIcon { id: id.clone() },
+                        ))
+                        .collect(),
+                }),
                 MenuItem::separator(),
                 MenuItem::action("Goto", GotoAction),
                 MenuItem::action("Reset zoom", ResetZoomAction),

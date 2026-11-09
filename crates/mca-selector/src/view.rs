@@ -785,37 +785,77 @@ impl MainView {
 
         self.paint_grids(bounds, vmin, vmax, window);
 
-        // coordinates: region coords at grid intersections (TileMap.drawCoordinates)
+        // coordinates (upstream TileMap.drawCoordinates): block coords,
+        // EDGE/DYNAMIC edge labels when zoomed, GRID/dynamic intersections otherwise.
         if self.map.show_coordinates && scale > 1.0 {
             let ts = window.text_system().clone();
-            for rx in vmin.x..=vmax.x + 1 {
-                for rz in vmin.z..=vmax.z + 1 {
-                    let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
-                    let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
-                    if sx < 0.0 || sz < 0.0 || sx > self.map.width || sz > self.map.height {
-                        continue;
+            let style = self.map.coordinate_style;
+            let zoom = get_zoom_level(scale);
+            let edge = style == crate::tilemap::CoordinateStyle::Edge
+                || (style == crate::tilemap::CoordinateStyle::Dynamic && scale > 30.0);
+            let mut paint = |text: String, sx: f32, sz: f32| {
+                let line = ts.shape_line(
+                    SharedString::from(text),
+                    px(12.),
+                    &[TextRun {
+                        len: usize::MAX,
+                        font: Font {
+                            family: "Sans".into(),
+                            features: FontFeatures::default(),
+                            weight: FontWeight::NORMAL,
+                            style: FontStyle::Normal,
+                            fallbacks: None,
+                        },
+                        color: rgba(COORDINATES_COLOR).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }],
+                    None,
+                );
+                let _ = line.paint(point(px(sx), px(sz)), px(14.), window, _cx);
+            };
+            if edge {
+                // edge labels: x along top, z along left (upstream rotates x;
+                // gpui can't rotate text - horizontal is close enough)
+                let mul = ((zoom / 4).max(1) * 512) as i64;
+                for rx in vmin.x..=vmax.x + 1 {
+                    let bx = rx as i64 * 512;
+                    if bx % mul == 0 {
+                        let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
+                        if sx >= 0.0 && sx <= self.map.width {
+                            paint(abbrev_coord(bx as i32), sx, 2.0);
+                        }
                     }
-                    let label = SharedString::from(format!("{}, {}", rx, rz));
-                    let line = ts.shape_line(
-                        label,
-                        px(12.),
-                        &[TextRun {
-                            len: usize::MAX,
-                            font: Font {
-                                family: "Sans".into(),
-                                features: FontFeatures::default(),
-                                weight: FontWeight::NORMAL,
-                                style: FontStyle::Normal,
-                                fallbacks: None,
-                            },
-                            color: rgba(COORDINATES_COLOR).into(),
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        }],
-                        None,
-                    );
-                    let _ = line.paint(point(px(sx), px(sz)), px(14.), window, _cx);
+                }
+                for rz in vmin.z..=vmax.z + 1 {
+                    let bz = rz as i64 * 512;
+                    if bz % mul == 0 {
+                        let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
+                        if sz >= 0.0 && sz <= self.map.height {
+                            paint(abbrev_coord(bz as i32), 2.0, sz);
+                        }
+                    }
+                }
+            } else {
+                let mul = if scale > 7.0 || style == crate::tilemap::CoordinateStyle::Grid {
+                    (zoom / 2).max(1) * 512
+                } else {
+                    512
+                } as i64;
+                for rx in vmin.x..=vmax.x + 1 {
+                    for rz in vmin.z..=vmax.z + 1 {
+                        let (bx, bz) = (rx as i64 * 512, rz as i64 * 512);
+                        if bx % mul != 0 || bz % mul != 0 {
+                            continue;
+                        }
+                        let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
+                        let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
+                        if sx < 0.0 || sz < 0.0 || sx > self.map.width || sz > self.map.height {
+                            continue;
+                        }
+                        paint(format!("{}, {}", abbrev_coord(bx as i32), abbrev_coord(bz as i32)), sx, sz);
+                    }
                 }
             }
         }
@@ -883,6 +923,10 @@ impl MainView {
                 .sub(self.map.offset)
                 .mul(1.0 / scale);
             for name in names {
+                // SelectStructures submenu persists per-type toggles
+                if g.structure_icons.get(name).copied().unwrap_or(true) == false {
+                    continue;
+                }
                 let Some(sd) = registry.icons.get(name) else { continue };
                 if sd.max_scale < scale {
                     continue;
@@ -1172,10 +1216,38 @@ impl Render for MainView {
                 config::set_global(g);
                 cx.notify();
             }))
+            .on_action(cx.listener(|v, _: &CoordStyleDynamicAction, _w, cx| {
+                v.map.coordinate_style = crate::tilemap::CoordinateStyle::Dynamic;
+                let mut g = config::global();
+                g.coordinate_style = "DYNAMIC".into();
+                config::set_global(g);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|v, _: &CoordStyleEdgeAction, _w, cx| {
+                v.map.coordinate_style = crate::tilemap::CoordinateStyle::Edge;
+                let mut g = config::global();
+                g.coordinate_style = "EDGE".into();
+                config::set_global(g);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|v, _: &CoordStyleGridAction, _w, cx| {
+                v.map.coordinate_style = crate::tilemap::CoordinateStyle::Grid;
+                let mut g = config::global();
+                g.coordinate_style = "GRID".into();
+                config::set_global(g);
+                cx.notify();
+            }))
             .on_action(cx.listener(|v, _: &CoordinatesAction, _w, cx| {
                 v.map.show_coordinates = !v.map.show_coordinates;
                 let mut g = config::global();
                 g.show_coordinates = v.map.show_coordinates;
+                config::set_global(g);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|v, a: &ToggleStructureIcon, _w, cx| {
+                let mut g = config::global();
+                let cur = g.structure_icons.get(&a.id).copied().unwrap_or(true);
+                g.structure_icons.insert(a.id.clone(), !cur);
                 config::set_global(g);
                 cx.notify();
             }))
@@ -2780,4 +2852,20 @@ pub fn set_nbt_path(c: &mut mc_core::nbt::Compound, path: &str, val: mc_core::nb
             }
         }
     }
+}
+
+/// upstream TextHelper.abbreviateCoordinate: K/M/B suffix over 100k.
+fn abbrev_coord(n: i32) -> String {
+    let abs = (n as i64).abs();
+    if abs < 100_000 {
+        return n.to_string();
+    }
+    let (value, suffix) = if abs >= 1_000_000_000 {
+        (n as f64 / 1_000_000_000.0, "B")
+    } else if abs >= 1_000_000 {
+        (n as f64 / 1_000_000.0, "M")
+    } else {
+        (n as f64 / 1_000.0, "K")
+    };
+    format!("{:.2}{}", value, suffix)
 }

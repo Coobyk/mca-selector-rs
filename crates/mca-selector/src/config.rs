@@ -55,6 +55,8 @@ pub struct GlobalConfig {
     pub show_chunk_grid: bool,
     pub show_region_grid: bool,
     pub show_coordinates: bool,
+    /// structure id -> draw icon (SelectStructures submenu toggles)
+
     pub coordinate_style: String,
     pub debug: bool,
     pub recent_worlds: BTreeMap<i64, RecentWorld>,
