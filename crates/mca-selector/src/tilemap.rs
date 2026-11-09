@@ -1180,7 +1180,11 @@ impl TileMapState {
     /// Returns true if anything changed.
     /// take a completed filter result
     pub fn take_filter_result(&mut self) -> Option<Selection> {
-        FILTER_RESULT.with(|r| r.borrow_mut().take())
+        FILTER_RESULT.lock().unwrap().take()
+    }
+
+    pub fn take_sum_result(&mut self) -> Option<i64> {
+        SUM_RESULT.lock().unwrap().take()
     }
 
     pub fn poll_results(&mut self) -> bool {
@@ -1330,7 +1334,9 @@ pub fn argb_to_render_image(argb: &[u32], size: usize) -> Option<std::sync::Arc<
     )))
 }
 
-thread_local! {
-    /// completed filter query result, consumed by the view
-    pub static FILTER_RESULT: std::cell::RefCell<Option<Selection>> = const { std::cell::RefCell::new(None) };
-}
+/// completed filter query result, consumed by the view on the UI thread —
+/// shared static, not thread-local (job workers write it).
+pub static FILTER_RESULT: std::sync::Mutex<Option<Selection>> =
+    std::sync::Mutex::new(None);
+/// completed sum-selection total, consumed by the view on the UI thread.
+pub static SUM_RESULT: std::sync::Mutex<Option<i64>> = std::sync::Mutex::new(None);

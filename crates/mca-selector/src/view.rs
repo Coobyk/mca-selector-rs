@@ -18,19 +18,14 @@ enum Drag {
     LeftSelect,
     RightSelect,
     MiddleMove,
-    CtrlLeft,
-    ShiftRight,
-    CtrlShiftLeft,
-    CtrlShiftRight,
 }
 
 impl Drag {
-    fn mark(&self, ctrl: bool, shift: bool) -> Option<bool> {
+    /// upstream: primary marks, secondary unmarks; ctrl is not a modifier.
+    fn mark(&self) -> Option<bool> {
         match self {
-            Drag::LeftSelect | Drag::CtrlShiftLeft => Some(!ctrl),
-            Drag::RightSelect | Drag::CtrlShiftRight => Some(ctrl),
-            Drag::CtrlLeft => Some(!ctrl),
-            Drag::ShiftRight => Some(false),
+            Drag::LeftSelect => Some(true),
+            Drag::RightSelect => Some(false),
             _ => None,
         }
     }
@@ -126,6 +121,9 @@ impl MainView {
     }
 
     fn poll_tick(&mut self, cx: &mut Context<Self>) {
+        if let Some(sum) = self.map.take_sum_result() {
+            self.dialog = Some(Dialog::Info { msg: format!("sum: {sum}") });
+        }
         if let Some(sel) = self.map.take_filter_result() {
             let n = sel.count();
             self.map.selection = sel;
@@ -299,10 +297,18 @@ impl MainView {
         self.focus.focus(window);
         let pos = Point2f::new(f32::from(event.position.x), f32::from(event.position.y));
         let shift = event.modifiers.shift;
-        let ctrl = event.modifiers.control || event.modifiers.platform;
+        let meta = event.modifiers.platform;
         match event.button {
             MouseButton::Left => {
-                if self.map.pasted.is_some() && !ctrl {
+                // upstream: PRIMARY+COMMAND pans; ctrl is not a modifier
+                if meta && self.map.pasted.is_none() {
+                    self.drag = Drag::MiddleMove;
+                    self.first = pos;
+                    self.previous = pos;
+                    cx.notify();
+                    return;
+                }
+                if self.map.pasted.is_some() {
                     self.drag = Drag::PasteMove;
                     if let Some(p) = &mut self.map.pasted {
                         p.first_mouse = Some(pos);
@@ -313,12 +319,8 @@ impl MainView {
                     cx.notify();
                     return;
                 }
-                self.drag = match (ctrl, shift) {
-                    (true, true) => Drag::CtrlShiftLeft,
-                    (true, false) => Drag::CtrlLeft,
-                    _ => Drag::LeftSelect,
-                };
-                if let Some(mark) = self.drag.mark(ctrl, shift) {
+                self.drag = Drag::LeftSelect;
+                if let Some(mark) = self.drag.mark() {
                     if self.map.scale <= CHUNK_GRID_SCALE {
                         let chunk = self.map.mouse_chunk(pos.x, pos.z);
                         if self.map.selection.is_chunk_selected(chunk) != mark {
@@ -360,11 +362,7 @@ impl MainView {
                     cx.notify();
                     return;
                 }
-                self.drag = match (ctrl, shift) {
-                    (true, true) => Drag::CtrlShiftRight,
-                    (false, true) => Drag::ShiftRight,
-                    _ => Drag::RightSelect,
-                };
+                self.drag = Drag::RightSelect;
             }
             MouseButton::Middle => self.drag = Drag::MiddleMove,
             _ => {}
@@ -394,10 +392,9 @@ impl MainView {
             let dz = (self.previous.z - pos.z) * self.map.scale;
             self.map.offset = self.map.offset.add(dx, dz);
         } else if pressed.is_some() && self.drag != Drag::None {
-            let ctrl = event.modifiers.control || event.modifiers.platform;
-            let shift = event.modifiers.shift;
-            if let Some(mark) = self.drag.mark(ctrl, shift) {
-                let paint_mode = shift && !ctrl;
+            if let Some(mark) = self.drag.mark() {
+                // upstream: paintMode = SHIFT held (other keys ignored)
+                let paint_mode = event.modifiers.shift;
                 self.map.mark(pos.x, pos.z, mark, self.first, paint_mode);
                 self.selection_version += 1;
             }
@@ -972,6 +969,27 @@ impl MainView {
             parts.push(format!("{} {}", h.x, h.z));
         }
         parts.push(format!("{} selected chunks", self.map.selected_chunks));
+        // upstream status bar: hovered structure names
+        if self.map.show_structure_icons {
+            let st = self.map.hovered_block.and_then(|h| {
+                let c = h.block_to_chunk();
+                let r = c.chunk_to_region();
+                self.map
+                    .tiles
+                    .get(&r.as_long())
+                    .and_then(|t| t.structures.as_ref())
+                    .and_then(|m| m.get(&c.as_long()))
+            });
+            if let Some(names) = st {
+                if !names.is_empty() {
+                    parts.push(format!(
+                        "structures: {}{}",
+                        names[0],
+                        if names.len() > 1 { ", ..." } else { "" }
+                    ));
+                }
+            }
+        }
         if self.map.unsaved_selection {
             parts.push("selection not saved".into());
         }
@@ -1818,39 +1836,52 @@ impl MainView {
     }
 
 
+    /// upstream SumSelectionJob: sums the ACTIVE OVERLAY's parseValue over all
+    /// selected chunks (that's why it's disabled without an overlay).
     fn sum_selection(&mut self, cx: &mut Context<Self>) {
         let sel = self.map.selection.clone();
+        let Some(ov) = self.map.overlay.clone() else { return };
         if sel.is_empty() { return; }
-        let tx = self.map.result_tx.clone();
-        let _ = tx;
-        // count chunks per region type (region/poi/entities) like upstream
+        let dirs = crate::config::world().map(|w| w.dirs.clone());
         mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
             mc_core::jobs::PRIORITY_LOW, None,
             move || {
-                let mut total = 0usize;
-                let mut inhabited = 0i64;
-                let mut total_ticks = 0f64;
-                for (&region_l, chunks) in &sel.selection {
+                let __p = mc_core::jobs::Progress::new("Summing selection", sel.selection.len() as i64);
+                let mut sum: i64 = 0;
+                'regions: for (&region_l, chunks) in &sel.selection {
+                    let __g = __p.inc_guard();
+                    if __p.is_cancelled() { break; }
                     let region = mc_core::point::Point2i::from_long(region_l);
-                    let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
-                    let p = dir.join(mc_core::files::mca_file_name(region));
-                    if !p.exists() { continue; }
-                    let Ok(mut m) = mc_core::mca::McaFile::new(p) else { continue; };
-                    if m.load(false).is_err() { continue; }
+                    let name = mc_core::files::mca_file_name(region);
+                    __p.set_current(format!("{} ({sum})", name));
+                    let Some(dirs) = &dirs else { break };
+                    let load = |d: Option<&std::path::PathBuf>| -> Option<mc_core::mca::McaFile> {
+                        let p = d?.join(&name);
+                        if !p.exists() { return None; }
+                        mc_core::mca::McaFile::new(p).ok().and_then(|mut m| m.load(false).ok().map(|_| m))
+                    };
+                    let rm = load(dirs.region.as_ref());
+                    let pm = load(dirs.poi.as_ref());
+                    let em = load(dirs.entities.as_ref());
                     for i in 0..1024 {
-                        let present = chunks.as_ref().map(|c| c.get(i)).unwrap_or(true);
-                        if !present { continue; }
-                        let Some(c) = &m.chunks[i] else { continue };
+                        let abs = region.region_to_chunk().add(i as i32 % 32, i as i32 / 32);
+                        // mask: sel.selection holds the chunk-set (None = all)
+                        let present = match chunks {
+                            Some(cs) => cs.get(i),
+                            None => true,
+                        };
+                        if sel.inverted == present { continue; }
+                        let _ = abs;
+                        let Some(c) = rm.as_ref().and_then(|m| m.chunks[i].as_ref()) else { continue };
                         let Some(d) = &c.data else { continue };
-                        total += 1;
-                        if let Some(t) = mc_core::nbt::long_from_opt(Some(d), "InhabitedTime") {
-                            inhabited += t;
-                            total_ticks += t as f64;
-                        }
+                        let pd = pm.as_ref().and_then(|m| m.chunks[i].as_ref()).and_then(|ch| ch.data.as_ref());
+                        let ed = em.as_ref().and_then(|m| m.chunks[i].as_ref()).and_then(|ch| ch.data.as_ref());
+                        let dv = mc_core::nbt::data_version(Some(d));
+                        sum += ov.parse_value(d, pd, ed, c.timestamp, dv) as i64;
+                        if sum < 0 { break 'regions; }
                     }
                 }
-                let _ = (inhabited, total_ticks);
-                eprintln!("sum: {total} chunks selected");
+                *crate::tilemap::SUM_RESULT.lock().unwrap() = Some(sum);
             }));
         cx.notify();
     }
@@ -2287,9 +2318,7 @@ impl MainView {
                 }
                 // send the resulting selection back through a tile result? use a
                 // dedicated mechanism: store into a shared slot
-                crate::tilemap::FILTER_RESULT.with(|r| {
-                    *r.borrow_mut() = Some(result);
-                });
+                *crate::tilemap::FILTER_RESULT.lock().unwrap() = Some(result);
             }));
         cx.notify();
     }
