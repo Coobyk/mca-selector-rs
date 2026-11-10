@@ -1320,36 +1320,55 @@ fn worker_probe_and_render(a: ProbeArgs) {
         } else {
             let png = files::png_cache_path(&a.cache_dir, a.zoom_level, region);
             if png.exists() {
-                let img = decode_png_scaled(&png, a.zoom_level, a.zoom_level);
-                let _ = a.tx.send(TileResult::Image {
-                    region,
-                    image: img,
-                    zoom: a.zoom_level,
-                    structures: cache::get_structures(&a.uuid, region),
-                    cache_write: false,
-                });
-                return;
-            }
-            for zl in [1, 2, 4, 8, 16, 32] {
-                if zl == a.zoom_level {
-                    continue;
-                }
-                let png = files::png_cache_path(&a.cache_dir, zl, region);
-                if png.exists() {
-                    let (load_zl, target) = if zl < a.zoom_level {
-                        (zl, a.zoom_level)
-                    } else {
-                        (zl, zl)
-                    };
-                    let img = decode_png_scaled(&png, load_zl, target);
+                if let Some(img) = decode_png_scaled(&png, a.zoom_level, a.zoom_level) {
                     let _ = a.tx.send(TileResult::Image {
                         region,
-                        image: img,
-                        zoom: target,
+                        image: Some(img),
+                        zoom: a.zoom_level,
                         structures: cache::get_structures(&a.uuid, region),
                         cache_write: false,
                     });
                     return;
+                }
+            }
+            // finer cached images downscale exactly to the target zoom — done.
+            for zl in [1, 2, 4, 8, 16, 32] {
+                if zl >= a.zoom_level {
+                    continue;
+                }
+                let png = files::png_cache_path(&a.cache_dir, zl, region);
+                if png.exists() {
+                    if let Some(img) = decode_png_scaled(&png, zl, a.zoom_level) {
+                        let _ = a.tx.send(TileResult::Image {
+                            region,
+                            image: Some(img),
+                            zoom: a.zoom_level,
+                            structures: cache::get_structures(&a.uuid, region),
+                            cache_write: false,
+                        });
+                        return;
+                    }
+                }
+            }
+            // coarser cached images are only placeholders: send one for
+            // instant paint, then keep going and render the real zoom —
+            // returning here left the tile tagged at the coarse zoom and
+            // update() re-requested it forever (queue never drained).
+            for zl in [1, 2, 4, 8, 16, 32] {
+                if zl <= a.zoom_level {
+                    continue;
+                }
+                let png = files::png_cache_path(&a.cache_dir, zl, region);
+                if png.exists() {
+                    let img = decode_png_scaled(&png, zl, zl);
+                    let _ = a.tx.send(TileResult::Image {
+                        region,
+                        image: img,
+                        zoom: zl,
+                        structures: cache::get_structures(&a.uuid, region),
+                        cache_write: false,
+                    });
+                    break;
                 }
             }
         }
