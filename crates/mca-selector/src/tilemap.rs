@@ -22,10 +22,10 @@ pub const MAX_TILE_REQUESTS: usize = 8192;
 /// max concurrent tile/structure jobs in flight
 pub const MAX_IN_FLIGHT_LOADS: usize = 2048;
 
-pub const REGION_GRID_COLOR: u32 = 0x8000_0000; // (0,0,0,0.5)
-pub const CHUNK_GRID_COLOR: u32 = 0x80A9_A9A9; // (.6627,.6627,.6627,.5)
+pub const REGION_GRID_COLOR: u32 = 0x99FF_FFFF; // white 60%
+pub const CHUNK_GRID_COLOR: u32 = 0x66FF_FFFF; // white 40%
 pub const COORDINATES_COLOR: u32 = 0xFFFF_FFFF;
-pub const EMPTY_COLOR: u32 = 0xFF33_3333; // (0.2,0.2,0.2,1)
+pub const EMPTY_COLOR: u32 = 0xFF0A_0A0A; // near-black
 pub const GRID_LINE_WIDTH: f32 = 1.0;
 
 pub fn get_zoom_level(scale: f32) -> i32 {

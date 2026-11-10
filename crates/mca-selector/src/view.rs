@@ -1371,7 +1371,7 @@ impl Render for MainView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x333333))
+            .bg(rgb(0x0a0a0a))
             .on_action(cx.listener(|v, _: &QuitAction, _w, cx| {
                 if v.map.unsaved_selection {
                     v.dialog = Some(Dialog::Confirm {
@@ -1716,16 +1716,16 @@ impl MainView {
         let frac = (((h + 64) as f32) / 383.).clamp(0., 1.);
         let slot = self.height_slider_bounds.clone();
         div()
-            .h(px(22.))
+            .h(px(32.))
             .w_full()
             .bg(rgb(0x242424))
             .flex()
             .items_center()
             .px_2()
             .gap_2()
-            .text_size(px(11.))
+            .text_size(px(12.))
             .text_color(rgb(0xbbbbbb))
-            .child(div().w(px(70.)).flex_none().child(format!("height {}", h)))
+            .child(div().w(px(76.)).flex_none().child(format!("height {}", h)))
             .child(
                 div()
                     .id("height-slider")
@@ -1746,15 +1746,15 @@ impl MainView {
                             let tx = b.origin.x + b.size.width * frac;
                             window.paint_quad(fill(
                                 Bounds {
-                                    origin: point(b.origin.x, cy - px(2.)),
-                                    size: gpui::size(b.size.width, px(4.)),
+                                    origin: point(b.origin.x, cy - px(3.)),
+                                    size: gpui::size(b.size.width, px(6.)),
                                 },
                                 rgb(0x181818),
                             ));
                             window.paint_quad(quad(
                                 Bounds {
-                                    origin: point(tx - px(5.), cy - px(8.)),
-                                    size: gpui::size(px(10.), px(16.)),
+                                    origin: point(tx - px(7.), cy - px(13.)),
+                                    size: gpui::size(px(14.), px(26.)),
                                 },
                                 px(3.),
                                 rgb(0xcccccc),
