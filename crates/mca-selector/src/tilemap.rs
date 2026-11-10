@@ -580,10 +580,24 @@ impl TileMapState {
             let tile = self.tiles.get_mut(&region.as_long()).unwrap();
             if tile.image.is_some() && tile.loaded {
                 let img_zoom = tile.image_zoom_level();
-                if img_zoom != zoom_level {
-                    // zoomed-out stale image: keep it painted stretched (same as
-                    // upstream's smoothed draw) and just re-render at the new
-                    // zoom — the higher-res interim is better than a rescale.
+                if img_zoom < zoom_level {
+                    // image has more detail than needed — downscale instantly
+                    // (upstream's pyramid does the same) instead of paying a
+                    // full NBT re-render on zoom-out.
+                    if let Some((img, _)) = tile.image.take() {
+                        let from = (img.len() as f64).sqrt() as usize;
+                        let to = (TILE_SIZE / zoom_level as usize).max(1);
+                        let scaled = if from > to {
+                            render::scale_down(&img, from, to)
+                        } else {
+                            img
+                        };
+                        tile.render_image = argb_to_render_image(&scaled, to);
+                        tile.image = Some((scaled.clone(), zoom_level));
+                        self.push_pool(zoom_level, region, scaled);
+                    }
+                } else {
+                    // zoomed in past the image's resolution — need a render
                     self.request_image(region, zoom_level);
                 }
             } else if !tile.loaded {

@@ -94,7 +94,7 @@ pub fn pools() -> &'static Pools {
         let process_threads = PROCESS_THREADS
             .get()
             .copied()
-            .unwrap_or((cpus.saturating_sub(2).max(1)).min(4));
+            .unwrap_or((cpus.saturating_sub(2).max(1)).min(8));
         Pools {
             process: spawn_pool(process_threads, "processPool"),
         }
