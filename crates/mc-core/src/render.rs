@@ -141,35 +141,53 @@ fn shade(
     let size = TILE_SIZE / scale as usize;
     let altitude_multiplier = if cfg.shade_altitude { 12.0 / 256.0 } else { 0.0 };
     for z in 0..size {
+        // row slices: bounds checks hoisted out of the per-pixel loop.
+        let hrow = &water_heights[z * size..(z + 1) * size];
+        let hup = if z == 0 {
+            hrow
+        } else {
+            &water_heights[(z - 1) * size..z * size]
+        };
+        let hdn = if z == size - 1 && size > 1 {
+            hrow
+        } else {
+            &water_heights[(z + 1) * size..(z + 2) * size]
+        };
+        let trow = &terrain[z * size..(z + 1) * size];
+        let wrow: &[u32] = if water_px.is_empty() {
+            &[]
+        } else {
+            &water_px[z * size..(z + 1) * size]
+        };
+        let prow = &mut px[z * size..(z + 1) * size];
         for x in 0..size {
-            let index = z * size + x;
-            if px[index] == 0 {
+            if prow[x] == 0 {
                 continue;
             }
-            if terrain[index] != water_heights[index] {
-                let ratio = 0.5 - 0.5 / 40.0 * (water_heights[index] - terrain[index]) as f32;
-                px[index] = blend(px[index], water_px[index], ratio);
+            if trow[x] != hrow[x] {
+                let ratio = 0.5 - 0.5 / 40.0 * (hrow[x] - trow[x]) as f32;
+                prow[x] = blend(prow[x], wrow[x], ratio);
             } else {
                 let z_shade = if z == 0 {
-                    water_heights[index + size] - water_heights[index]
+                    hdn[x] - hrow[x]
                 } else if z == size - 1 {
-                    water_heights[index] - water_heights[index - size]
+                    hrow[x] - hup[x]
                 } else {
-                    (water_heights[index + size] - water_heights[index - size]) * 2
+                    (hdn[x] - hup[x]) * 2
                 };
                 let x_shade = if x == 0 {
-                    water_heights[index + 1] - water_heights[index]
+                    hrow[1] - hrow[0]
                 } else if x == size - 1 {
-                    water_heights[index] - water_heights[index - 1]
+                    hrow[x] - hrow[x - 1]
                 } else {
-                    (water_heights[index + 1] - water_heights[index - 1]) * 2
+                    (hrow[x + 1] - hrow[x - 1]) * 2
                 };
                 let mut shade = (x_shade + z_shade) as f32;
                 shade = shade.clamp(-8.0, 8.0);
-                let mut alt = (water_heights[index] - 64) as f32 * altitude_multiplier;
+                let mut alt = (hrow[x] - 64) as f32 * altitude_multiplier;
                 alt = alt.clamp(-4.0, 12.0);
                 shade += alt;
-                px[index] = shade_color(px[index], (shade * 8.0) as i32);
+                prow[x] = shade_color(prow[x], (shade * 8.0) as i32);
             }
         }
     }
@@ -178,10 +196,8 @@ fn shade(
 /// generateImageFromChunkSet — the green LOD tile used at high zoom levels.
 pub fn lod_image(chunk_set: &crate::selection::ChunkSet, color: u32) -> Vec<u32> {
     let mut pixels = vec![0u32; 1024];
-    for i in 0..1024 {
-        if chunk_set.get(i) {
-            pixels[i] = color;
-        }
+    for i in chunk_set.iter() {
+        pixels[i] = color;
     }
     pixels
 }
@@ -190,12 +206,60 @@ pub fn lod_image(chunk_set: &crate::selection::ChunkSet, color: u32) -> Vec<u32>
 pub fn scale_down(img: &[u32], from_size: usize, to_size: usize) -> Vec<u32> {
     let factor = from_size / to_size;
     let mut out = vec![0u32; to_size * to_size];
-    for y in 0..to_size {
-        for x in 0..to_size {
-            out[y * to_size + x] = img[(y * factor) * from_size + x * factor];
+    if factor == 0 {
+        // upscale: every pixel samples img[0] (same as the old x*0 indexing)
+        out.fill(img[0]);
+        return out;
+    }
+    for (y, row) in out.chunks_exact_mut(to_size).enumerate() {
+        let base = y * factor * from_size;
+        let src = &img[base..base + (to_size - 1) * factor + 1];
+        for (p, v) in row.iter_mut().zip(src.iter().step_by(factor)) {
+            *p = *v;
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mca::McaFile;
+
+    /// Timing harness for renderer changes. Needs a real region dir:
+    ///   cargo test -p mc-core --release render_timing -- --ignored --nocapture
+    /// MCA_WORLD_DIR overrides the default world path; MCA_REGION_PATH picks
+    /// a single file.
+    #[test]
+    #[ignore]
+    fn render_timing() {
+        let dir = std::env::var("MCA_WORLD_DIR").unwrap_or_else(|_| {
+            "/home/coobyk/Documents/Chunkyied/dimensions/minecraft/overworld".into()
+        });
+        let path = if let Ok(p) = std::env::var("MCA_REGION_PATH") {
+            std::path::PathBuf::from(p)
+        } else {
+            std::fs::read_dir(&dir)
+                .expect("world dir")
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| p.extension().map(|e| e == "mca").unwrap_or(false))
+                .expect("a .mca region file")
+        };
+        eprintln!("rendering {}", path.display());
+        let mut m = McaFile::new(path).expect("region file");
+        m.load(true).expect("load");
+        let corrupted = [0u32; 256];
+        let mut checksum = 0u64;
+        for i in 0..5 {
+            let t = std::time::Instant::now();
+            let img = generate_image(&m, 1, &RenderSettings::default(), &corrupted).expect("image");
+            let el = t.elapsed();
+            checksum = img
+                .iter()
+                .fold(0u64, |a, &p| a.wrapping_mul(31).wrapping_add(p as u64));
+            eprintln!("iter {i}: {el:?} ({} px, checksum {checksum:016x})", img.len());
+        }
+    }
 }
 
 

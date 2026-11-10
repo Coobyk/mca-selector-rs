@@ -49,23 +49,33 @@ fn env_or(env: &str, def: &str) -> PathBuf {
 }
 
 /// BASE_CACHE_DIR (linux branch: XDG_CACHE_HOME/mcaselector or ~/.cache/mcaselector)
+/// Memoized: cache helpers call this once per file op; avoids a create_dir_all
+/// syscall each time. Env vars are process-stable, so caching is safe.
 pub fn base_cache_dir() -> PathBuf {
-    let dir = std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| env_or("HOME", "~").join(".cache"));
-    let p = dir.join("mcaselector");
-    let _ = std::fs::create_dir_all(&p);
-    p
+    static P: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let dir = std::env::var("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| env_or("HOME", "~").join(".cache"));
+        let p = dir.join("mcaselector");
+        let _ = std::fs::create_dir_all(&p);
+        p
+    })
+    .clone()
 }
 
 /// BASE_CONFIG_FILE dir (XDG_CONFIG_HOME/mcaselector or ~/.mcaselector/mcaselector)
 pub fn base_config_dir() -> PathBuf {
-    let dir = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| env_or("HOME", "~").join(".mcaselector"));
-    let p = dir.join("mcaselector");
-    let _ = std::fs::create_dir_all(&p);
-    p
+    static P: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let dir = std::env::var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| env_or("HOME", "~").join(".mcaselector"));
+        let p = dir.join("mcaselector");
+        let _ = std::fs::create_dir_all(&p);
+        p
+    })
+    .clone()
 }
 
 
@@ -189,14 +199,15 @@ pub fn scan_region_files(region_dir: &Path) -> std::collections::HashSet<i64> {
     let mut set = std::collections::HashSet::new();
     if let Ok(rd) = std::fs::read_dir(region_dir) {
         for e in rd.flatten() {
+            // cheap filename check first — avoids a stat on non-mca entries
+            let Some(p) = parse_mca_file_name(e.file_name().to_str().unwrap_or("")) else {
+                continue;
+            };
             let ok = e
                 .metadata()
                 .map(|m| m.len() > crate::mca::HEADER_SIZE as u64)
                 .unwrap_or(false);
-            if !ok {
-                continue;
-            }
-            if let Some(p) = parse_mca_file_name(e.file_name().to_str().unwrap_or("")) {
+            if ok {
                 set.insert(p.as_long());
             }
         }

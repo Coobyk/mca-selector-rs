@@ -3,7 +3,9 @@
 use crate::nbt::{self, Compound, NbtReader, Tag};
 use crate::point::Point2i;
 use anyhow::{bail, Context as _, Result};
-use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::bufread::{GzDecoder, ZlibDecoder};
+use rayon::prelude::*;
+use std::borrow::Cow;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
@@ -102,7 +104,7 @@ fn mcc_path(mca: &Path, chunk: Point2i) -> PathBuf {
 /// repeated blocks of: compressed_len i32 BE, original_len i32 BE, data.
 /// compressed_len high bit (0x80000000) => raw stored block.
 fn lz4_decompress_blocks(data: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(data.len().saturating_mul(3).max(4096));
     let mut c = Cursor::new(data);
     let mut hdr = [0u8; 4];
     loop {
@@ -154,21 +156,29 @@ pub fn lz4_compress_blocks(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-pub(crate) fn decompress(compression: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
+/// Borrowing variant of [`decompress`]: uncompressed payloads are returned as
+/// a view into `data` (zero-copy), compressed ones come back owned.
+/// `bufread` decoders inflate straight from the source slice with no
+/// intermediate buffer copy.
+fn decompress_cow(compression: CompressionType, data: &[u8]) -> Result<Cow<'_, [u8]>> {
     Ok(match compression.base() {
         CompressionType::Gzip => {
-            let mut v = Vec::new();
+            let mut v = Vec::with_capacity(data.len().saturating_mul(4).max(4096));
             GzDecoder::new(data).read_to_end(&mut v)?;
-            v
+            Cow::Owned(v)
         }
         CompressionType::Zlib => {
-            let mut v = Vec::new();
+            let mut v = Vec::with_capacity(data.len().saturating_mul(4).max(4096));
             ZlibDecoder::new(data).read_to_end(&mut v)?;
-            v
+            Cow::Owned(v)
         }
-        CompressionType::Lz4 => lz4_decompress_blocks(data)?,
-        _ => data.to_vec(),
+        CompressionType::Lz4 => Cow::Owned(lz4_decompress_blocks(data)?),
+        _ => Cow::Borrowed(data),
     })
+}
+
+pub(crate) fn decompress(compression: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
+    Ok(decompress_cow(compression, data)?.into_owned())
 }
 
 fn compress(compression: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
@@ -260,14 +270,18 @@ impl McaFile {
 
     
 
-    /// loadOffsets: only the offset table.
+    /// loadOffsets: only the offset table — read just the first 4KiB instead
+    /// of the whole (multi-MB) region file; callers only need the header.
     pub fn load_offsets(&mut self) -> Result<()> {
-        let data = self.read_file()?;
-        if data.len() < HEADER_OFFSETS_SIZE {
-            return Ok(());
+        let mut hdr = [0u8; HEADER_OFFSETS_SIZE];
+        let mut f = std::fs::File::open(&self.file)?;
+        match f.read_exact(&mut hdr) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e.into()),
         }
         for i in 0..1024 {
-            self.offsets[i] = offset_at(&data, i);
+            self.offsets[i] = offset_at(&hdr, i);
         }
         Ok(())
     }
@@ -295,25 +309,33 @@ impl McaFile {
         }
         self.parse_header(&data[..HEADER_SIZE]);
         let origin = self.location.region_to_chunk();
-        for i in 0..1024 {
-            if self.offsets[i] == 0 {
-                self.chunks[i] = None;
-                continue;
-            }
-            let loc = origin.add_p(Point2i::from_chunk_index(i as i32));
-            let pos = self.offsets[i] as usize * 4096;
-            match Self::parse_chunk(&data, pos, loc, &self.file, raw) {
-                Ok(Some(mut c)) => {
-                    c.timestamp = self.timestamps[i];
-                    self.chunks[i] = Some(c);
+        let offsets = self.offsets;
+        let timestamps = self.timestamps;
+        let file = &self.file;
+        // decompress+parse is the dominant region-load cost and chunks are
+        // independent: spread them over the rayon pool. collect() preserves
+        // index order so chunks[i] still corresponds to header slot i.
+        self.chunks = (0..1024)
+            .into_par_iter()
+            .map(|i| {
+                if offsets[i] == 0 {
+                    return None;
                 }
-                Ok(None) => self.chunks[i] = None,
-                Err(e) => {
-                    eprintln!("failed to load chunk at {loc}: {e}");
-                    self.chunks[i] = None;
+                let loc = origin.add_p(Point2i::from_chunk_index(i as i32));
+                let pos = offsets[i] as usize * 4096;
+                match Self::parse_chunk(&data, pos, loc, file, raw) {
+                    Ok(Some(mut c)) => {
+                        c.timestamp = timestamps[i];
+                        Some(c)
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        eprintln!("failed to load chunk at {loc}: {e}");
+                        None
+                    }
                 }
-            }
-        }
+            })
+            .collect();
         Ok(())
     }
 
@@ -329,23 +351,30 @@ impl McaFile {
         }
         let length = i32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         let compression = CompressionType::from_byte(data[pos + 4])?;
-        let payload = if compression.is_external() {
+        // borrow the payload straight out of the file image — decoders read
+        // from the slice and uncompressed chunks parse in place (no copies).
+        let payload: Cow<'_, [u8]> = if compression.is_external() {
             let mcc = mcc_path(file, loc);
             if !mcc.exists() {
                 bail!("mcc file {} does not exist", mcc.display());
             }
-            std::fs::read(&mcc)?
+            Cow::Owned(std::fs::read(&mcc)?)
         } else {
             let end = (pos + 5 + length.saturating_sub(1)).min(data.len());
-            data[pos + 5..end].to_vec()
+            Cow::Borrowed(&data[pos + 5..end])
         };
-        let nbt_data = decompress(compression, &payload)?;
-        let mut reader = NbtReader::new(Cursor::new(nbt_data));
+        let nbt_data = decompress_cow(compression, &payload)?;
+        let mut reader = NbtReader::new(&nbt_data[..]);
         reader.raw_arrays = raw;
         let tag = reader.read()?;
         let mut chunk = Chunk::new(loc);
         chunk.compression = compression;
-        chunk.data = tag.as_compound().cloned();
+        // move the root compound out — as_compound().cloned() would deep-copy
+        // the entire NBT tree just to drop the original right after.
+        chunk.data = match tag {
+            Tag::Compound(c) => Some(c),
+            _ => None,
+        };
         Ok(Some(chunk))
     }
 
@@ -588,10 +617,12 @@ fn write_chunk_data<W: std::io::Write>(
     loc: Point2i,
 ) -> Result<usize> {
     let mut buf = Vec::with_capacity(8192);
-    nbt::write_nbt(
+    let empty = Compound::default();
+    // borrow the compound — avoids a deep clone of the whole chunk per save.
+    nbt::write_root_compound(
         &mut Cursor::new(&mut buf),
         "",
-        &Tag::Compound(chunk.data.clone().unwrap_or_default()),
+        chunk.data.as_ref().unwrap_or(&empty),
     )?;
     let payload = compress(chunk.compression, &buf)?;
     if payload.len() > 1_044_475 {

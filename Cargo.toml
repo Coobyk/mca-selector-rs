@@ -23,7 +23,7 @@ parking_lot = "0.12"
 indexmap = "2"
 
 [profile.release]
-lto = "thin"
+lto = true
 codegen-units = 1
 
 # gpui 0.2.2 pulls xattr 0.2.3 (via zed-async-tar), which references

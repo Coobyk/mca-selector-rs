@@ -8,6 +8,7 @@ use gpui::*;
 use mc_core::files;
 use crate::nbt_editor;
 use mc_core::point::{Point2f, Point2i};
+use mc_core::selection::ChunkSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -87,6 +88,13 @@ pub struct MainView {
     height_slider_drag: bool,
     height_slider_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
     icon_cache: std::collections::HashMap<String, Arc<RenderImage>>,
+    /// reusable per-frame scratch: (x, z, key) of loaded tiles, kept sorted in
+    /// raster order — avoids re-allocating the list every paint.
+    visible_tiles_buf: Vec<(i32, i32, i64)>,
+    /// paste-ghost images keyed by (offset.x, offset.z, color, dir); rebuilt
+    /// only when the paste state changes, not once per region per frame.
+    paste_overlay_cache:
+        Option<(i32, i32, u32, PathBuf, std::collections::HashMap<i64, Arc<RenderImage>>)>,
     last_frame: std::time::Instant,
 }
 
@@ -116,6 +124,8 @@ impl MainView {
             height_slider_drag: false,
             height_slider_bounds: Default::default(),
             icon_cache: std::collections::HashMap::new(),
+            visible_tiles_buf: Vec::new(),
+            paste_overlay_cache: None,
             last_frame: std::time::Instant::now(),
         };
         cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
@@ -735,8 +745,6 @@ impl MainView {
         self.map.height = f32::from(bounds.size.height);
         self.last_frame = std::time::Instant::now();
 
-        window.paint_quad(fill(bounds, rgba(0x000000ff)));
-
         if self.pressed_keys != 0 && !self.map.disabled {
             let speed = 10.0;
             let dx = if self.pressed_keys & 2 != 0 { -speed } else if self.pressed_keys & 8 != 0 { speed } else { 0.0 };
@@ -749,62 +757,138 @@ impl MainView {
         let show_empty = self.map.show_nonexistent_regions
             && config::world().map(|w| w.cfg.show_nonexistent_regions).unwrap_or(true);
         // upstream draws the empty tile image under every unloaded/missing
-        // region — one fullscreen quad does the same job.
+        // region — one fullscreen quad does the same job. EMPTY_COLOR is
+        // opaque and covers the same bounds, so the black clear is only
+        // needed when the empty-tile fill is off.
         if show_empty {
             window.paint_quad(fill(bounds, rgba(EMPTY_COLOR)));
+        } else {
+            window.paint_quad(fill(bounds, rgba(0x000000ff)));
         }
 
         let (vmin, vmax) = self.map.visible_region_bounds(Point2f::ZERO);
-        for rx in vmin.x..=vmax.x {
-            for rz in vmin.z..=vmax.z {
-            let region = Point2i::new(rx, rz);
-            let key = region.as_long();
-            // block-space position -> screen px, same convention as the grids
-            // and coordinates below (offset is in world blocks).
-            let offset = Point2f::new(
-                (region.x as f32 * TILE_SIZE as f32 - self.map.offset.x) / scale,
-                (region.z as f32 * TILE_SIZE as f32 - self.map.offset.z) / scale,
-            );
-            let w = TILE_SIZE as f32 / scale;
-            let b = Bounds {
-                origin: point(px(offset.x), px(offset.z)),
-                size: size(px(w), px(w)),
+
+        // -- tile pass ---------------------------------------------------------
+        // upstream draws only tiles whose rect intersects the canvas. Iterate
+        // the bounded tile map instead of the visible region grid: at max
+        // zoom-out the grid is ~32k cells while tile count is capped by
+        // MAX_TILE_REQUESTS, and hash lookups dominate the per-frame cost.
+        // Collect + sort so paint order is identical to the old rx/rz raster
+        // scan (x-major, z inner).
+        {
+            let map = &self.map;
+            let buf = &mut self.visible_tiles_buf;
+            let icon_cache = &mut self.icon_cache;
+            let paste_cache = &mut self.paste_overlay_cache;
+
+            buf.clear();
+            buf.extend(map.tiles.values().filter_map(|t| {
+                let l = t.location;
+                // same region range the old raster loop visited — truncating
+                // int math can exclude a sub-pixel sliver at negative offsets,
+                // so keep the check for pixel-identical output.
+                if t.image.is_some()
+                    && t.loaded
+                    && l.x >= vmin.x
+                    && l.x <= vmax.x
+                    && l.z >= vmin.z
+                    && l.z <= vmax.z
+                {
+                    Some((l.x, l.z, l.as_long()))
+                } else {
+                    None
+                }
+            }));
+            buf.sort_unstable();
+
+            if map.pasted.is_none() {
+                *paste_cache = None;
+            }
+            // config reads used to run per tile (each clones BTreeMaps);
+            // hoist to once per frame, and only when something needs them.
+            let g_cfg = if map.pasted.is_some() || map.show_structure_icons {
+                Some(config::global())
+            } else {
+                None
             };
-            let pasted_cs = self.map.pasted_chunks_for_region(region);
-            let Some(tile) = self.map.tiles.get(&key) else { continue };
-            let loaded = tile.image.is_some() && tile.loaded;
-            if !loaded {
-                continue;
-            }
-            if b.size.width < px(0.5) || b.size.height < px(0.5) {
-                continue;
-            }
-            if let Some(ri) = tile.render_image.clone() {
-                let _ = window.paint_image(b, px(0.).into(), ri, 0, false);
-            }
-            if self.map.overlay.is_some() {
-                if let Some(oi) = tile.overlay_render_image.clone() {
-                    let _ = window.paint_image(b, px(0.).into(), oi, 0, false);
+            let icon_size_cfg = if map.show_structure_icons {
+                config::world().map(|w| w.cfg.structure_icon_size).unwrap_or(32)
+            } else {
+                0
+            };
+            let has_selection = !map.selection.is_empty();
+            let has_overlay = map.overlay.is_some();
+            let tile_px = TILE_SIZE as f32 / scale;
+            for &(rx, rz, key) in buf.iter() {
+                // block-space position -> screen px, same convention as the
+                // grids and coordinates below (offset is in world blocks).
+                let ox = (rx as f32 * TILE_SIZE as f32 - map.offset.x) / scale;
+                let oz = (rz as f32 * TILE_SIZE as f32 - map.offset.z) / scale;
+                // cull tiles fully outside the canvas before any paint work
+                if ox + tile_px <= 0.0
+                    || oz + tile_px <= 0.0
+                    || ox >= map.width
+                    || oz >= map.height
+                {
+                    continue;
                 }
-            }
-            if let Some(ov) = selection_overlay_image(tile, &self.map.selection, self.map.selection_version) {
-                let _ = window.paint_image(b, px(0.).into(), ov, 0, false);
-            }
-            if let Some(cs) = &pasted_cs {
-                let _ = cs; let _ = tile;
-                let color = config::global().paste_chunks_color.to_argb();
-                let mut pxa = [0u32; 32 * 32];
-                for i in cs.iter() { pxa[i] = color; }
-                if let Some(pv) = paste_argb_image(&pxa) {
-                    let _ = window.paint_image(b, px(0.).into(), pv, 0, false);
+                if tile_px < 0.5 {
+                    continue;
                 }
-            }
-            if self.map.show_structure_icons {
-                let structures = tile.structures.clone();
-                if let Some(st) = structures {
-                    self.paint_structure_icons(&st, region, scale, window);
+                let b = Bounds {
+                    origin: point(px(ox), px(oz)),
+                    size: size(px(tile_px), px(tile_px)),
+                };
+                let Some(tile) = map.tiles.get(&key) else { continue };
+                if let Some(ri) = tile.render_image.clone() {
+                    let _ = window.paint_image(b, px(0.).into(), ri, 0, false);
                 }
-            }
+                if has_overlay {
+                    if let Some(oi) = tile.overlay_render_image.clone() {
+                        let _ = window.paint_image(b, px(0.).into(), oi, 0, false);
+                    }
+                }
+                if has_selection {
+                    if let Some(ov) =
+                        selection_overlay_image(tile, &map.selection, map.selection_version)
+                    {
+                        let _ = window.paint_image(b, px(0.).into(), ov, 0, false);
+                    }
+                }
+                if let Some(p) = &map.pasted {
+                    let color = g_cfg.as_ref().unwrap().paste_chunks_color.to_argb();
+                    let hit = matches!(paste_cache.as_ref(),
+                        Some((px_, pz_, c, dir, _))
+                            if *px_ == p.offset.x && *pz_ == p.offset.z
+                                && *c == color && *dir == p.dir);
+                    if !hit {
+                        *paste_cache = Some((
+                            p.offset.x,
+                            p.offset.z,
+                            color,
+                            p.dir.clone(),
+                            build_paste_overlay(p, color),
+                        ));
+                    }
+                    if let Some((_, _, _, _, imgs)) = paste_cache.as_ref() {
+                        if let Some(pv) = imgs.get(&key) {
+                            let _ = window.paint_image(b, px(0.).into(), pv.clone(), 0, false);
+                        }
+                    }
+                }
+                if map.show_structure_icons {
+                    if let (Some(st), Some(g)) = (tile.structures.as_ref(), g_cfg.as_ref()) {
+                        paint_structure_icons(
+                            icon_cache,
+                            map,
+                            st,
+                            &g.structure_icons,
+                            icon_size_cfg,
+                            scale,
+                            window,
+                        );
+                    }
+                }
             }
         }
 
@@ -844,22 +928,23 @@ impl MainView {
                 // edge labels: x along top, z along left (upstream rotates x;
                 // gpui can't rotate text - horizontal is close enough)
                 let mul = ((zoom / 4).max(1) * 512) as i64;
-                for rx in vmin.x..=vmax.x + 1 {
+                // bx % mul == 0 <=> rx % (mul/512) == 0: step the multiples
+                // directly instead of scanning every visible region.
+                let step = (mul / 512) as i32;
+                let x0 = vmin.x + (step - vmin.x.rem_euclid(step)) % step;
+                for rx in (x0..=vmax.x + 1).step_by(step as usize) {
                     let bx = rx as i64 * 512;
-                    if bx % mul == 0 {
-                        let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
-                        if sx >= 0.0 && sx <= self.map.width {
-                            paint(abbrev_coord(bx as i32), sx, 2.0);
-                        }
+                    let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
+                    if sx >= 0.0 && sx <= self.map.width {
+                        paint(abbrev_coord(bx as i32), sx, 2.0);
                     }
                 }
-                for rz in vmin.z..=vmax.z + 1 {
+                let z0 = vmin.z + (step - vmin.z.rem_euclid(step)) % step;
+                for rz in (z0..=vmax.z + 1).step_by(step as usize) {
                     let bz = rz as i64 * 512;
-                    if bz % mul == 0 {
-                        let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
-                        if sz >= 0.0 && sz <= self.map.height {
-                            paint(abbrev_coord(bz as i32), 2.0, sz);
-                        }
+                    let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
+                    if sz >= 0.0 && sz <= self.map.height {
+                        paint(abbrev_coord(bz as i32), 2.0, sz);
                     }
                 }
             } else {
@@ -868,12 +953,12 @@ impl MainView {
                 } else {
                     512
                 } as i64;
-                for rx in vmin.x..=vmax.x + 1 {
-                    for rz in vmin.z..=vmax.z + 1 {
+                let step = (mul / 512) as i32;
+                let x0 = vmin.x + (step - vmin.x.rem_euclid(step)) % step;
+                let z0 = vmin.z + (step - vmin.z.rem_euclid(step)) % step;
+                for rx in (x0..=vmax.x + 1).step_by(step as usize) {
+                    for rz in (z0..=vmax.z + 1).step_by(step as usize) {
                         let (bx, bz) = (rx as i64 * 512, rz as i64 * 512);
-                        if bx % mul != 0 || bz % mul != 0 {
-                            continue;
-                        }
                         let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
                         let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
                         if sx < 0.0 || sz < 0.0 || sx > self.map.width || sz > self.map.height {
@@ -934,54 +1019,79 @@ impl MainView {
         }
     }
 
-    fn paint_structure_icons(&mut self, structures: &std::collections::HashMap<i64, Vec<String>>, region: Point2i, scale: f32, window: &mut Window) {
-        let _ = region;
-        let registry = mc_core::structures::structures();
-        let g = config::global();
-        let chunk_size = 16.0 / scale;
-        let icon_size = config::world().map(|w| w.cfg.structure_icon_size).unwrap_or(32) as f32 / scale;
-        for (chunk_l, names) in structures {
-            let chunk = Point2i::from_long(*chunk_l);
-            let off = chunk
-                .chunk_to_block()
-                .to_point2f()
-                .sub(self.map.offset)
-                .mul(1.0 / scale);
-            for name in names {
-                // SelectStructures submenu persists per-type toggles
-                if g.structure_icons.get(name).copied().unwrap_or(true) == false {
-                    continue;
-                }
-                let Some(sd) = registry.icons.get(name) else { continue };
-                if sd.max_scale < scale {
-                    continue;
-                }
-                let canon = format!("minecraft:{}", sd.name);
-                if !g.structure_icons.get(&canon).copied().unwrap_or(true) {
-                    continue;
-                }
-                if let Some(icon) = self.icon(&sd.icon) {
-                    let b = Bounds {
-                        origin: point(
-                            px(off.x + (chunk_size - icon_size) / 2.0),
-                            px(off.z + (chunk_size - icon_size) / 2.0),
-                        ),
-                        size: size(px(icon_size), px(icon_size)),
-                    };
-                    if b.size.width >= px(0.5) {
-                        let _ = window.paint_image(b, px(0.).into(), icon, 0, false);
-                    }
-                }
-                break;
+}
+
+/// upstream TileMap.drawStructureIcons: first enabled structure icon per
+/// chunk, centered on the chunk. Free function so the tile loop can hold an
+/// immutable borrow of `map` while icons resolve through the mutable cache.
+fn paint_structure_icons(
+    icon_cache: &mut std::collections::HashMap<String, Arc<RenderImage>>,
+    map: &TileMapState,
+    structures: &std::collections::HashMap<i64, Vec<String>>,
+    structure_icons: &std::collections::BTreeMap<String, bool>,
+    icon_size_cfg: i32,
+    scale: f32,
+    window: &mut Window,
+) {
+    let registry = mc_core::structures::structures();
+    let chunk_size = 16.0 / scale;
+    let icon_size = icon_size_cfg as f32 / scale;
+    let mut canon = String::with_capacity(32);
+    for (chunk_l, names) in structures {
+        let chunk = Point2i::from_long(*chunk_l);
+        let off = chunk
+            .chunk_to_block()
+            .to_point2f()
+            .sub(map.offset)
+            .mul(1.0 / scale);
+        let icon_l = off.x + (chunk_size - icon_size) / 2.0;
+        let icon_t = off.z + (chunk_size - icon_size) / 2.0;
+        // cull chunks whose icon rect is fully off-screen — paint_image
+        // would clip it away anyway, so skip the per-name config lookups.
+        if icon_l + icon_size <= 0.0
+            || icon_t + icon_size <= 0.0
+            || icon_l >= map.width
+            || icon_t >= map.height
+        {
+            continue;
+        }
+        for name in names {
+            // SelectStructures submenu persists per-type toggles
+            if structure_icons.get(name).copied().unwrap_or(true) == false {
+                continue;
             }
+            let Some(sd) = registry.icons.get(name) else { continue };
+            if sd.max_scale < scale {
+                continue;
+            }
+            canon.clear();
+            canon.push_str("minecraft:");
+            canon.push_str(&sd.name);
+            if !structure_icons.get(canon.as_str()).copied().unwrap_or(true) {
+                continue;
+            }
+            if let Some(icon) = load_icon(icon_cache, &sd.icon) {
+                let b = Bounds {
+                    origin: point(px(icon_l), px(icon_t)),
+                    size: size(px(icon_size), px(icon_size)),
+                };
+                if b.size.width >= px(0.5) {
+                    let _ = window.paint_image(b, px(0.).into(), icon, 0, false);
+                }
+            }
+            break;
         }
     }
+}
 
-    fn icon(&mut self, icon: &str) -> Option<Arc<RenderImage>> {
-        if let Some(i) = self.icon_cache.get(icon) {
-            return Some(i.clone());
-        }
-        let bytes = match icon {
+fn load_icon(
+    icon_cache: &mut std::collections::HashMap<String, Arc<RenderImage>>,
+    icon: &str,
+) -> Option<Arc<RenderImage>> {
+    if let Some(i) = icon_cache.get(icon) {
+        return Some(i.clone());
+    }
+    let bytes = match icon {
             "abandoned_camp" => include_bytes!("../resources/img/structure/abandoned_camp.png").as_slice(),
             "blaze" => include_bytes!("../resources/img/structure/blaze.png").as_slice(),
             "boat" => include_bytes!("../resources/img/structure/boat.png").as_slice(),
@@ -1023,12 +1133,82 @@ impl MainView {
 
             _ => return None,
         };
-        let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-        let r = Arc::new(RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(img), 1)));
-        self.icon_cache.insert(icon.to_string(), r.clone());
-        Some(r)
-    }
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let r = Arc::new(RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(img), 1)));
+    icon_cache.insert(icon.to_string(), r.clone());
+    Some(r)
+}
 
+/// pasted-chunks ghost images keyed by target region long. Same chunk
+/// mapping as TileMapState::pasted_chunks_for_region, computed for all
+/// affected regions at once so the per-tile loop is a hash lookup.
+fn build_paste_overlay(
+    p: &Pasted,
+    color: u32,
+) -> std::collections::HashMap<i64, Arc<RenderImage>> {
+    let mut sets: std::collections::HashMap<i64, ChunkSet> = std::collections::HashMap::new();
+    {
+        let mut put = |pos: Point2i| {
+            let region = pos.chunk_to_region();
+            let first = region.region_to_chunk();
+            sets.entry(region.as_long())
+                .or_default()
+                .set(((pos.z - first.z) * 32 + (pos.x - first.x)) as usize);
+        };
+        if let Some(sel) = &p.selection {
+            for (&region_l, cs) in &sel.selection {
+                let base = Point2i::from_long(region_l).region_to_chunk();
+                // effective set = cs or full region; complement when inverted
+                let eff: Option<ChunkSet> = match cs {
+                    Some(c) => Some(if sel.inverted { c.flip() } else { c.clone() }),
+                    None => {
+                        if sel.inverted { Some(ChunkSet::new()) } else { None }
+                    }
+                };
+                match eff {
+                    Some(c) => {
+                        for i in c.iter() {
+                            put(base.add(i as i32 % 32, i as i32 / 32).add_p(p.offset));
+                        }
+                    }
+                    None => {
+                        for i in 0..1024i32 {
+                            put(base.add(i % 32, i / 32).add_p(p.offset));
+                        }
+                    }
+                }
+            }
+        } else {
+            // no selection data: all chunks in all copied regions are pasted.
+            // build from the region file names present in the clipboard dir.
+            if let Ok(rd) = std::fs::read_dir(&p.dir) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if let Some(r) = files::parse_mca_file_name(&name) {
+                        let base = r.region_to_chunk();
+                        for i in 0..1024i32 {
+                            put(base.add(i % 32, i / 32).add_p(p.offset));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = std::collections::HashMap::with_capacity(sets.len());
+    let mut pxa = [0u32; 32 * 32];
+    for (k, cs) in sets {
+        pxa.iter_mut().for_each(|v| *v = 0);
+        for i in cs.iter() {
+            pxa[i] = color;
+        }
+        if let Some(img) = paste_argb_image(&pxa) {
+            out.insert(k, img);
+        }
+    }
+    out
+}
+
+impl MainView {
     fn render_layer_only_only(&self) -> bool {
         config::world().map(|w| w.cfg.render_layer_only).unwrap_or(false)
     }

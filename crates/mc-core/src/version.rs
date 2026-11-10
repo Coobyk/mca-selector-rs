@@ -1,6 +1,7 @@
 //! Port of version.*: DataVersion-dispatched ChunkRenderers + ColorMappings.
 //! Dispatch via floorEntry, like upstream's VersionHandler.
 
+use crate::bitset::BitSet;
 use crate::colors::{self, ColorConfig};
 use crate::nbt::{self, Compound, Tag};
 
@@ -110,6 +111,22 @@ impl ColorMap {
                     BiomeKey::Idx(id) => biome_id_to_name(id),
                 };
                 c.get_color(name, biome_name, props).color | 0xFF00_0000
+            }
+        }
+    }
+
+    /// get_rgb with the block-state bitset pre-resolved by the caller
+    /// (renderers resolve it once per palette entry).
+    pub fn get_rgb_state(&self, name: &str, state: Option<&BitSet>, biome: BiomeKey) -> u32 {
+        match self {
+            ColorMap::Null => 0,
+            ColorMap::Legacy(_) => 0xFF00_0000,
+            ColorMap::Config(c) => {
+                let biome_name = match biome {
+                    BiomeKey::Name(s) => s,
+                    BiomeKey::Idx(id) => biome_id_to_name(id),
+                };
+                c.get_color_state(name, biome_name, state).color | 0xFF00_0000
             }
         }
     }
@@ -265,37 +282,175 @@ fn palette_props<'a>(entry: Option<&'a Tag>) -> Option<&'a Compound> {
     }
 }
 
+// --- resolved palette entries ------------------------------------------------
+//
+// The old inner loop re-did all of this per block visit: Compound lookups for
+// "Name"/"Properties" (IndexMap string hashing), HashSet<String> lookups for
+// transparent/water/foliage and a waterlogged string compare, plus a BitSet
+// allocation inside get_state for every column. All of it depends only on the
+// palette entry, so it is resolved once per palette slot when a section is
+// indexed.
+
+const F_TRANSPARENT: u8 = 0b0001;
+const F_WATER: u8 = 0b0010;
+const F_WATERLOGGED: u8 = 0b0100;
+const F_FOLIAGE: u8 = 0b1000;
+const F_TINTED: u8 = 0b1_0000;
+
+struct PalEntry<'a> {
+    name: &'a str,
+    /// block-state bitset, only kept when the resolved color is F_TINTED.
+    state: Option<BitSet>,
+    /// resolved argb — valid unless F_TINTED (tinted colors need the biome).
+    rgb: u32,
+    flags: u8,
+}
+
+/// One palette entry resolved against the color mapping. Same result as the
+/// old per-block (palette_name, palette_props, is_*, get_rgb) sequence.
+fn resolve_entry<'a>(cm: &ColorMap, name: &'a str, props: Option<&'a Compound>) -> PalEntry<'a> {
+    let cp = colors::color_properties();
+    let mut flags = 0u8;
+    if cp.transparent.contains(name) {
+        flags |= F_TRANSPARENT;
+    }
+    if cp.water.contains(name) {
+        flags |= F_WATER;
+    }
+    if cp.foliage.contains(name) {
+        flags |= F_FOLIAGE;
+    }
+    if props
+        .and_then(|p| p.get("waterlogged"))
+        .and_then(|t| t.as_string())
+        .map(|s| s == "true")
+        .unwrap_or(false)
+    {
+        flags |= F_WATERLOGGED;
+    }
+    match cm {
+        ColorMap::Config(c) => {
+            let sc = c.colors.get(name);
+            // state is only consulted when `name` has a color mapping at all
+            // (an unmapped name yields MISSING_COLOR regardless of state).
+            let state = if sc.is_some() {
+                c.states.get_state(props)
+            } else {
+                None
+            };
+            let bc = sc
+                .map(|s| s.color(state.as_ref()))
+                .unwrap_or(colors::BlockColor {
+                    color: colors::MISSING_COLOR,
+                    properties: 0,
+                });
+            if bc.properties & colors::TINTED != 0 {
+                // rgb is resolved per-biome at render time (memoized).
+                PalEntry {
+                    name,
+                    state,
+                    rgb: 0,
+                    flags: flags | F_TINTED,
+                }
+            } else {
+                PalEntry {
+                    name,
+                    state: None,
+                    rgb: bc.color | 0xFF00_0000,
+                    flags,
+                }
+            }
+        }
+        ColorMap::Null => PalEntry {
+            name,
+            state: None,
+            rgb: 0,
+            flags,
+        },
+        ColorMap::Legacy(_) => PalEntry {
+            name,
+            state: None,
+            rgb: 0xFF00_0000,
+            flags,
+        },
+    }
+}
+
+/// What the old code produced for a missing/empty palette entry: name ""
+/// (not transparent, not water, not foliage; MISSING_COLOR -> opaque white
+/// for Config mappings, 0 for Null, 0xFF000000 for Legacy).
+fn oob_entry(cm: &ColorMap) -> PalEntry<'static> {
+    PalEntry {
+        name: "",
+        state: None,
+        rgb: match cm {
+            ColorMap::Config(_) => colors::MISSING_COLOR | 0xFF00_0000,
+            ColorMap::Null => 0,
+            ColorMap::Legacy(_) => 0xFF00_0000,
+        },
+        flags: 0,
+    }
+}
+
 struct IndexedSection<'a> {
-    palette: Vec<&'a Tag>,
-    data: Option<&'a [u8]>,
+    /// resolved block palette; entry i is block palette index i.
+    entries: Vec<PalEntry<'a>>,
+    /// decoded packed block data (empty => every block reads entries[0]).
+    longs: Vec<u64>,
     bits: usize,
     indexes_per_long: usize,
+    /// resolved biome names for the 4x4x4 cells ([yq*16+zq*4+xq]); empty when
+    /// the packed encoding is pathological and get_biome_packed must be used.
+    biome_names: Vec<&'a str>,
+    // raw biome palette kept for the pathological-bipl fallback path only.
     biome_palette: Vec<&'a Tag>,
     biome_data: Option<&'a [u8]>,
     biome_bits: usize,
     biome_indexes_per_long: usize,
     start_height: i32,
     section_height: i32,
+    /// provable "every block maps to a transparent entry" => sections can be
+    /// skipped wholesale by the column scan.
+    all_transparent: bool,
+    /// same for the caves renderer (transparent OR foliage never counts).
+    caves_inert: bool,
 }
 
-fn get_block<'a>(
-    s: &'a IndexedSection<'a>,
-    x: usize,
-    y: usize,
-    z: usize,
-) -> Option<&'a Tag> {
-    if s.palette.is_empty() {
-        return None;
+/// biome lookup for one (x, cy, z) inside a section — mirrors the old
+/// (get_biome_packed | biome_int) dispatch.
+#[inline]
+fn biome_at<'a>(
+    s: &IndexedSection<'a>,
+    chunk_biomes: Option<&[u8]>,
+    modern: bool,
+    format: ChunkFormat,
+    cx: usize,
+    cy: i32,
+    cz: usize,
+    y_min: i32,
+) -> BiomeKey<'a> {
+    if modern {
+        if !s.biome_names.is_empty() {
+            let bi = ((cy as usize >> 2) & 0xF) * 16 + ((cz >> 2) & 0xF) * 4 + ((cx >> 2) & 0xF);
+            BiomeKey::Name(s.biome_names.get(bi).copied().unwrap_or(""))
+        } else {
+            BiomeKey::Name(get_biome_packed(s, cx, cy as usize, cz, format))
+        }
+    } else {
+        BiomeKey::Idx(biome_int(
+            chunk_biomes,
+            cx,
+            s.section_height + cy,
+            cz,
+            format,
+            y_min,
+        ))
     }
-    if s.bits == 0 || s.data.is_none() {
-        return s.palette.first().copied();
-    }
-    let index = y * 256 + z * 16 + x;
-    let pal_idx = packed_get(s.data, index, s.bits, s.indexes_per_long) as usize;
-    s.palette.get(pal_idx).copied()
 }
 
-fn get_biome_packed<'a>(s: &'a IndexedSection<'a>, x: usize, y: usize, z: usize, format: ChunkFormat) -> &'a str {
+/// fallback for pathological biome packings (biome_indexes_per_long == 0);
+/// identical to the old per-call implementation.
+fn get_biome_packed<'a>(s: &IndexedSection<'a>, x: usize, y: usize, z: usize, format: ChunkFormat) -> &'a str {
     if s.biome_palette.is_empty() {
         return "";
     }
@@ -305,6 +460,44 @@ fn get_biome_packed<'a>(s: &'a IndexedSection<'a>, x: usize, y: usize, z: usize,
     let index = (y >> 2 & 0xF) * 16 + (z >> 2 & 0xF) * 4 + (x >> 2 & 0xF);
     let pal_idx = packed_get(s.biome_data, index, s.biome_bits, s.biome_indexes_per_long) as usize;
     palette_name(s.biome_palette.get(pal_idx).copied(), format)
+}
+
+/// rgb of a resolved entry; biome is only evaluated when the entry is tinted.
+#[inline]
+fn entry_rgb<'a>(
+    memo: &mut RgbMemo,
+    cm: &ColorMap,
+    e: &PalEntry<'_>,
+    bk: impl FnOnce() -> BiomeKey<'a>,
+) -> u32 {
+    if e.flags & F_TINTED == 0 {
+        e.rgb
+    } else {
+        memo.get(cm, e, bk())
+    }
+}
+
+/// small multiplicative hasher for pointer/integer keys — the memo is hit
+/// once or more per rendered column and std's SipHash dominates otherwise.
+#[derive(Default)]
+struct PtrHasher(u64);
+impl std::hash::Hasher for PtrHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            self.0 = self.0.rotate_left(23);
+        }
+    }
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.0 = (self.0 ^ i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = self.0.rotate_left(23);
+    }
 }
 
 fn biome_id_to_name(id: i32) -> &'static str {
@@ -374,6 +567,7 @@ fn index_sections<'a>(
     format: ChunkFormat,
     height: i32,
     y_min: i32,
+    cm: &ColorMap,
 ) -> Vec<Option<IndexedSection<'a>>> {
     let modern = is_modern(format);
     let (lo, hi) = if modern {
@@ -398,59 +592,128 @@ fn index_sections<'a>(
         if idx >= s_max {
             continue;
         }
-        let (palette, data) = if modern {
-            let bs = s.get("block_states").and_then(Tag::as_compound);
-            (
-                bs.and_then(|b| b.get("palette"))
-                    .and_then(Tag::as_list)
-                    .map(|(_, l)| l.iter().collect())
-                    .unwrap_or_default(),
-                bs.and_then(|b| b.get("data")).and_then(|t| t.as_bytes()),
-            )
-        } else {
-            (
-                s.get("Palette")
-                    .and_then(Tag::as_list)
-                    .map(|(_, l)| l.iter().collect())
-                    .unwrap_or_default(),
-                s.get("BlockStates").and_then(|t| t.as_bytes()),
-            )
-        };
-        let bits = data.map(|d| d.len() >> 9).unwrap_or(0);
-        let ipl = if bits == 0 { 1 } else { (64.0 / bits as f64) as usize };
-        let (biome_palette, biome_data) = if modern {
-            let bc = s.get("biomes").and_then(Tag::as_compound);
-            (
-                bc.and_then(|b| b.get("palette"))
-                    .and_then(Tag::as_list)
-                    .map(|(_, l)| l.iter().collect())
-                    .unwrap_or_default(),
-                bc.and_then(|b| b.get("data")).and_then(|t| t.as_bytes()),
-            )
-        } else {
-            (Vec::new(), None)
-        };
-        let bb = biome_data.map(|d| d.len() >> 3).unwrap_or(0);
-        let bipl = if bb == 0 { 1 } else { (64.0 / bb as f64) as usize };
         let abs_h = if modern { height - y_min * 16 } else { height.clamp(0, 255) };
-        indexed[idx] = Some(IndexedSection {
-            palette,
-            data,
-            bits,
-            indexes_per_long: ipl,
-            biome_palette,
-            biome_data,
-            biome_bits: bb,
-            biome_indexes_per_long: bipl,
-            start_height: if (abs_h >> 4) == idx as i32 {
+        indexed[idx] = Some(build_section(
+            s,
+            modern,
+            format,
+            if (abs_h >> 4) == idx as i32 {
                 abs_h & 0xF
             } else {
                 15
             },
-            section_height: (idx as i32 + lo) * 16,
-        });
+            (idx as i32 + lo) * 16,
+            cm,
+        ));
     }
     indexed
+}
+
+/// Extracts block/biome palettes + packed data from one section compound and
+/// resolves every palette entry against the color mapping once.
+fn build_section<'a>(
+    s: &'a Compound,
+    modern: bool,
+    format: ChunkFormat,
+    start_height: i32,
+    section_height: i32,
+    cm: &ColorMap,
+) -> IndexedSection<'a> {
+    let (palette, data): (Vec<&'a Tag>, Option<&'a [u8]>) = if modern {
+        let bs = s.get("block_states").and_then(Tag::as_compound);
+        (
+            bs.and_then(|b| b.get("palette"))
+                .and_then(Tag::as_list)
+                .map(|(_, l)| l.iter().collect())
+                .unwrap_or_default(),
+            bs.and_then(|b| b.get("data")).and_then(|t| t.as_bytes()),
+        )
+    } else {
+        (
+            s.get("Palette")
+                .and_then(Tag::as_list)
+                .map(|(_, l)| l.iter().collect())
+                .unwrap_or_default(),
+            s.get("BlockStates").and_then(|t| t.as_bytes()),
+        )
+    };
+    let bits = data.map(|d| d.len() >> 9).unwrap_or(0);
+    let ipl = if bits == 0 { 1 } else { (64.0 / bits as f64) as usize };
+    let (biome_palette, biome_data): (Vec<&'a Tag>, Option<&'a [u8]>) = if modern {
+        let bc = s.get("biomes").and_then(Tag::as_compound);
+        (
+            bc.and_then(|b| b.get("palette"))
+                .and_then(Tag::as_list)
+                .map(|(_, l)| l.iter().collect())
+                .unwrap_or_default(),
+            bc.and_then(|b| b.get("data")).and_then(|t| t.as_bytes()),
+        )
+    } else {
+        (Vec::new(), None)
+    };
+    let bb = biome_data.map(|d| d.len() >> 3).unwrap_or(0);
+    let bipl = if bb == 0 { 1 } else { (64.0 / bb as f64) as usize };
+
+    let entries: Vec<PalEntry> = palette
+        .iter()
+        .map(|&t| resolve_entry(cm, palette_name(Some(t), format), palette_props(Some(t))))
+        .collect();
+    // every palette index the packed data can produce must be in range for a
+    // whole-section skip to be sound (oob entries resolve as opaque).
+    let no_oob =
+        bits == 0 || (bits < 64 && entries.len() >= (1usize << bits));
+    let all_transparent = no_oob
+        && !entries.is_empty()
+        && entries.iter().all(|e| e.flags & F_TRANSPARENT != 0);
+    let caves_inert = no_oob
+        && !entries.is_empty()
+        && entries
+            .iter()
+            .all(|e| e.flags & (F_TRANSPARENT | F_FOLIAGE) != 0);
+    let longs: Vec<u64> = if bits > 0 {
+        data.map(|d| {
+            d.chunks_exact(8)
+                .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+                .collect()
+        })
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // resolve the 64 biome cells once; skipped when the packed encoding is
+    // pathological (bb >= 64) — biome_at then uses get_biome_packed per call,
+    // matching the old code including its panic behaviour on corrupt data.
+    let biome_names: Vec<&'a str> = if modern && bb < 64 {
+        let mut v = Vec::with_capacity(64);
+        if biome_palette.is_empty() {
+            v.resize(64, "");
+        } else if bb == 0 || biome_data.is_none() {
+            v.resize(64, palette_name(biome_palette.first().copied(), format));
+        } else {
+            for i in 0..64 {
+                let pi = packed_get(biome_data, i, bb, bipl) as usize;
+                v.push(palette_name(biome_palette.get(pi).copied(), format));
+            }
+        }
+        v
+    } else {
+        Vec::new()
+    };
+    IndexedSection {
+        entries,
+        longs,
+        bits,
+        indexes_per_long: ipl,
+        biome_names,
+        biome_palette,
+        biome_data,
+        biome_bits: bb,
+        biome_indexes_per_long: bipl,
+        start_height,
+        section_height,
+        all_transparent,
+        caves_inert,
+    }
 }
 
 pub struct RenderOut<'a> {
@@ -482,7 +745,7 @@ pub fn draw_chunk(
     let (level, sections, y_min) = sections_and_level(root, format);
     let modern = is_modern(format);
     let height = out.height;
-    let indexed = index_sections(sections, format, height, y_min);
+    let indexed = index_sections(sections, format, height, y_min, cm);
     if indexed.is_empty() {
         return;
     }
@@ -499,58 +762,85 @@ pub fn draw_chunk(
     };
     let start = ((abs_h >> 4).min(indexed.len() as i32 - 1)).max(0) as usize;
     let mut memo = RgbMemo::default();
+    let oob = oob_entry(cm);
+    let water_entry = resolve_entry(cm, WATER_DUMMY_NAME, None);
+    let row = 512usize >> scale_bits;
 
     for cx in (0..16usize).step_by(scale as usize) {
         'zloop: for cz in (0..16usize).step_by(scale as usize) {
-            let pixel_index =
-                (z + (cz >> scale_bits)) * (512 >> scale_bits) + (x + (cx >> scale_bits));
+            let pixel_index = (z + (cz >> scale_bits)) * row + (x + (cx >> scale_bits));
             let mut water_depth = false;
+            let col = cz * 16 + cx;
             for s in indexed[..=start].iter().rev().flatten() {
+                if s.all_transparent {
+                    continue;
+                }
+                // packed-data cursor: block index = y*256 + z*16 + x, so
+                // stepping y by -1 always subtracts exactly 256 — the long
+                // index / bit offset can be updated incrementally without a
+                // division per block.
+                let uniform = s.longs.is_empty();
+                let ipl = s.indexes_per_long;
+                let top_index = s.start_height as usize * 256 + col;
+                let mut li = top_index / ipl;
+                let mut rem = top_index % ipl;
+                let step_li = 256 / ipl;
+                let step_rem = 256 % ipl;
+                let mask = (1u64 << s.bits) - 1;
                 for cy in (0..=s.start_height).rev() {
-                    let entry = get_block(s, cx, cy as usize, cz);
-                    let name = palette_name(entry, format);
-                    if cm.is_transparent(name) {
+                    let e = if uniform {
+                        s.entries.first().unwrap_or(&oob)
+                    } else {
+                        let v = s.longs.get(li).copied().unwrap_or(0);
+                        let pi = ((v >> (rem * s.bits)) & mask) as usize;
+                        if cy > 0 {
+                            if rem < step_rem {
+                                rem += ipl;
+                                li -= 1;
+                            }
+                            rem -= step_rem;
+                            li -= step_li;
+                        }
+                        s.entries.get(pi).unwrap_or(&oob)
+                    };
+                    if e.flags & F_TRANSPARENT != 0 {
+                        if uniform {
+                            // every row holds the same entry — nothing else
+                            // in this section can block the column.
+                            break;
+                        }
                         continue;
                     }
-                    let props = palette_props(entry);
-                    let bk = if modern {
-                        BiomeKey::Name(get_biome_packed(s, cx, cy as usize, cz, format))
-                    } else {
-                        BiomeKey::Idx(biome_int(
-                            chunk_biomes,
-                            cx,
-                            s.section_height + cy,
-                            cz,
-                            format,
-                            y_min,
-                        ))
-                    };
+                    let bk = || biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min);
+                    let y_abs = s.section_height + cy;
                     if out.water {
                         let wh = out.water_heights.as_deref_mut().unwrap();
                         if !water_depth {
-                            out.pixel_buffer[pixel_index] = memo.get(cm, name, props, bk);
-                            wh[pixel_index] = (s.section_height + cy) as i16;
+                            out.pixel_buffer[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
+                            wh[pixel_index] = y_abs as i16;
                         }
-                        if cm.is_water(name) {
+                        if e.flags & F_WATER != 0 {
                             water_depth = true;
-                            continue;
-                        } else if cm.is_waterlogged(props) {
-                            out.pixel_buffer[pixel_index] =
-                                memo.get(cm, WATER_DUMMY_NAME, None, bk);
-                            if let Some(wp) = out.water_pixels.as_deref_mut() {
-                                wp[pixel_index] = memo.get(cm, name, props, bk);
+                            if uniform {
+                                break;
                             }
-                            wh[pixel_index] = (s.section_height + cy) as i16;
-                            out.terrain_heights[pixel_index] =
-                                (s.section_height + cy - 1) as i16;
+                            continue;
+                        } else if e.flags & F_WATERLOGGED != 0 {
+                            out.pixel_buffer[pixel_index] =
+                                entry_rgb(&mut memo, cm, &water_entry, bk);
+                            if let Some(wp) = out.water_pixels.as_deref_mut() {
+                                wp[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
+                            }
+                            wh[pixel_index] = y_abs as i16;
+                            out.terrain_heights[pixel_index] = (y_abs - 1) as i16;
                             continue 'zloop;
                         } else if let Some(wp) = out.water_pixels.as_deref_mut() {
-                            wp[pixel_index] = memo.get(cm, name, props, bk);
+                            wp[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
                         }
                     } else {
-                        out.pixel_buffer[pixel_index] = memo.get(cm, name, props, bk);
+                        out.pixel_buffer[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
                     }
-                    out.terrain_heights[pixel_index] = (s.section_height + cy) as i16;
+                    out.terrain_heights[pixel_index] = y_abs as i16;
                     continue 'zloop;
                 }
             }
@@ -559,27 +849,25 @@ pub fn draw_chunk(
 }
 
 
-/// per-chunk rgb memo: within one chunk, block/biome names and props are
-/// borrowed palette entries — pointer + len is a stable identity, so
-/// (name, props, biome) -> rgb can be memoized instead of re-running
-/// get_state + the 3-level string-keyed lookups per column.
+/// per-chunk rgb memo for tinted blocks: each resolved PalEntry already
+/// carries its state bitset, so (entry address, biome) -> rgb can be memoized
+/// instead of re-running get_state + the string-keyed color lookups.
 #[derive(Default)]
 struct RgbMemo {
-    map: std::collections::HashMap<(usize, usize, usize, usize), u32>,
+    map: std::collections::HashMap<(usize, usize), u32, std::hash::BuildHasherDefault<PtrHasher>>,
 }
 impl RgbMemo {
     #[inline]
-    fn get(&mut self, cm: &ColorMap, name: &str, props: Option<&Compound>, bk: BiomeKey) -> u32 {
+    fn get(&mut self, cm: &ColorMap, e: &PalEntry<'_>, bk: BiomeKey) -> u32 {
         let bk_key = match bk {
             BiomeKey::Name(s) => (s.as_ptr() as usize) ^ (s.len() << 20),
             BiomeKey::Idx(i) => (i as usize) << 40 | 1,
         };
-        let props_ptr = props.map(|p| p as *const _ as usize).unwrap_or(0);
-        let key = (name.as_ptr() as usize, name.len(), props_ptr, bk_key);
+        let key = (e as *const PalEntry<'_> as usize, bk_key);
         if let Some(&c) = self.map.get(&key) {
             return c;
         }
-        let c = cm.get_rgb(name, props, bk);
+        let c = cm.get_rgb_state(e.name, e.state.as_ref(), bk);
         self.map.insert(key, c);
         c
     }
@@ -612,52 +900,7 @@ pub fn draw_layer(
         }
     }
     let Some(section) = target else { return };
-    let (palette, data) = if modern {
-        let bs = section.get("block_states").and_then(Tag::as_compound);
-        (
-            bs.and_then(|b| b.get("palette"))
-                .and_then(Tag::as_list)
-                .map(|(_, l)| l.iter().collect())
-                .unwrap_or_default(),
-            bs.and_then(|b| b.get("data")).and_then(|t| t.as_bytes()),
-        )
-    } else {
-        (
-            section
-                .get("Palette")
-                .and_then(Tag::as_list)
-                .map(|(_, l)| l.iter().collect())
-                .unwrap_or_default(),
-            section.get("BlockStates").and_then(|t| t.as_bytes()),
-        )
-    };
-    let bits = data.map(|d| d.len() >> 9).unwrap_or(0);
-    let ipl = if bits == 0 { 1 } else { (64.0 / bits as f64) as usize };
-    let (biome_palette, biome_data) = if modern {
-        let bc = section.get("biomes").and_then(Tag::as_compound);
-        (
-            bc.and_then(|b| b.get("palette"))
-                .and_then(Tag::as_list)
-                .map(|(_, l)| l.iter().collect())
-                .unwrap_or_default(),
-            bc.and_then(|b| b.get("data")).and_then(|t| t.as_bytes()),
-        )
-    } else {
-        (Vec::new(), None)
-    };
-    let bb = biome_data.map(|d| d.len() >> 3).unwrap_or(0);
-    let s = IndexedSection {
-        palette,
-        data,
-        bits,
-        indexes_per_long: ipl,
-        biome_palette,
-        biome_data,
-        biome_bits: bb,
-        biome_indexes_per_long: if bb == 0 { 1 } else { (64.0 / bb as f64) as usize },
-        start_height: 15,
-        section_height: target_y * 16,
-    };
+    let s = build_section(section, modern, format, 15, target_y * 16, cm);
     let chunk_biomes = if modern {
         None
     } else {
@@ -670,29 +913,29 @@ pub fn draw_layer(
         height.clamp(0, 255)
     };
     let cy = (abs_h & 0xF) as usize;
+    let oob = oob_entry(cm);
+    let mut memo = RgbMemo::default();
+    let mask = (1u64 << s.bits) - 1;
     for cx in (0..16usize).step_by(scale as usize) {
         for cz in (0..16usize).step_by(scale as usize) {
-            let entry = get_block(&s, cx, cy, cz);
-            let name = palette_name(entry, format);
-            if cm.is_transparent(name) {
+            let index = cy * 256 + cz * 16 + cx;
+            let e = if s.longs.is_empty() {
+                s.entries.first().unwrap_or(&oob)
+            } else {
+                let v = s.longs
+                    .get(index / s.indexes_per_long)
+                    .copied()
+                    .unwrap_or(0);
+                let pi = ((v >> ((index % s.indexes_per_long) * s.bits)) & mask) as usize;
+                s.entries.get(pi).unwrap_or(&oob)
+            };
+            if e.flags & F_TRANSPARENT != 0 {
                 continue;
             }
-            let props = palette_props(entry);
             let pixel_index =
                 (z + (cz >> scale_bits)) * (512 >> scale_bits) + (x + (cx >> scale_bits));
-            let bk = if modern {
-                BiomeKey::Name(get_biome_packed(&s, cx, cy, cz, format))
-            } else {
-                BiomeKey::Idx(biome_int(
-                    chunk_biomes,
-                    cx,
-                    s.section_height + cy as i32,
-                    cz,
-                    format,
-                    y_min,
-                ))
-            };
-            pixel_buffer[pixel_index] = cm.get_rgb(name, props, bk);
+            let bk = || biome_at(&s, chunk_biomes, modern, format, cx, cy as i32, cz, y_min);
+            pixel_buffer[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
         }
     }
 }
@@ -714,7 +957,7 @@ pub fn draw_caves(
     }
     let (level, sections, y_min) = sections_and_level(root, format);
     let modern = is_modern(format);
-    let indexed = index_sections(sections, format, height, y_min);
+    let indexed = index_sections(sections, format, height, y_min, cm);
     let chunk_biomes = if modern {
         None
     } else {
@@ -727,38 +970,59 @@ pub fn draw_caves(
         height.clamp(0, 255)
     };
     let start = ((abs_h >> 4).min(indexed.len() as i32 - 1)).max(0) as usize;
+    let oob = oob_entry(cm);
+    let mut memo = RgbMemo::default();
     for cx in (0..16usize).step_by(scale as usize) {
         'zloop: for cz in (0..16usize).step_by(scale as usize) {
             let pixel_index =
                 (z + (cz >> scale_bits)) * (512 >> scale_bits) + (x + (cx >> scale_bits));
             let mut ignored = 0;
             let mut done_skipping = false;
+            let col = cz * 16 + cx;
             for s in indexed[..=start].iter().rev().flatten() {
+                if s.caves_inert {
+                    continue;
+                }
+                let uniform = s.longs.is_empty();
+                let ipl = s.indexes_per_long;
+                let top_index = s.start_height as usize * 256 + col;
+                let mut li = top_index / ipl;
+                let mut rem = top_index % ipl;
+                let step_li = 256 / ipl;
+                let step_rem = 256 % ipl;
+                let mask = (1u64 << s.bits) - 1;
                 for cy in (0..=s.start_height).rev() {
-                    let entry = get_block(s, cx, cy as usize, cz);
-                    let name = palette_name(entry, format);
-                    if !cm.is_transparent(name) && !cm.is_foliage(name) {
+                    let e = if uniform {
+                        s.entries.first().unwrap_or(&oob)
+                    } else {
+                        let v = s.longs.get(li).copied().unwrap_or(0);
+                        let pi = ((v >> (rem * s.bits)) & mask) as usize;
+                        if cy > 0 {
+                            if rem < step_rem {
+                                rem += ipl;
+                                li -= 1;
+                            }
+                            rem -= step_rem;
+                            li -= step_li;
+                        }
+                        s.entries.get(pi).unwrap_or(&oob)
+                    };
+                    if e.flags & (F_TRANSPARENT | F_FOLIAGE) == 0 {
                         if done_skipping {
-                            let props = palette_props(entry);
-                            let bk = if modern {
-                                BiomeKey::Name(get_biome_packed(s, cx, cy as usize, cz, format))
-                            } else {
-                                BiomeKey::Idx(biome_int(
-                                    chunk_biomes,
-                                    cx,
-                                    s.section_height + cy,
-                                    cz,
-                                    format,
-                                    y_min,
-                                ))
-                            };
-                            pixel_buffer[pixel_index] = cm.get_rgb(name, props, bk);
+                            let bk =
+                                || biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min);
+                            pixel_buffer[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
                             terrain_heights[pixel_index] = (s.section_height + cy) as i16;
                             continue 'zloop;
                         }
                         ignored += 1;
                     } else if ignored > 0 {
                         done_skipping = true;
+                    }
+                    if uniform {
+                        // every row holds the same entry — repeated rows can
+                        // only repeat the first row's effect.
+                        break;
                     }
                 }
             }

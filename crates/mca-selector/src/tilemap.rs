@@ -10,7 +10,7 @@ use mc_core::render;
 use mc_core::selection::{ChunkSet, Selection};
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Arc;
 
 pub const TILE_SIZE: usize = 512;
 pub const CHUNK_GRID_SCALE: f32 = 1.5;
@@ -41,12 +41,15 @@ pub fn get_zoom_level(scale: f32) -> i32 {
 /// Tile = one region. Image = argb pixels of size 512/zoomLevel.
 pub struct Tile {
     pub location: Point2i,
-    /// argb buffer + its zoom level (image size = 512/zoom)
-    pub image: Option<(Vec<u32>, i32)>,
+    /// argb buffer + its zoom level (image size = 512/zoom); shared with the
+    /// memory pool via Arc so handoffs are refcount bumps, not buffer copies
+    pub image: Option<(Arc<Vec<u32>>, i32)>,
     pub loaded: bool,
     pub overlay_data: Option<std::sync::Arc<[i32; 1024]>>,
     pub overlay_loaded: bool,
     pub structures: Option<HashMap<i64, Vec<String>>>,
+    /// structure disk-cache lookup was already attempted for this image
+    pub structures_checked: bool,
     /// gpu-ready image, built when the argb result lands
     pub render_image: Option<std::sync::Arc<gpui::RenderImage>>,
     /// gpu-ready 32x32 overlay image
@@ -62,6 +65,7 @@ impl Tile {
             overlay_data: None,
             overlay_loaded: false,
             structures: None,
+            structures_checked: false,
             render_image: None,
             overlay_render_image: None,
         }
@@ -138,10 +142,15 @@ pub struct TileMapState {
     pub hovered_block: Option<Point2i>,
     pub pasted: Option<Pasted>,
     pub disabled: bool,
-    /// memory image pool: zoomLevel -> lru region->image
-    pub pool: HashMap<i32, HashMap<i64, Vec<u32>>>,
-    pub pool_order: HashMap<i32, Vec<i64>>, // insertion order for trim
+    /// memory image pool: zoomLevel -> region->image (buffers shared with tiles)
+    pub pool: HashMap<i32, HashMap<i64, Arc<Vec<u32>>>>,
+    pub pool_order: HashMap<i32, Vec<i64>>, // keys currently in the pool, for trim
     pub loading: HashSet<i64>,
+    /// visible bounds `tile_priorities` was last built for — rebuilding the
+    /// map is skipped while the viewport stays put
+    prio_bounds: Option<(Point2i, Point2i)>,
+    /// amortizes the O(visible regions) visible-set build in `trim_pool`
+    pool_trim_defer: u32,
     pub results_rx: Option<Receiver<TileResult>>,
     pub result_tx: Sender<TileResult>,
     /// active overlay parser (overlayPool.parser)
@@ -186,6 +195,8 @@ impl TileMapState {
             pool: HashMap::new(),
             pool_order: HashMap::new(),
             loading: HashSet::new(),
+            prio_bounds: None,
+            pool_trim_defer: 0,
             results_rx: Some(rx),
             result_tx: tx,
             overlay: None,
@@ -218,8 +229,13 @@ impl TileMapState {
 
 
     /// spiral iteration center-out with limit (priorities).
-    pub fn for_visible_regions_spiral(&self, limit: usize, mut f: impl FnMut(Point2i)) {
+    pub fn for_visible_regions_spiral(&self, limit: usize, f: impl FnMut(Point2i)) {
         let (min, max) = self.visible_region_bounds(Point2f::ZERO);
+        Self::for_regions_spiral(min, max, limit, f);
+    }
+
+    /// spiral over an explicit region rectangle, center-out, capped at `limit`.
+    fn for_regions_spiral(min: Point2i, max: Point2i, limit: usize, mut f: impl FnMut(Point2i)) {
         let mid = min
             .region_to_block()
             .add_p(max.region_to_block())
@@ -310,6 +326,7 @@ impl TileMapState {
                 t.image = None;
                 t.render_image = None;
                 t.structures = None;
+                t.structures_checked = false;
             }
             if overlay {
             }
@@ -529,9 +546,8 @@ impl TileMapState {
     }
 
     /// region file path for a tile
-    pub fn mca_path(&self, r: Point2i) -> Option<std::path::PathBuf> {
-        let w = crate::config::world()?;
-        Some(w.region_dir().join(files::mca_file_name(r)))
+    fn mca_path(&self, ws: &crate::config::WorldState, r: Point2i) -> Option<std::path::PathBuf> {
+        Some(ws.region_dir().join(files::mca_file_name(r)))
     }
 
     // -- the periodic update (updateService) ------------------------------------
@@ -540,15 +556,23 @@ impl TileMapState {
     /// evict tiles outside the viewport margin — O(total tiles), so it runs
     /// on the slow poll rather than per scroll event.
     pub fn evict_invisible(&mut self) {
-        let mut to_remove = Vec::new();
-        for (k, t) in &self.tiles {
-            if !t.is_visible(self, TILE_VISIBILITY_THRESHOLD) {
-                to_remove.push(*k);
-            }
-        }
-        for k in to_remove {
-            self.tiles.remove(&k);
-        }
+        // visibility bounds in region coords, computed once (per-tile
+        // is_visible() used to redo the whole float pipeline each call).
+        let t = TILE_VISIBILITY_THRESHOLD * TILE_SIZE as i32;
+        let o = self.offset.to_point2i();
+        let min = o.sub_v(t, t).block_to_region();
+        let max = Point2i::new(
+            (o.x as f32 + self.width * self.scale) as i32,
+            (o.z as f32 + self.height * self.scale) as i32,
+        )
+        .add(t, t)
+        .block_to_region();
+        // key encodes (x << 32) | z — same decode as Point2i::from_long.
+        self.tiles.retain(|k, _| {
+            let x = (*k >> 32) as i32;
+            let z = *k as i32;
+            x >= min.x && z >= min.z && x <= max.x && z <= max.z
+        });
     }
 
     /// TileMap.initUpdateService: assign priorities center-out, request images.
@@ -560,61 +584,92 @@ impl TileMapState {
         // at max zoom-out a huge screen can see >100k regions; loading all of
         // them exhausts file descriptors, the job queue and the GPU atlas.
         let zoom_level = get_zoom_level(self.scale);
-        let mut new_prios = HashMap::new();
-        let mut prio = 1i64;
-        let mut requests: Vec<Point2i> = Vec::new();
-        self.for_visible_regions_spiral(MAX_TILE_REQUESTS, |region| {
-            new_prios.insert(region.as_long(), prio);
-            prio += 1;
-            requests.push(region);
-        });
-        self.tile_priorities = new_prios;
+        let bounds = self.visible_region_bounds(Point2f::ZERO);
+        let visible = (bounds.1.x as i64 - bounds.0.x as i64 + 1)
+            .saturating_mul(bounds.1.z as i64 - bounds.0.z as i64 + 1)
+            .clamp(0, MAX_TILE_REQUESTS as i64) as usize;
+        let mut requests: Vec<Point2i> = Vec::with_capacity(visible);
+        if self.prio_bounds == Some(bounds) {
+            // viewport unchanged: the spiral (and thus every priority value)
+            // is identical to last update — keep the existing map.
+            Self::for_regions_spiral(bounds.0, bounds.1, MAX_TILE_REQUESTS, |region| {
+                requests.push(region);
+            });
+        } else {
+            let mut new_prios = HashMap::with_capacity(visible);
+            let mut prio = 1i64;
+            Self::for_regions_spiral(bounds.0, bounds.1, MAX_TILE_REQUESTS, |region| {
+                new_prios.insert(region.as_long(), prio);
+                prio += 1;
+                requests.push(region);
+            });
+            self.tile_priorities = new_prios;
+            self.prio_bounds = Some(bounds);
+        }
 
-        let header_zoom = ws.cfg.render_header_only_zoom_level;
         for region in requests {
-            if !self.tiles.contains_key(&region.as_long()) {
-                self.tiles.insert(region.as_long(), Tile::new(region));
-            }
-            let need_overlay = self.overlay.is_some()
-                && !self.tiles.get(&region.as_long()).map(|t| t.overlay_loaded).unwrap_or(false);
-            let tile = self.tiles.get_mut(&region.as_long()).unwrap();
-            if tile.image.is_some() && tile.loaded {
-                let img_zoom = tile.image_zoom_level();
-                if img_zoom < zoom_level {
-                    // image has more detail than needed — downscale instantly
-                    // (upstream's pyramid does the same) instead of paying a
-                    // full NBT re-render on zoom-out.
-                    if let Some((img, _)) = tile.image.take() {
-                        let from = (img.len() as f64).sqrt() as usize;
-                        let to = (TILE_SIZE / zoom_level as usize).max(1);
-                        let scaled = if from > to {
-                            render::scale_down(&img, from, to)
-                        } else {
-                            img
-                        };
-                        tile.render_image = argb_to_render_image(&scaled, to);
-                        tile.image = Some((scaled.clone(), zoom_level));
-                        self.push_pool(zoom_level, region, scaled);
+            let key = region.as_long();
+            // single lookup per region (was contains+get+get_mut).
+            let (downscale, request, need_overlay) = {
+                let tile = self.tiles.entry(key).or_insert_with(|| Tile::new(region));
+                let need_overlay = self.overlay.is_some() && !tile.overlay_loaded;
+                let (downscale, request) = if tile.image.is_some() && tile.loaded {
+                    match tile.image_zoom_level().cmp(&zoom_level) {
+                        std::cmp::Ordering::Less => (true, false),
+                        // image already at the right zoom: upstream's pool
+                        // would just hand back the same buffer. re-requesting
+                        // here paid a pooled-buffer clone + RenderImage
+                        // rebuild for every visible tile on every update.
+                        std::cmp::Ordering::Equal => (false, false),
+                        // zoomed in past the image's resolution — need a render
+                        std::cmp::Ordering::Greater => (false, true),
                     }
                 } else {
-                    // zoomed in past the image's resolution — need a render
-                    self.request_image(region, zoom_level);
+                    (false, !tile.loaded)
+                };
+                (downscale, request, need_overlay)
+            };
+            if downscale {
+                // image has more detail than needed — downscale instantly
+                // (upstream's pyramid does the same) instead of paying a
+                // full NBT re-render on zoom-out.
+                if let Some((img, _)) = self.tiles.get_mut(&key).and_then(|t| t.image.take()) {
+                    let from = (img.len() as f64).sqrt() as usize;
+                    let to = (TILE_SIZE / zoom_level as usize).max(1);
+                    let scaled: Arc<Vec<u32>> = if from > to {
+                        Arc::new(render::scale_down(&img, from, to))
+                    } else {
+                        img
+                    };
+                    if let Some(tile) = self.tiles.get_mut(&key) {
+                        tile.render_image = argb_to_render_image(&scaled, to);
+                        tile.image = Some((scaled.clone(), zoom_level));
+                    }
+                    self.push_pool(zoom_level, region, scaled);
                 }
-            } else if !tile.loaded {
-                self.request_image(region, zoom_level);
+            } else if request {
+                self.request_image(&ws, region, zoom_level);
+            } else {
+                // ready tile: pick up cached structure data once, then this
+                // becomes a couple of hash lookups per update.
+                self.fetch_or_parse_structures(&ws, region);
             }
             if need_overlay {
-                self.request_overlay(region);
+                self.request_overlay(&ws, region);
             }
         }
     }
 
     /// OverlayPool.requestImage: parse overlay data for a region and send back
     /// the 32x32 color-graded image.
-    fn request_overlay(&mut self, region: Point2i) {
-        let Some(ov) = self.overlay.clone() else { return };
-        if !ov.is_valid() || !ov.active {
-            return;
+    fn request_overlay(&mut self, ws: &crate::config::WorldState, region: Point2i) {
+        {
+            // cheap checks first: this runs per visible region per update, so
+            // cloning the Overlay before the dedupe was an alloc storm.
+            let Some(ov) = self.overlay.as_ref() else { return };
+            if !ov.is_valid() || !ov.active {
+                return;
+            }
         }
         if !self.regions.contains(&region.as_long()) {
             if let Some(t) = self.tiles.get_mut(&region.as_long()) {
@@ -625,16 +680,13 @@ impl TileMapState {
         if !self.overlay_loading.insert(region.as_long()) {
             return;
         }
-        let Some(path) = self.mca_path(region) else { return };
+        let Some(ov) = self.overlay.clone() else { return };
+        let Some(path) = self.mca_path(ws, region) else { return };
         let tx = self.result_tx.clone();
         let priority = self.tile_priority(region);
         let name = files::mca_file_name(region);
-        let poi_path = crate::config::world()
-            .and_then(|w| w.dirs.poi.clone())
-            .map(|d| d.join(&name));
-        let ent_path = crate::config::world()
-            .and_then(|w| w.dirs.entities.clone())
-            .map(|d| d.join(&name));
+        let poi_path = ws.dirs.poi.clone().map(|d| d.join(&name));
+        let ent_path = ws.dirs.entities.clone().map(|d| d.join(&name));
         jobs::pools().add_process(Job::new(
             jobs::PRIORITY_MEDIUM,
             Some(Box::new(move || priority)),
@@ -760,55 +812,55 @@ impl TileMapState {
     }
 
     /// ImagePool.requestImage.
-    pub fn request_image(&mut self, region: Point2i, zoom_level: i32) {
-        let Some(ws) = crate::config::world() else { return };
-        if !self.regions.contains(&region.as_long()) {
-            if let Some(t) = self.tiles.get_mut(&region.as_long()) {
+    fn request_image(&mut self, ws: &crate::config::WorldState, region: Point2i, zoom_level: i32) {
+        let key = region.as_long();
+        if !self.regions.contains(&key) {
+            if let Some(t) = self.tiles.get_mut(&key) {
                 t.loaded = true;
             }
             return;
         }
-        if self.loading.contains(&region.as_long()) {
+        if self.loading.contains(&key) {
             return;
         }
         if self.loading.len() >= MAX_IN_FLIGHT_LOADS {
             return;
         }
 
-        if let Some(img) = self.pool.get(&zoom_level).and_then(|m| m.get(&region.as_long())) {
+        if let Some(img) = self.pool.get(&zoom_level).and_then(|m| m.get(&key)) {
             let img = img.clone();
-            let t = self.tiles.get_mut(&region.as_long()).unwrap();
+            let t = self.tiles.get_mut(&key).unwrap();
             t.image = Some((img.clone(), zoom_level));
             t.render_image = argb_to_render_image(&img, TILE_SIZE / zoom_level as usize);
             t.loaded = true;
-            self.fetch_or_parse_structures(region);
+            self.fetch_or_parse_structures(ws, region);
             return;
         }
         for zl in (1..=crate::config::MAX_ZOOM_LEVEL).step_by(1) {
             if (zl & (zl - 1)) != 0 || zl == zoom_level {
                 continue;
             }
-            if let Some(img) = self.pool.get(&zl).and_then(|m| m.get(&region.as_long())) {
+            if let Some(img) = self.pool.get(&zl).and_then(|m| m.get(&key)) {
                 let img = img.clone();
                 if zl < zoom_level {
                     // larger than needed -> scale down
                     let from = TILE_SIZE / zl as usize;
                     let to = TILE_SIZE / zoom_level as usize;
-                    let scaled = render::scale_down(&img, from, to);
+                    let scaled = Arc::new(render::scale_down(&img, from, to));
                     self.push_pool(zoom_level, region, scaled.clone());
-                    let t = self.tiles.get_mut(&region.as_long()).unwrap();
+                    let t = self.tiles.get_mut(&key).unwrap();
                     t.render_image = argb_to_render_image(&scaled, TILE_SIZE / zoom_level as usize);
                     t.image = Some((scaled, zoom_level));
                     t.loaded = true;
-                    self.fetch_or_parse_structures(region);
+                    self.fetch_or_parse_structures(ws, region);
                     return;
                 } else {
                     // lower res: use anyway, keep looking on disk
-                    let t = self.tiles.get_mut(&region.as_long()).unwrap();
+                    let t = self.tiles.get_mut(&key).unwrap();
                     t.render_image = argb_to_render_image(&img, TILE_SIZE / zoom_level as usize);
                     t.image = Some((img, zoom_level));
                     t.loaded = true;
-                    self.fetch_or_parse_structures(region);
+                    self.fetch_or_parse_structures(ws, region);
                     break;
                 }
             }
@@ -816,14 +868,15 @@ impl TileMapState {
 
         if zoom_level >= 32 {
             if let Some((img, _)) = cache::get_lod_image(&ws.uuid, region) {
+                let img = Arc::new(img);
                 self.push_pool(zoom_level, region, img.clone());
-                if let Some(t) = self.tiles.get_mut(&region.as_long()) {
+                if let Some(t) = self.tiles.get_mut(&key) {
                     t.render_image = argb_to_render_image(&img, TILE_SIZE / zoom_level as usize);
                     t.image = Some((img, zoom_level));
                 }
-                if self.is_image_outdated(region) {
+                if self.is_image_outdated(ws, region) {
                     self.discard_cached_image(region);
-                    if let Some(t) = self.tiles.get_mut(&region.as_long()) {
+                    if let Some(t) = self.tiles.get_mut(&key) {
                         t.loaded = false;
                     }
                 }
@@ -860,24 +913,24 @@ impl TileMapState {
         // unreadable so we render real LOD tiles instead).
         if zoom_level >= ws.cfg.render_header_only_zoom_level {
             if let Some(cs) = cache::get_chunks(&ws.uuid, region) {
-                let t = self.tiles.get_mut(&region.as_long()).unwrap();
+                let t = self.tiles.get_mut(&key).unwrap();
                 if !t.loaded {
                     let img = render::lod_image(&cs, ws.cfg.zoom_level_lod_color);
                     t.render_image = argb_to_render_image(&img, 32);
-                    t.image = Some((img, zoom_level));
+                    t.image = Some((Arc::new(img), zoom_level));
                 }
             }
         }
 
-        if self.loading.contains(&region.as_long()) {
+        if self.loading.contains(&key) {
             return;
         }
         let tx = self.result_tx.clone();
-        let path = match self.mca_path(region) {
+        let path = match self.mca_path(ws, region) {
             Some(p) => p,
             None => return,
         };
-        self.loading.insert(region.as_long());
+        self.loading.insert(key);
         let cfg = mc_core::render::RenderSettings {
             render_height: ws.cfg.render_height,
             layer_only: ws.cfg.render_layer_only,
@@ -962,25 +1015,32 @@ impl TileMapState {
         true
     }
 
-    fn fetch_or_parse_structures(&mut self, region: Point2i) {
-        let Some(ws) = crate::config::world() else { return };
-        if let Some(s) = cache::get_structures(&ws.uuid, region) {
-            if let Some(t) = self.tiles.get_mut(&region.as_long()) {
+    fn fetch_or_parse_structures(&mut self, ws: &crate::config::WorldState, region: Point2i) {
+        let key = region.as_long();
+        // one-shot: the structures cache file can only be written by a
+        // completed render job (which sets `structures` directly), so
+        // re-reading it every update for every visible tile was pure syscalls.
+        match self.tiles.get(&key) {
+            Some(t) if t.structures.is_none() && !t.structures_checked => {}
+            _ => return,
+        }
+        let s = cache::get_structures(&ws.uuid, region);
+        if let Some(t) = self.tiles.get_mut(&key) {
+            t.structures_checked = true;
+            if let Some(s) = s {
                 t.structures = Some(s);
             }
-            return;
         }
         // structure parsing piggybacks on the normal image job in our impl
     }
 
-    fn is_image_outdated(&self, region: Point2i) -> bool {
-        let Some(ws) = crate::config::world() else { return false };
+    fn is_image_outdated(&self, ws: &crate::config::WorldState, region: Point2i) -> bool {
         let t = cache::get_file_time(&ws.uuid, region);
         if t == -1 {
             return false;
         }
         let mt = self
-            .mca_path(region)
+            .mca_path(ws, region)
             .and_then(|p| std::fs::metadata(p).ok())
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -989,10 +1049,9 @@ impl TileMapState {
         t != mt
     }
 
-    fn record_file_time(&self, region: Point2i) {
-        let Some(ws) = crate::config::world() else { return };
+    fn record_file_time(&self, ws: &crate::config::WorldState, region: Point2i) {
         let mt = self
-            .mca_path(region)
+            .mca_path(ws, region)
             .and_then(|p| std::fs::metadata(p).ok())
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1001,16 +1060,21 @@ impl TileMapState {
         cache::set_file_time(&ws.uuid, region, mt);
     }
 
-    fn push_pool(&mut self, zoom: i32, region: Point2i, img: Vec<u32>) {
-        self.pool
-            .entry(zoom)
-            .or_default()
-            .insert(region.as_long(), img);
-        let order = self.pool_order.entry(zoom).or_default();
-        order.retain(|r| *r != region.as_long());
-        order.push(region.as_long());
+    fn push_pool(&mut self, zoom: i32, region: Point2i, img: Arc<Vec<u32>>) {
+        let key = region.as_long();
+        // trim removes every non-visible entry anyway, so position in `order`
+        // is irrelevant — a plain deduped append keeps pushes O(1) instead of
+        // the old O(pool size) retain-per-push.
+        if self.pool.entry(zoom).or_default().insert(key, img).is_none() {
+            self.pool_order.entry(zoom).or_default().push(key);
+        }
         self.trim_pool(zoom);
     }
+
+    /// run the full visible-set trim at most every Nth over-limit push — the
+    /// trim itself is O(visible regions) and used to run per pooled image,
+    /// which went quadratic while panning at far zoom.
+    const POOL_TRIM_EVERY: u32 = 16;
 
     /// ImagePool.trim — keep pool size <= visibleTiles * IMAGE_POOL_SIZE.
     fn trim_pool(&mut self, zoom: i32) {
@@ -1022,6 +1086,11 @@ impl TileMapState {
         if entry <= limit {
             return;
         }
+        self.pool_trim_defer += 1;
+        if self.pool_trim_defer < Self::POOL_TRIM_EVERY {
+            return;
+        }
+        self.pool_trim_defer = 0;
         let scale = self.scale * 2.0;
         let (min, max) = {
             let old = self.scale;
@@ -1057,6 +1126,9 @@ impl TileMapState {
             for o in self.pool_order.values_mut() {
                 o.retain(|r| *r != region.as_long());
             }
+            if let Some(t) = self.tiles.get_mut(&region.as_long()) {
+                t.structures_checked = false;
+            }
             cache::delete_data(&ws.uuid, region);
             for zl in [1, 2, 4, 8, 16, 32] {
                 let _ = std::fs::remove_file(files::png_cache_path(&ws.cache_dir, zl, region));
@@ -1091,6 +1163,12 @@ impl TileMapState {
                 pending.push(res);
             }
         }
+        if pending.is_empty() {
+            return false;
+        }
+        // world lookup hoisted: it takes a lock + clones strings, and used to
+        // run 2-3x per drained result.
+        let ws = crate::config::world();
         for res in pending {
             changed = true;
             match res {
@@ -1101,7 +1179,9 @@ impl TileMapState {
                     structures,
                     cache_write,
                 } => {
-                    self.loading.remove(&region.as_long());
+                    let key = region.as_long();
+                    self.loading.remove(&key);
+                    let image = image.map(Arc::new);
                     // renders that landed at a stale zoom are still valid
                     // data — keep them in the pool but don't clobber the
                     // tile's current-zoom image.
@@ -1114,31 +1194,26 @@ impl TileMapState {
                     if let Some(img) = &image {
                         self.push_pool(zoom, region, img.clone());
                     }
-                    if let Some(t) = self.tiles.get_mut(&region.as_long()) {
+                    if let Some(t) = self.tiles.get_mut(&key) {
                         if let Some(img) = image {
                             let size = TILE_SIZE / zoom as usize;
-                            let mut rgba = Vec::with_capacity(size * size * 4);
-                            for &p in img.iter() {
-                                rgba.push((p >> 16) as u8);
-                                rgba.push((p >> 8) as u8);
-                                rgba.push(p as u8);
-                                rgba.push((p >> 24) as u8);
-                            }
-                            if let Some(buf) = image::RgbaImage::from_raw(size as u32, size as u32, rgba) {
-                                let frame = image::Frame::new(buf);
-                                t.render_image = Some(std::sync::Arc::new(gpui::RenderImage::new(smallvec::SmallVec::from_elem(frame, 1))));
+                            if let Some(ri) = argb_to_render_image(&img, size) {
+                                t.render_image = Some(ri);
                             }
                             t.image = Some((img, zoom));
                         }
                         if let Some(s) = structures {
                             t.structures = Some(s);
+                            t.structures_checked = true;
                         }
                         t.loaded = true;
                     }
-                    if cache_write {
-                        self.write_image_cache(region, zoom);
+                    if let Some(ws) = &ws {
+                        if cache_write {
+                            self.write_image_cache(ws, region, zoom);
+                        }
+                        self.record_file_time(ws, region);
                     }
-                    self.record_file_time(region);
                 }
                 TileResult::Overlay { region, image, data } => {
                     self.overlay_loading.remove(&region.as_long());
@@ -1158,8 +1233,7 @@ impl TileMapState {
     }
 
     /// write the tile's current image to the disk caches (RegionImageGeneratorSaveJob).
-    fn write_image_cache(&self, region: Point2i, zoom: i32) {
-        let Some(ws) = crate::config::world() else { return };
+    fn write_image_cache(&self, ws: &crate::config::WorldState, region: Point2i, zoom: i32) {
         let Some(t) = self.tiles.get(&region.as_long()) else { return };
         let Some((img, _)) = &t.image else { return };
         if zoom >= 32 {

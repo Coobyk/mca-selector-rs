@@ -114,11 +114,17 @@ pub struct ColorConfig {
 
 impl ColorConfig {
     pub fn get_color(&self, name: &str, biome: &str, properties: Option<&Compound>) -> BlockColor {
-        let state = self.states.get_state(properties);
+        self.get_color_state(name, biome, self.states.get_state(properties).as_ref())
+    }
+
+    /// get_color with the block-state bitset already resolved. The renderer
+    /// computes each palette entry's state once instead of calling get_state
+    /// (which allocates a BitSet) for every column.
+    pub fn get_color_state(&self, name: &str, biome: &str, state: Option<&BitSet>) -> BlockColor {
         let block_color = self
             .colors
             .get(name)
-            .map(|sc| sc.color(state.as_ref()))
+            .map(|sc| sc.color(state))
             .unwrap_or(BlockColor {
                 color: MISSING_COLOR,
                 properties: 0,
@@ -128,7 +134,7 @@ impl ColorConfig {
                 .tint_cache
                 .get(name)
                 .and_then(|m| m.get(biome))
-                .map(|sc| sc.color(state.as_ref()));
+                .map(|sc| sc.color(state));
             return tinted.unwrap_or_else(|| {
                 self.tint_cache
                     .get(name)

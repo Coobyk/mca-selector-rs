@@ -6,6 +6,7 @@
 //! `rawArrays(true)` reader.
 
 use indexmap::IndexMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, Read, Write};
 
 pub const TAG_END: u8 = 0;
@@ -22,7 +23,63 @@ pub const TAG_COMPOUND: u8 = 10;
 pub const TAG_INT_ARRAY: u8 = 11;
 pub const TAG_LONG_ARRAY: u8 = 12;
 
-pub type Compound = IndexMap<String, Tag>;
+/// FxHash-family hasher for compound keys. NBT keys are short, trusted
+/// strings hashed on every parse insert and every render-time `get` —
+/// SipHash's DoS resistance isn't needed for local world data.
+#[derive(Default)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, w: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ w).wrapping_mul(FX_SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        // extra multiply so the high bits hashbrown uses for SIMD tags
+        // carry entropy even for short keys
+        self.hash.wrapping_mul(FX_SEED)
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut b = bytes;
+        while b.len() >= 8 {
+            self.add(u64::from_ne_bytes(b[..8].try_into().unwrap()));
+            b = &b[8..];
+        }
+        if b.len() >= 4 {
+            self.add(u64::from(u32::from_ne_bytes(b[..4].try_into().unwrap())));
+            b = &b[4..];
+        }
+        for &x in b {
+            self.add(u64::from(x));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, n: u8) {
+        self.add(u64::from(n));
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+}
+
+/// BuildHasher for [`FxHasher`].
+pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
+
+pub type Compound = IndexMap<String, Tag, FxBuildHasher>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tag {
@@ -272,7 +329,12 @@ impl<R: Read> NbtReader<R> {
     fn string(&mut self) -> io::Result<String> {
         let len = self.u16()? as usize;
         let raw = self.bytes(len)?;
-        Ok(String::from_utf8_lossy(&raw).into_owned())
+        // String::from_utf8 reuses `raw`'s buffer on success (the common
+        // case) — one allocation instead of copy-into-new-String.
+        match String::from_utf8(raw) {
+            Ok(s) => Ok(s),
+            Err(e) => Ok(String::from_utf8_lossy(&e.into_bytes()).into_owned()),
+        }
     }
 
     
@@ -314,7 +376,8 @@ impl<R: Read> NbtReader<R> {
                 Tag::List(et, items)
             }
             TAG_COMPOUND => {
-                let mut map = Compound::default();
+                let mut map =
+                    Compound::with_capacity_and_hasher(8, FxBuildHasher::default());
                 loop {
                     let t = self.u8()?;
                     if t == TAG_END {
@@ -331,9 +394,11 @@ impl<R: Read> NbtReader<R> {
                 if self.raw_arrays {
                     Tag::ByteArray(self.bytes(n * 4)?)
                 } else {
+                    // one bulk read + word-wise BE decode instead of n reads
+                    let raw = self.bytes(n * 4)?;
                     let mut v = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        v.push(self.i32()?);
+                    for c in raw.chunks_exact(4) {
+                        v.push(i32::from_be_bytes(c.try_into().unwrap()));
                     }
                     Tag::IntArray(v)
                 }
@@ -343,9 +408,10 @@ impl<R: Read> NbtReader<R> {
                 if self.raw_arrays {
                     Tag::ByteArray(self.bytes(n * 8)?)
                 } else {
+                    let raw = self.bytes(n * 8)?;
                     let mut v = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        v.push(self.i64()?);
+                    for c in raw.chunks_exact(8) {
+                        v.push(i64::from_be_bytes(c.try_into().unwrap()));
                     }
                     Tag::LongArray(v)
                 }
@@ -366,6 +432,15 @@ pub fn write_nbt<W: Write>(w: &mut W, name: &str, tag: &Tag) -> io::Result<()> {
     w.write_all(&(name.len() as u16).to_be_bytes())?;
     w.write_all(name.as_bytes())?;
     write_payload(w, tag)
+}
+
+/// Serialize a compound borrowed as the root tag — same byte layout as
+/// `write_nbt(w, name, &Tag::Compound(c))` without owning a Tag.
+pub fn write_root_compound<W: Write>(w: &mut W, name: &str, c: &Compound) -> io::Result<()> {
+    w.write_all(&[TAG_COMPOUND])?;
+    w.write_all(&(name.len() as u16).to_be_bytes())?;
+    w.write_all(name.as_bytes())?;
+    write_compound_entries(w, c)
 }
 
 fn wstr<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
@@ -399,29 +474,33 @@ fn write_payload<W: Write>(w: &mut W, tag: &Tag) -> io::Result<()> {
             }
             Ok(())
         }
-        Tag::Compound(c) => {
-            for (k, v) in c {
-                w.write_all(&[v.id()])?;
-                wstr(w, k)?;
-                write_payload(w, v)?;
-            }
-            w.write_all(&[TAG_END])
-        }
+        Tag::Compound(c) => write_compound_entries(w, c),
         Tag::IntArray(v) => {
             w.write_all(&(v.len() as i32).to_be_bytes())?;
+            let mut b = Vec::with_capacity(v.len() * 4);
             for i in v {
-                w.write_all(&i.to_be_bytes())?;
+                b.extend_from_slice(&i.to_be_bytes());
             }
-            Ok(())
+            w.write_all(&b)
         }
         Tag::LongArray(v) => {
             w.write_all(&(v.len() as i32).to_be_bytes())?;
+            let mut b = Vec::with_capacity(v.len() * 8);
             for i in v {
-                w.write_all(&i.to_be_bytes())?;
+                b.extend_from_slice(&i.to_be_bytes());
             }
-            Ok(())
+            w.write_all(&b)
         }
     }
+}
+
+fn write_compound_entries<W: Write>(w: &mut W, c: &Compound) -> io::Result<()> {
+    for (k, v) in c {
+        w.write_all(&[v.id()])?;
+        wstr(w, k)?;
+        write_payload(w, v)?;
+    }
+    w.write_all(&[TAG_END])
 }
 
 // ---------------------------------------------------------------------------
@@ -987,9 +1066,9 @@ mod snbt_tests {
 
     #[test]
     fn path_mutations() {
-        let mut c = Compound::new();
+        let mut c = Compound::default();
         c.insert("a".into(), Tag::Compound({
-            let mut x = Compound::new();
+            let mut x = Compound::default();
             x.insert("b".into(), Tag::Int(7));
             x.insert("l".into(), Tag::List(1, vec![Tag::Byte(1), Tag::Byte(2)]));
             x
