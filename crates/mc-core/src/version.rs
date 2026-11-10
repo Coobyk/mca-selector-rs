@@ -498,6 +498,7 @@ pub fn draw_chunk(
         height.clamp(0, 255)
     };
     let start = ((abs_h >> 4).min(indexed.len() as i32 - 1)).max(0) as usize;
+    let mut memo = RgbMemo::default();
 
     for cx in (0..16usize).step_by(scale as usize) {
         'zloop: for cz in (0..16usize).step_by(scale as usize) {
@@ -527,7 +528,7 @@ pub fn draw_chunk(
                     if out.water {
                         let wh = out.water_heights.as_deref_mut().unwrap();
                         if !water_depth {
-                            out.pixel_buffer[pixel_index] = cm.get_rgb(name, props, bk);
+                            out.pixel_buffer[pixel_index] = memo.get(cm, name, props, bk);
                             wh[pixel_index] = (s.section_height + cy) as i16;
                         }
                         if cm.is_water(name) {
@@ -535,25 +536,52 @@ pub fn draw_chunk(
                             continue;
                         } else if cm.is_waterlogged(props) {
                             out.pixel_buffer[pixel_index] =
-                                cm.get_rgb(WATER_DUMMY_NAME, None, bk);
+                                memo.get(cm, WATER_DUMMY_NAME, None, bk);
                             if let Some(wp) = out.water_pixels.as_deref_mut() {
-                                wp[pixel_index] = cm.get_rgb(name, props, bk);
+                                wp[pixel_index] = memo.get(cm, name, props, bk);
                             }
                             wh[pixel_index] = (s.section_height + cy) as i16;
                             out.terrain_heights[pixel_index] =
                                 (s.section_height + cy - 1) as i16;
                             continue 'zloop;
                         } else if let Some(wp) = out.water_pixels.as_deref_mut() {
-                            wp[pixel_index] = cm.get_rgb(name, props, bk);
+                            wp[pixel_index] = memo.get(cm, name, props, bk);
                         }
                     } else {
-                        out.pixel_buffer[pixel_index] = cm.get_rgb(name, props, bk);
+                        out.pixel_buffer[pixel_index] = memo.get(cm, name, props, bk);
                     }
                     out.terrain_heights[pixel_index] = (s.section_height + cy) as i16;
                     continue 'zloop;
                 }
             }
         }
+    }
+}
+
+
+/// per-chunk rgb memo: within one chunk, block/biome names and props are
+/// borrowed palette entries — pointer + len is a stable identity, so
+/// (name, props, biome) -> rgb can be memoized instead of re-running
+/// get_state + the 3-level string-keyed lookups per column.
+#[derive(Default)]
+struct RgbMemo {
+    map: std::collections::HashMap<(usize, usize, usize, usize), u32>,
+}
+impl RgbMemo {
+    #[inline]
+    fn get(&mut self, cm: &ColorMap, name: &str, props: Option<&Compound>, bk: BiomeKey) -> u32 {
+        let bk_key = match bk {
+            BiomeKey::Name(s) => (s.as_ptr() as usize) ^ (s.len() << 20),
+            BiomeKey::Idx(i) => (i as usize) << 40 | 1,
+        };
+        let props_ptr = props.map(|p| p as *const _ as usize).unwrap_or(0);
+        let key = (name.as_ptr() as usize, name.len(), props_ptr, bk_key);
+        if let Some(&c) = self.map.get(&key) {
+            return c;
+        }
+        let c = cm.get_rgb(name, props, bk);
+        self.map.insert(key, c);
+        c
     }
 }
 
