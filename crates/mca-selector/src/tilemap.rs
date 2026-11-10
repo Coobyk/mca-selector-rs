@@ -840,72 +840,19 @@ impl TileMapState {
             }
         }
 
-        let header_only = zoom_level >= ws.cfg.render_header_only_zoom_level;
-        if header_only {
-            // try cached chunk set
+        // far zoom: paint the cheap chunk-presence map instantly as a
+        // placeholder, but let the real render below produce actual terrain
+        // (upstream's presence map is the final image; the green field is
+        // unreadable so we render real LOD tiles instead).
+        if zoom_level >= ws.cfg.render_header_only_zoom_level {
             if let Some(cs) = cache::get_chunks(&ws.uuid, region) {
-                let img = render::lod_image(&cs, ws.cfg.zoom_level_lod_color);
                 let t = self.tiles.get_mut(&region.as_long()).unwrap();
-                t.render_image = argb_to_render_image(&img, 32);
-                t.image = Some((img, zoom_level));
-                t.loaded = true;
-                return;
+                if !t.loaded {
+                    let img = render::lod_image(&cs, ws.cfg.zoom_level_lod_color);
+                    t.render_image = argb_to_render_image(&img, 32);
+                    t.image = Some((img, zoom_level));
+                }
             }
-            if self.loading.contains(&region.as_long()) {
-                return;
-            }
-            self.loading.insert(region.as_long());
-            let tx = self.result_tx.clone();
-            let path = match self.mca_path(region) {
-                Some(p) => p,
-                None => return,
-            };
-            let uuid = ws.uuid.clone();
-            let lod_color = ws.cfg.zoom_level_lod_color;
-            let priority = self.tile_priority(region);
-            jobs::pools().add_process(Job::new(
-                jobs::PRIORITY_LOW,
-                Some(Box::new(move || priority)),
-                move || {
-                    let mut m = match McaFile::new(path) {
-                        Ok(m) => m,
-                        Err(_) => {
-                            let _ = tx.send(TileResult::Image {
-                                region,
-                                image: None,
-                                zoom: zoom_level,
-                                structures: None,
-                                cache_write: false,
-                            });
-                            return;
-                        }
-                    };
-                    let res = m.load_offsets().map(|_| m.offsets_chunk_set()).ok();
-                    match res {
-                        Some(cs) => {
-                            cache::set_chunks(&uuid, region, &cs);
-                            let img = render::lod_image(&cs, lod_color);
-                            let _ = tx.send(TileResult::Image {
-                                region,
-                                image: Some(img),
-                                zoom: zoom_level,
-                                structures: None,
-                                cache_write: false,
-                            });
-                        }
-                        None => {
-                            let _ = tx.send(TileResult::Image {
-                                region,
-                                image: None,
-                                zoom: zoom_level,
-                                structures: None,
-                                cache_write: false,
-                            });
-                        }
-                    }
-                },
-            ));
-            return;
         }
 
         if self.loading.contains(&region.as_long()) {

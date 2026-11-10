@@ -380,8 +380,8 @@ impl BladeRenderer {
         let atlas = Arc::new(BladeAtlas::new(&context.gpu));
         let atlas_sampler = context.gpu.create_sampler(gpu::SamplerDesc {
             name: "path rasterization sampler",
-            mag_filter: gpu::FilterMode::Linear,
-            min_filter: gpu::FilterMode::Linear,
+            mag_filter: gpu::FilterMode::Nearest,
+            min_filter: gpu::FilterMode::Nearest,
             ..Default::default()
         });
 
