@@ -118,6 +118,11 @@ pub enum TileResult {
         /// write to disk cache as well
         cache_write: bool,
     },
+    /// far-zoom chunk-presence placeholder (sent before the real render)
+    Presence {
+        region: Point2i,
+        image: Vec<u32>,
+    },
     /// 32x32 ARGB overlay image (one pixel per chunk)
     Overlay {
         region: Point2i,
@@ -875,77 +880,16 @@ impl TileMapState {
             }
         }
 
-        // disk caches are only usable when the mca mtime AND the render
-        // settings fingerprint match — otherwise serve nothing and render.
-        let outdated = self.is_image_outdated(ws, region);
-        if outdated {
-            self.discard_cached_image(region);
-        }
-        if !outdated {
-            if zoom_level >= 32 {
-                if let Some((img, size)) = cache::get_lod_image(&ws.uuid, region) {
-                    let img = Arc::new(img);
-                    let img_zoom = (TILE_SIZE / size) as i32;
-                    self.push_pool(img_zoom, region, img.clone());
-                    if let Some(t) = self.tiles.get_mut(&key) {
-                        t.render_image = argb_to_render_image(&img, size);
-                        t.image = Some((img, img_zoom));
-                        t.loaded = true;
-                    }
-                    return;
-                }
-            } else {
-                let png = files::png_cache_path(&ws.cache_dir, zoom_level, region);
-                if png.exists() {
-                    if self.load_cached_image(region, png, zoom_level, zoom_level, hash) {
-                        return;
-                    }
-                }
-            }
-            for zl in [1, 2, 4, 8, 16, 32] {
-                if zl == zoom_level {
-                    continue;
-                }
-                let png = files::png_cache_path(&ws.cache_dir, zl, region);
-                if png.exists() {
-                    let (load_zl, target) = if zl < zoom_level {
-                        (zl, zoom_level)
-                    } else {
-                        (zl, zl)
-                    };
-                    if self.load_cached_image(region, png, load_zl, target, hash) {
-                        return;
-                    }
-                }
-            }
-        }
-
-        // far zoom: paint the cheap chunk-presence map instantly as a
-        // placeholder, but let the real render below produce actual terrain
-        // (upstream's presence map is the final image; the green field is
-        // unreadable so we render real LOD tiles instead).
-        if zoom_level >= ws.cfg.render_header_only_zoom_level {
-            if let Some(cs) = cache::get_chunks(&ws.uuid, region) {
-                let t = self.tiles.get_mut(&key).unwrap();
-                if !t.loaded {
-                    let img = render::lod_image(&cs, ws.cfg.zoom_level_lod_color);
-                    t.render_image = argb_to_render_image(&img, 32);
-                    // the tuple always carries the image's own zoom: a
-                    // 32x32 tile image is zoom 16 regardless of view zoom.
-                    t.image = Some((Arc::new(img), (TILE_SIZE / 32) as i32));
-                }
-            }
-        }
-
-        if self.loading.contains_key(&key) {
-            return;
-        }
-        let tx = self.result_tx.clone();
-        let path = match self.mca_path(ws, region) {
-            Some(p) => p,
-            None => return,
-        };
+        // everything below runs on a pool worker: cache probing, file
+        // deletes, png decode, nbt render and cache writes are all file IO +
+        // CPU work that must not stall the UI thread.
         self.loading.insert(key, hash);
+        let tx = self.result_tx.clone();
+        let uuid = ws.uuid.clone();
+        let cache_dir = ws.cache_dir.clone();
+        let region_dir = ws.region_dir().to_path_buf();
+        let header_zoom = ws.cfg.render_header_only_zoom_level;
+        let lod_color = ws.cfg.zoom_level_lod_color;
         let cfg = mc_core::render::RenderSettings {
             render_height: ws.cfg.render_height,
             layer_only: ws.cfg.render_layer_only,
@@ -954,80 +898,27 @@ impl TileMapState {
             shade_water: ws.cfg.shade_water,
             shade_altitude: ws.cfg.shade_altitude,
         };
-        let uuid = ws.uuid.clone();
         let priority = self.tile_priority(region);
+        let corrupted = CORRUPTED.with(|c| *c.borrow());
         jobs::pools().add_process(Job::new(
             jobs::PRIORITY_LOW,
             Some(Box::new(move || priority)),
             move || {
-                let mut m = match McaFile::new(path) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        let _ = tx.send(TileResult::Image {
-                            region,
-                            image: None,
-                            zoom: zoom_level,
-                            structures: None,
-                            cache_write: false,
-                        });
-                        return;
-                    }
-                };
-                if m.load(true).is_err() {
-                    let _ = tx.send(TileResult::Image {
-                        region,
-                        image: None,
-                        zoom: zoom_level,
-                        structures: None,
-                        cache_write: false,
-                    });
-                    return;
-                }
-                let corrupted = CORRUPTED.with(|c| *c.borrow());
-                let img = render::generate_image(&m, zoom_level, &cfg, &corrupted);
-                let structures = m.structures();
-                let _ = tx.send(TileResult::Image {
+                worker_probe_and_render(ProbeArgs {
+                    tx,
+                    uuid,
+                    cache_dir,
+                    region_dir,
                     region,
-                    image: img,
-                    zoom: zoom_level,
-                    structures: Some(structures),
-                    cache_write: true,
+                    zoom_level,
+                    cfg,
+                    header_zoom,
+                    lod_color,
+                    hash,
+                    corrupted,
                 });
             },
         ));
-    }
-
-    /// LoadCachedImageJob — read png on a pool thread, scaled to target zoom.
-    fn load_cached_image(&mut self, region: Point2i, path: std::path::PathBuf, load_zoom: i32, target_zoom: i32, settings: i64) -> bool {
-        if self.loading.contains_key(&region.as_long()) {
-            return false;
-        }
-        self.loading.insert(region.as_long(), settings);
-        let tx = self.result_tx.clone();
-        jobs::pools().add_process(Job::new(jobs::PRIORITY_MEDIUM, None, move || {
-            let img = image::open(&path).ok().map(|im| {
-                let rgba = im.to_rgba8();
-                let (w, _h) = rgba.dimensions();
-                let mut px: Vec<u32> = rgba
-                    .chunks_exact(4)
-                    .map(|c| {
-                        ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32
-                    })
-                    .collect();
-                if load_zoom != target_zoom {
-                    px = render::scale_down(&px, w as usize, TILE_SIZE / target_zoom as usize);
-                }
-                px
-            });
-            let _ = tx.send(TileResult::Image {
-                region,
-                image: img,
-                zoom: target_zoom,
-                structures: None,
-                cache_write: false,
-            });
-        }));
-        true
     }
 
     fn fetch_or_parse_structures(&mut self, ws: &crate::config::WorldState, region: Point2i) {
@@ -1049,30 +940,6 @@ impl TileMapState {
         // structure parsing piggybacks on the normal image job in our impl
     }
 
-    fn is_image_outdated(&self, ws: &crate::config::WorldState, region: Point2i) -> bool {
-        if cache::get_render_hash(&ws.uuid, region) != render_hash(&ws.cfg) {
-            // rendered under different settings (or before rset existed)
-            if cache::get_file_time(&ws.uuid, region) != -1
-                || files::png_cache_path(&ws.cache_dir, 1, region).exists()
-            {
-                return true;
-            }
-            return false;
-        }
-        let t = cache::get_file_time(&ws.uuid, region);
-        if t == -1 {
-            return false;
-        }
-        let mt = self
-            .mca_path(ws, region)
-            .and_then(|p| std::fs::metadata(p).ok())
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        t != mt
-    }
-
     fn record_file_time(&self, ws: &crate::config::WorldState, region: Point2i) {
         let mt = self
             .mca_path(ws, region)
@@ -1082,6 +949,7 @@ impl TileMapState {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         cache::set_file_time(&ws.uuid, region, mt);
+        cache::set_render_hash(&ws.uuid, region, render_hash(&ws.cfg));
     }
 
     fn push_pool(&mut self, zoom: i32, region: Point2i, img: Arc<Vec<u32>>) {
@@ -1268,8 +1136,16 @@ impl TileMapState {
                     if let Some(ws) = &ws {
                         if cache_write {
                             self.write_image_cache(ws, region);
+                            self.record_file_time(ws, region);
                         }
-                        self.record_file_time(ws, region);
+                    }
+                }
+                TileResult::Presence { region, image } => {
+                    if let Some(t) = self.tiles.get_mut(&region.as_long()) {
+                        if !t.loaded {
+                            t.render_image = argb_to_render_image(&image, 32);
+                            t.image = Some((Arc::new(image), (TILE_SIZE / 32) as i32));
+                        }
                     }
                 }
                 TileResult::Overlay { region, image, data } => {
@@ -1364,3 +1240,178 @@ pub static FILTER_RESULT: std::sync::Mutex<Option<Selection>> =
     std::sync::Mutex::new(None);
 /// completed sum-selection total, consumed by the view on the UI thread.
 pub static SUM_RESULT: std::sync::Mutex<Option<i64>> = std::sync::Mutex::new(None);
+
+
+// -- worker-side tile probe (runs on pool threads, not the UI) --------------
+
+struct ProbeArgs {
+    tx: std::sync::mpsc::Sender<TileResult>,
+    uuid: String,
+    cache_dir: std::path::PathBuf,
+    region_dir: std::path::PathBuf,
+    region: Point2i,
+    zoom_level: i32,
+    cfg: mc_core::render::RenderSettings,
+    header_zoom: i32,
+    lod_color: u32,
+    hash: i64,
+    corrupted: [u32; 256],
+}
+
+fn decode_png_scaled(path: &std::path::Path, load_zoom: i32, target_zoom: i32) -> Option<Vec<u32>> {
+    let im = image::open(path).ok()?;
+    let rgba = im.to_rgba8();
+    let (w, _h) = rgba.dimensions();
+    let mut px: Vec<u32> = rgba
+        .chunks_exact(4)
+        .map(|c| {
+            ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32
+        })
+        .collect();
+    if load_zoom != target_zoom {
+        px = render::scale_down(&px, w as usize, TILE_SIZE / target_zoom as usize);
+    }
+    Some(px)
+}
+
+/// Everything the UI thread used to do synchronously per tile request:
+/// staleness probe, file deletes, png/lod decode, chunk-presence read, the
+/// mca render itself, and all cache writes. Sends at most one Image result
+/// (plus an optional Presence placeholder for far zoom).
+fn worker_probe_and_render(a: ProbeArgs) {
+    let region = a.region;
+    let key_path = a.region_dir.join(files::mca_file_name(region));
+    let mt = std::fs::metadata(&key_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    // staleness: render-settings hash mismatch (anything cached is stale), or
+    // file time changed under the same settings.
+    let outdated = if cache::get_render_hash(&a.uuid, region) != a.hash {
+        cache::get_file_time(&a.uuid, region) != -1
+            || files::png_cache_path(&a.cache_dir, 1, region).exists()
+    } else {
+        let t = cache::get_file_time(&a.uuid, region);
+        t != -1 && t != mt
+    };
+    if outdated {
+        cache::delete_data(&a.uuid, region);
+        for zl in [1, 2, 4, 8, 16, 32] {
+            let _ = std::fs::remove_file(files::png_cache_path(&a.cache_dir, zl, region));
+        }
+    }
+
+    if !outdated {
+        if a.zoom_level >= 32 {
+            if let Some((img, size)) = cache::get_lod_image(&a.uuid, region) {
+                let _ = a.tx.send(TileResult::Image {
+                    region,
+                    image: Some(img),
+                    zoom: (TILE_SIZE / size) as i32,
+                    structures: cache::get_structures(&a.uuid, region),
+                    cache_write: false,
+                });
+                return;
+            }
+        } else {
+            let png = files::png_cache_path(&a.cache_dir, a.zoom_level, region);
+            if png.exists() {
+                let img = decode_png_scaled(&png, a.zoom_level, a.zoom_level);
+                let _ = a.tx.send(TileResult::Image {
+                    region,
+                    image: img,
+                    zoom: a.zoom_level,
+                    structures: cache::get_structures(&a.uuid, region),
+                    cache_write: false,
+                });
+                return;
+            }
+            for zl in [1, 2, 4, 8, 16, 32] {
+                if zl == a.zoom_level {
+                    continue;
+                }
+                let png = files::png_cache_path(&a.cache_dir, zl, region);
+                if png.exists() {
+                    let (load_zl, target) = if zl < a.zoom_level {
+                        (zl, a.zoom_level)
+                    } else {
+                        (zl, zl)
+                    };
+                    let img = decode_png_scaled(&png, load_zl, target);
+                    let _ = a.tx.send(TileResult::Image {
+                        region,
+                        image: img,
+                        zoom: target,
+                        structures: cache::get_structures(&a.uuid, region),
+                        cache_write: false,
+                    });
+                    return;
+                }
+            }
+        }
+    }
+
+    // far zoom: chunk-presence placeholder before the real render.
+    if a.zoom_level >= a.header_zoom {
+        if let Some(cs) = cache::get_chunks(&a.uuid, region) {
+            let img = render::lod_image(&cs, a.lod_color);
+            let _ = a.tx.send(TileResult::Presence { region, image: img });
+        }
+    }
+
+    // real render
+    let send_fail = |a: &ProbeArgs| {
+        let _ = a.tx.send(TileResult::Image {
+            region,
+            image: None,
+            zoom: a.zoom_level,
+            structures: None,
+            cache_write: false,
+        });
+    };
+    let mut m = match McaFile::new(key_path.clone()) {
+        Ok(m) => m,
+        Err(_) => return send_fail(&a),
+    };
+    if m.load(true).is_err() {
+        return send_fail(&a);
+    }
+    let Some(img) = render::generate_image(&m, a.zoom_level, &a.cfg, &a.corrupted) else {
+        return send_fail(&a);
+    };
+    let structures = m.structures();
+
+    // persist: png pyramid (or lod) + meta. all worker-side; the UI just
+    // adopts the pixels.
+    if a.zoom_level >= 32 {
+        cache::set_lod_image(&a.uuid, region, &img);
+    } else {
+        let size = TILE_SIZE / a.zoom_level as usize;
+        let path = files::png_cache_path(&a.cache_dir, a.zoom_level, region);
+        if let Some(p) = path.parent() {
+            let _ = std::fs::create_dir_all(p);
+        }
+        let mut rgba = Vec::with_capacity(size * size * 4);
+        for &p in img.iter() {
+            rgba.push((p >> 16) as u8);
+            rgba.push((p >> 8) as u8);
+            rgba.push(p as u8);
+            rgba.push((p >> 24) as u8);
+        }
+        let _ = image::save_buffer(&path, &rgba, size as u32, size as u32, image::ColorType::Rgba8);
+    }
+    cache::set_file_time(&a.uuid, region, mt);
+    cache::set_render_hash(&a.uuid, region, a.hash);
+    cache::set_structures(&a.uuid, region, &structures);
+
+    let _ = a.tx.send(TileResult::Image {
+        region,
+        image: Some(img),
+        zoom: a.zoom_level,
+        structures: Some(structures),
+        cache_write: false,
+    });
+}

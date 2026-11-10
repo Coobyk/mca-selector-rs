@@ -272,3 +272,52 @@ mod tests {
 }
 
 
+
+#[cfg(test)]
+mod tests3 {
+    use super::*;
+    use crate::mca::McaFile;
+    use std::collections::HashMap;
+    #[test]
+    #[ignore]
+    fn mansion_probe() {
+        let path = std::path::PathBuf::from(std::env::var("MCA_REGION_PATH").expect("MCA_REGION_PATH"));
+        let mut m = McaFile::new(path).expect("region");
+        m.load(true).expect("load");
+        let corrupted = [0u32; 256];
+        let img = generate_image(&m, 1, &RenderSettings::default(), &corrupted).expect("img");
+        // mansion ~ chunk(-46,-49) -> local (18,15); sample 260..340 x 220..290
+        let mut hist: HashMap<u32, usize> = HashMap::new();
+        for y in 220..290usize {
+            for x in 260..340usize {
+                *hist.entry(img[y * 512 + x]).or_default() += 1;
+            }
+        }
+        let mut v: Vec<_> = hist.into_iter().collect();
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (c, n) in v.iter().take(12) {
+            eprintln!("color {c:08x} x{n}");
+        }
+        let checksum = img.iter().fold(0u64, |a, &p| a.wrapping_mul(31).wrapping_add(p as u64));
+        eprintln!("checksum {checksum:016x}");
+        // dump mansion area at several zoom levels
+        for zl in [1i32, 2, 4, 8, 16] {
+            let zi = generate_image(&m, zl, &RenderSettings::default(), &corrupted).expect("img");
+            let sz = 512 / zl as usize;
+            let mut rgba = Vec::with_capacity(sz * sz * 4);
+            for &p in zi.iter() {
+                rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8]);
+            }
+            image::save_buffer(format!("/tmp/zl{zl}.png"), &rgba, sz as u32, sz as u32, image::ColorType::Rgba8).unwrap();
+        }
+        let (x0, y0, w, h) = (200usize, 180usize, 250usize, 160usize);
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                let p = img[y * 512 + x];
+                rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8]);
+            }
+        }
+        image::save_buffer("/tmp/mansion.png", &rgba, w as u32, h as u32, image::ColorType::Rgba8).unwrap();
+    }
+}
