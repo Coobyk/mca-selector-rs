@@ -22,8 +22,8 @@ pub const MAX_TILE_REQUESTS: usize = 8192;
 /// max concurrent tile/structure jobs in flight
 pub const MAX_IN_FLIGHT_LOADS: usize = 2048;
 
-pub const REGION_GRID_COLOR: u32 = 0x99FF_FFFF; // white 60%
-pub const CHUNK_GRID_COLOR: u32 = 0x66FF_FFFF; // white 40%
+pub const REGION_GRID_COLOR: u32 = 0xB300_0000; // black 70%
+pub const CHUNK_GRID_COLOR: u32 = 0x7300_0000; // black 45%
 pub const COORDINATES_COLOR: u32 = 0xFFFF_FFFF;
 pub const EMPTY_COLOR: u32 = 0xFF0A_0A0A; // near-black
 pub const GRID_LINE_WIDTH: f32 = 1.0;
