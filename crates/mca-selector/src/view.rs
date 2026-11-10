@@ -744,9 +744,11 @@ impl MainView {
             for rz in vmin.z..=vmax.z {
             let region = Point2i::new(rx, rz);
             let key = region.as_long();
+            // block-space position -> screen px, same convention as the grids
+            // and coordinates below (offset is in world blocks).
             let offset = Point2f::new(
-                region.x as f32 * TILE_SIZE as f32 - self.map.offset.x,
-                region.z as f32 * TILE_SIZE as f32 - self.map.offset.z,
+                (region.x as f32 * TILE_SIZE as f32 - self.map.offset.x) / scale,
+                (region.z as f32 * TILE_SIZE as f32 - self.map.offset.z) / scale,
             );
             let w = TILE_SIZE as f32 / scale;
             let b = Bounds {
