@@ -3,6 +3,7 @@
 use crate::mca::McaFile;
 use crate::nbt;
 use crate::version::{self, RenderOut};
+use rayon::prelude::*;
 
 pub const TILE_SIZE: usize = 512;
 pub const CHUNK_SIZE: usize = 16;
@@ -62,6 +63,169 @@ pub fn generate_image(
     let mut terrain_heights = vec![0i16; pixels];
     let mut water_heights = if shade_water { vec![0i16; pixels] } else { Vec::new() };
 
+    // The renderers address the buffers with a row stride of
+    // `512 >> ilog2(scale)`; splitting the buffers into per-chunk-row bands
+    // is a pure partition only when that stride equals `size`, i.e. for
+    // power-of-two scales that keep chunk_size > 0 (1,2,4,8,16). Anything
+    // else runs the original sequential loop verbatim.
+    if chunk_size > 0 && scale > 0 && (scale & (scale - 1)) == 0 {
+        draw_bands(
+            mca,
+            scale,
+            cfg,
+            corrupted,
+            size,
+            chunk_size,
+            &mut pixel_buffer,
+            &mut terrain_heights,
+            &mut water_pixels,
+            &mut water_heights,
+        );
+    } else {
+        draw_sequential(
+            mca,
+            scale,
+            cfg,
+            corrupted,
+            size,
+            chunk_size,
+            pixels,
+            shade_water,
+            &mut pixel_buffer,
+            &mut terrain_heights,
+            &mut water_pixels,
+            &mut water_heights,
+        );
+    }
+
+    if cfg.caves {
+        flat_shade(&mut pixel_buffer, &terrain_heights, scale);
+    } else if cfg.shade && !cfg.layer_only {
+        shade(&mut pixel_buffer, &water_pixels, &terrain_heights, &water_heights, scale, cfg);
+    }
+    Some(pixel_buffer)
+}
+
+/// Parallel chunk rendering: chunk row `crz` exclusively owns pixel rows
+/// `crz*chunk_size .. (crz+1)*chunk_size` in every buffer, so
+/// `par_chunks_mut` hands each rayon task a disjoint band. Inside a band
+/// the draw calls run with z=0 (band-local rows) and x = crx*chunk_size —
+/// the same absolute pixel_index, just relative to the band's start.
+#[allow(clippy::too_many_arguments)]
+fn draw_bands(
+    mca: &McaFile,
+    scale: i32,
+    cfg: &RenderSettings,
+    corrupted: &[u32; 256],
+    size: usize,
+    chunk_size: usize,
+    pixel_buffer: &mut [u32],
+    terrain_heights: &mut [i16],
+    water_pixels: &mut [u32],
+    water_heights: &mut [i16],
+) {
+    let band = chunk_size * size;
+    if water_pixels.is_empty() {
+        pixel_buffer
+            .par_chunks_mut(band)
+            .zip(terrain_heights.par_chunks_mut(band))
+            .enumerate()
+            .for_each(|(crz, (pb, th))| {
+                draw_band(mca, crz, scale, cfg, corrupted, chunk_size, size, pb, th, None, None);
+            });
+    } else {
+        pixel_buffer
+            .par_chunks_mut(band)
+            .zip(terrain_heights.par_chunks_mut(band))
+            .zip(water_pixels.par_chunks_mut(band))
+            .zip(water_heights.par_chunks_mut(band))
+            .enumerate()
+            .for_each(|(crz, (((pb, th), wp), wh))| {
+                draw_band(
+                    mca,
+                    crz,
+                    scale,
+                    cfg,
+                    corrupted,
+                    chunk_size,
+                    size,
+                    pb,
+                    th,
+                    Some(wp),
+                    Some(wh),
+                );
+            });
+    }
+}
+
+/// One band = one chunk row; renders its 32 chunks sequentially into the
+/// band slices. The DataVersion dispatch cache is kept per band — chunks in
+/// a region almost always share a DataVersion.
+#[allow(clippy::too_many_arguments)]
+fn draw_band(
+    mca: &McaFile,
+    crz: usize,
+    scale: i32,
+    cfg: &RenderSettings,
+    corrupted: &[u32; 256],
+    chunk_size: usize,
+    size: usize,
+    pixel_band: &mut [u32],
+    terrain_band: &mut [i16],
+    mut water_px_band: Option<&mut [u32]>,
+    mut water_h_band: Option<&mut [i16]>,
+) {
+    let mut last_dv: Option<i32> = None;
+    let mut format = version::ChunkFormat::Null;
+    let mut cm = version::ColorMap::Null;
+    for crx in 0..SIZE_IN_CHUNKS {
+        let index = crz * SIZE_IN_CHUNKS + crx;
+        let Some(chunk) = &mca.chunks[index] else { continue };
+        let Some(data) = &chunk.data else { continue };
+        let data_version = nbt::data_version(Some(data));
+        if last_dv != Some(data_version) {
+            last_dv = Some(data_version);
+            format = version::chunk_format(data_version);
+            cm = version::color_mapping(data_version);
+        }
+        let x = crx * chunk_size;
+        draw_one(
+            data,
+            &cm,
+            format,
+            x,
+            0,
+            scale,
+            cfg,
+            corrupted,
+            size,
+            pixel_band.len(),
+            pixel_band,
+            terrain_band,
+            water_px_band.as_deref_mut(),
+            water_h_band.as_deref_mut(),
+        );
+    }
+}
+
+/// The original sequential loop, kept verbatim for scales where the
+/// renderers' internal row stride (`512 >> ilog2(scale)`) does not equal
+/// `size` — a band split would not be a pure partition there.
+#[allow(clippy::too_many_arguments)]
+fn draw_sequential(
+    mca: &McaFile,
+    scale: i32,
+    cfg: &RenderSettings,
+    corrupted: &[u32; 256],
+    size: usize,
+    chunk_size: usize,
+    pixels: usize,
+    shade_water: bool,
+    pixel_buffer: &mut [u32],
+    terrain_heights: &mut [i16],
+    water_pixels: &mut Vec<u32>,
+    water_heights: &mut Vec<i16>,
+) {
     // chunks in a region almost always share a DataVersion — cache the
     // last dispatch (chunk_format + color_mapping) instead of re-walking
     // the tables and OnceLocks per chunk.
@@ -81,57 +245,97 @@ pub fn generate_image(
             }
             let x = cx * chunk_size;
             let z = cz * chunk_size;
-            // upstream wraps each chunk's draw in try/catch and paints the
-            // corrupted overlay on failure — catch_unwind is the equivalent.
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut out = RenderOut {
-                    pixel_buffer: &mut pixel_buffer,
-                    water_pixels: if shade_water { Some(&mut water_pixels) } else { None },
-                    terrain_heights: &mut terrain_heights,
-                    water_heights: if shade_water { Some(&mut water_heights) } else { None },
-                    water: cfg.shade && cfg.shade_water,
-                    height: cfg.render_height,
-                };
-                if cfg.caves {
-                    version::draw_caves(data, &cm, format, x, z, scale, out.pixel_buffer, out.terrain_heights, cfg.render_height);
-                } else if cfg.layer_only {
-                    version::draw_layer(data, &cm, format, x, z, scale, out.pixel_buffer, cfg.render_height);
+            draw_one(
+                data,
+                &cm,
+                format,
+                x,
+                z,
+                scale,
+                cfg,
+                corrupted,
+                size,
+                pixels,
+                pixel_buffer,
+                terrain_heights,
+                if shade_water {
+                    Some(water_pixels.as_mut_slice())
                 } else {
-                    version::draw_chunk(data, &cm, format, x, z, scale, &mut out);
-                }
-            }));
-            if res.is_err() {
-                // corruptedChunkOverlay + heights = 64 (upstream drawChunkImage)
-                for cy in 0..CHUNK_SIZE {
-                    for cxi in 0..CHUNK_SIZE {
-                        let src = cy * CHUNK_SIZE + cxi;
-                        let dst = (z + cy / scale as usize) * size + (x + cxi / scale as usize);
-                        if dst < pixels {
-                            pixel_buffer[dst] = corrupted[src];
-                            terrain_heights[dst] = 64;
-                            if !water_heights.is_empty() {
-                                water_heights[dst] = 64;
-                            }
-                        }
+                    None
+                },
+                if shade_water {
+                    Some(water_heights.as_mut_slice())
+                } else {
+                    None
+                },
+            );
+        }
+    }
+}
+
+/// One chunk's draw_chunk/draw_layer/draw_caves + the corrupted-overlay
+/// fallback. `x`/`z` are pixel offsets into the given buffer slices, which
+/// address `buf_size`-wide rows; overlay writes are clipped at `buf_len`
+/// (the full buffer length sequentially, the band length in `draw_bands`).
+/// upstream wraps each chunk's draw in try/catch and paints the corrupted
+/// overlay on failure — catch_unwind is the equivalent.
+#[allow(clippy::too_many_arguments)]
+fn draw_one(
+    data: &nbt::Compound,
+    cm: &version::ColorMap,
+    format: version::ChunkFormat,
+    x: usize,
+    z: usize,
+    scale: i32,
+    cfg: &RenderSettings,
+    corrupted: &[u32; 256],
+    buf_size: usize,
+    buf_len: usize,
+    pixel_buffer: &mut [u32],
+    terrain_heights: &mut [i16],
+    mut water_pixels: Option<&mut [u32]>,
+    mut water_heights: Option<&mut [i16]>,
+) {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut out = RenderOut {
+            pixel_buffer: &mut *pixel_buffer,
+            water_pixels: water_pixels.as_deref_mut(),
+            terrain_heights: &mut *terrain_heights,
+            water_heights: water_heights.as_deref_mut(),
+            water: cfg.shade && cfg.shade_water,
+            height: cfg.render_height,
+        };
+        if cfg.caves {
+            version::draw_caves(data, cm, format, x, z, scale, out.pixel_buffer, out.terrain_heights, cfg.render_height);
+        } else if cfg.layer_only {
+            version::draw_layer(data, cm, format, x, z, scale, out.pixel_buffer, cfg.render_height);
+        } else {
+            version::draw_chunk(data, cm, format, x, z, scale, &mut out);
+        }
+    }));
+    if res.is_err() {
+        // corruptedChunkOverlay + heights = 64 (upstream drawChunkImage)
+        for cy in 0..CHUNK_SIZE {
+            for cxi in 0..CHUNK_SIZE {
+                let src = cy * CHUNK_SIZE + cxi;
+                let dst = (z + cy / scale as usize) * buf_size + (x + cxi / scale as usize);
+                if dst < buf_len {
+                    pixel_buffer[dst] = corrupted[src];
+                    terrain_heights[dst] = 64;
+                    if let Some(wh) = water_heights.as_deref_mut() {
+                        wh[dst] = 64;
                     }
                 }
             }
         }
     }
-
-    if cfg.caves {
-        flat_shade(&mut pixel_buffer, &terrain_heights, scale);
-    } else if cfg.shade && !cfg.layer_only {
-        shade(&mut pixel_buffer, &water_pixels, &terrain_heights, &water_heights, scale, cfg);
-    }
-    Some(pixel_buffer)
 }
 
 fn flat_shade(px: &mut [u32], heights: &[i16], _scale: i32) {
-    for (i, p) in px.iter_mut().enumerate() {
+    px.par_iter_mut().enumerate().for_each(|(i, p)| {
         let alt = (heights[i] / 4).clamp(-50, 50);
         *p = shade_color(*p, (alt * 4) as i32);
-    }
+    });
 }
 
 fn shade(
@@ -148,58 +352,67 @@ fn shade(
         terrain
     };
     let size = TILE_SIZE / scale as usize;
-    let altitude_multiplier = if cfg.shade_altitude { 12.0 / 256.0 } else { 0.0 };
-    for z in 0..size {
-        // row slices: bounds checks hoisted out of the per-pixel loop.
-        let hrow = &water_heights[z * size..(z + 1) * size];
-        let hup = if z == 0 {
-            hrow
-        } else {
-            &water_heights[(z - 1) * size..z * size]
-        };
-        let hdn = if z == size - 1 && size > 1 {
-            hrow
-        } else {
-            &water_heights[(z + 1) * size..(z + 2) * size]
-        };
-        let trow = &terrain[z * size..(z + 1) * size];
-        let wrow: &[u32] = if water_px.is_empty() {
-            &[]
-        } else {
-            &water_px[z * size..(z + 1) * size]
-        };
-        let prow = &mut px[z * size..(z + 1) * size];
-        for x in 0..size {
-            if prow[x] == 0 {
-                continue;
-            }
-            if trow[x] != hrow[x] {
-                let ratio = 0.5 - 0.5 / 40.0 * (hrow[x] - trow[x]) as f32;
-                prow[x] = blend(prow[x], wrow[x], ratio);
-            } else {
-                let z_shade = if z == 0 {
-                    hdn[x] - hrow[x]
-                } else if z == size - 1 {
-                    hrow[x] - hup[x]
-                } else {
-                    (hdn[x] - hup[x]) * 2
-                };
-                let x_shade = if x == 0 {
-                    hrow[1] - hrow[0]
-                } else if x == size - 1 {
-                    hrow[x] - hrow[x - 1]
-                } else {
-                    (hrow[x + 1] - hrow[x - 1]) * 2
-                };
-                let mut shade = (x_shade + z_shade) as f32;
-                shade = shade.clamp(-8.0, 8.0);
-                let mut alt = (hrow[x] - 64) as f32 * altitude_multiplier;
-                alt = alt.clamp(-4.0, 12.0);
-                shade += alt;
-                prow[x] = shade_color(prow[x], (shade * 8.0) as i32);
-            }
-        }
+    if size == 0 {
+        return;
     }
+    let altitude_multiplier = if cfg.shade_altitude { 12.0 / 256.0 } else { 0.0 };
+    // rows only read shared height/color buffers — disjoint prow bands make
+    // the pass trivially parallel with identical per-pixel math. Only the
+    // first size*size pixels form rows (for odd scales pixels can be
+    // larger); the tail stays untouched exactly like the sequential loop.
+    px[..size * size]
+        .par_chunks_mut(size)
+        .enumerate()
+        .for_each(|(z, prow)| {
+            // row slices: bounds checks hoisted out of the per-pixel loop.
+            let hrow = &water_heights[z * size..(z + 1) * size];
+            let hup = if z == 0 {
+                hrow
+            } else {
+                &water_heights[(z - 1) * size..z * size]
+            };
+            let hdn = if z == size - 1 && size > 1 {
+                hrow
+            } else {
+                &water_heights[(z + 1) * size..(z + 2) * size]
+            };
+            let trow = &terrain[z * size..(z + 1) * size];
+            let wrow: &[u32] = if water_px.is_empty() {
+                &[]
+            } else {
+                &water_px[z * size..(z + 1) * size]
+            };
+            for x in 0..size {
+                if prow[x] == 0 {
+                    continue;
+                }
+                if trow[x] != hrow[x] {
+                    let ratio = 0.5 - 0.5 / 40.0 * (hrow[x] - trow[x]) as f32;
+                    prow[x] = blend(prow[x], wrow[x], ratio);
+                } else {
+                    let z_shade = if z == 0 {
+                        hdn[x] - hrow[x]
+                    } else if z == size - 1 {
+                        hrow[x] - hup[x]
+                    } else {
+                        (hdn[x] - hup[x]) * 2
+                    };
+                    let x_shade = if x == 0 {
+                        hrow[1] - hrow[0]
+                    } else if x == size - 1 {
+                        hrow[x] - hrow[x - 1]
+                    } else {
+                        (hrow[x + 1] - hrow[x - 1]) * 2
+                    };
+                    let mut shade = (x_shade + z_shade) as f32;
+                    shade = shade.clamp(-8.0, 8.0);
+                    let mut alt = (hrow[x] - 64) as f32 * altitude_multiplier;
+                    alt = alt.clamp(-4.0, 12.0);
+                    shade += alt;
+                    prow[x] = shade_color(prow[x], (shade * 8.0) as i32);
+                }
+            }
+        });
 }
 
 /// generateImageFromChunkSet — the green LOD tile used at high zoom levels.

@@ -1,11 +1,12 @@
 //! Port of io.mca: region file loading (MCAFile/Chunk/RegionChunk/Region).
 
-use crate::nbt::{self, Compound, NbtReader, Tag};
+use crate::nbt::{self, Compound, SliceReader, Tag};
 use crate::point::Point2i;
 use anyhow::{bail, Context as _, Result};
 use flate2::bufread::{GzDecoder, ZlibDecoder};
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -104,8 +105,9 @@ fn mcc_path(mca: &Path, chunk: Point2i) -> PathBuf {
 /// net.jpountz.lz4.LZ4BlockInputStream framing:
 /// repeated blocks of: compressed_len i32 BE, original_len i32 BE, data.
 /// compressed_len high bit (0x80000000) => raw stored block.
-fn lz4_decompress_blocks(data: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(data.len().saturating_mul(3).max(4096));
+/// `into` variant decodes each block straight into `out`'s tail instead of
+/// an intermediate Vec per block.
+fn lz4_decompress_blocks_into(data: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let mut c = Cursor::new(data);
     let mut hdr = [0u8; 4];
     loop {
@@ -120,6 +122,9 @@ fn lz4_decompress_blocks(data: &[u8]) -> Result<Vec<u8>> {
         }
         c.read_exact(&mut hdr)?;
         let original = i32::from_be_bytes(hdr);
+        if original < 0 {
+            bail!("invalid lz4 block size {original}");
+        }
         if compressed as u32 & 0x8000_0000 != 0 {
             let n = (compressed & 0x7FFF_FFFF) as usize;
             let start = c.position() as usize;
@@ -128,12 +133,21 @@ fn lz4_decompress_blocks(data: &[u8]) -> Result<Vec<u8>> {
         } else {
             let n = compressed as usize;
             let start = c.position() as usize;
-            let block = lz4_flex::block::decompress(&data[start..start + n], original as usize)
-                .context("lz4 block decompress")?;
-            out.extend_from_slice(&block);
+            let base = out.len();
+            out.resize(base + original as usize, 0);
+            let written =
+                lz4_flex::block::decompress_into(&data[start..start + n], &mut out[base..])
+                    .context("lz4 block decompress")?;
+            out.truncate(base + written);
             c.set_position((start + n) as u64);
         }
     }
+    Ok(())
+}
+
+fn lz4_decompress_blocks(data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len().saturating_mul(3).max(4096));
+    lz4_decompress_blocks_into(data, &mut out)?;
     Ok(out)
 }
 
@@ -176,6 +190,45 @@ fn decompress_cow(compression: CompressionType, data: &[u8]) -> Result<Cow<'_, [
         CompressionType::Lz4 => Cow::Owned(lz4_decompress_blocks(data)?),
         _ => Cow::Borrowed(data),
     })
+}
+
+/// Scratch variant of [`decompress_cow`]: compressed payloads inflate into
+/// `scratch` (which the caller reuses across chunks) and uncompressed ones
+/// are still returned as a view into `data`. The returned slice borrows
+/// either `data` or `scratch` — scratch stays borrowed until the NBT parse
+/// consuming it is done.
+fn decompress_into<'a>(
+    compression: CompressionType,
+    data: &'a [u8],
+    scratch: &'a mut Vec<u8>,
+) -> Result<&'a [u8]> {
+    Ok(match compression.base() {
+        CompressionType::Gzip => {
+            scratch.clear();
+            scratch.reserve(data.len().saturating_mul(4).max(4096));
+            GzDecoder::new(data).read_to_end(scratch)?;
+            &scratch[..]
+        }
+        CompressionType::Zlib => {
+            scratch.clear();
+            scratch.reserve(data.len().saturating_mul(4).max(4096));
+            ZlibDecoder::new(data).read_to_end(scratch)?;
+            &scratch[..]
+        }
+        CompressionType::Lz4 => {
+            scratch.clear();
+            lz4_decompress_blocks_into(data, scratch)?;
+            &scratch[..]
+        }
+        _ => data,
+    })
+}
+
+/// Per-worker decompression buffer. Region loads inflate up to 1024 chunks;
+/// reusing one Vec per thread turns ~1024 grow-to-size allocations per
+/// region into ~one per worker.
+thread_local! {
+    static DECOMPRESS_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn decompress(compression: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
@@ -427,9 +480,16 @@ impl McaFile {
         // already saturate all cores, so cross-thread dispatch of a handful
         // of tiny chunk tasks is pure overhead.
         const PAR_CHUNK_THRESHOLD: usize = 64;
+        // cap splitting at ~32-chunk tasks: 1024 single-chunk tasks mostly
+        // buy scheduling overhead at chunk-parse cost granularity.
+        const PAR_MIN_BATCH: usize = 32;
         let present = offsets.iter().filter(|&&o| o != 0).count();
         self.chunks = if present >= PAR_CHUNK_THRESHOLD {
-            (0..1024).into_par_iter().map(parse).collect()
+            (0..1024)
+                .into_par_iter()
+                .with_min_len(PAR_MIN_BATCH)
+                .map(parse)
+                .collect()
         } else {
             (0..1024).map(parse).collect()
         };
@@ -465,10 +525,16 @@ impl McaFile {
             let end = (pos + 5 + length.saturating_sub(1)).min(data.len());
             Cow::Borrowed(&data[pos + 5..end])
         };
-        let nbt_data = decompress_cow(compression, &payload)?;
-        let mut reader = NbtReader::new(&nbt_data[..]);
-        reader.raw_arrays = raw;
-        let tag = reader.read()?;
+        // decompress into the per-thread scratch buffer and parse — the
+        // scratch borrow (and any payload borrow for uncompressed chunks)
+        // lives only until the owned Tag tree is built inside the closure.
+        let tag = DECOMPRESS_SCRATCH.with(|cell| -> Result<Tag> {
+            let mut scratch = cell.borrow_mut();
+            let nbt_data = decompress_into(compression, &payload, &mut scratch)?;
+            let mut reader = SliceReader::new(nbt_data);
+            reader.raw_arrays = raw;
+            Ok(reader.read()?)
+        })?;
         let mut chunk = Chunk::new(loc);
         chunk.compression = compression;
         // move the root compound out — as_compound().cloned() would deep-copy

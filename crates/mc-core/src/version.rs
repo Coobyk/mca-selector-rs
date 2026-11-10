@@ -836,16 +836,15 @@ pub fn draw_chunk(
     let oob = oob_entry();
     let water_entry = resolve_entry(WATER_DUMMY_NAME, None);
     let row = 512usize >> scale_bits;
-    // the column scan walks the same top-down section sequence 256 times;
-    // resolve the Option chain once.
-    let order: Vec<&SectionSlot> = indexed[..=start].iter().rev().flatten().collect();
 
     for cx in (0..16usize).step_by(scale as usize) {
         'zloop: for cz in (0..16usize).step_by(scale as usize) {
             let pixel_index = (z + (cz >> scale_bits)) * row + (x + (cx >> scale_bits));
             let mut water_depth = false;
             let col = cz * 16 + cx;
-            for slot in &order {
+            // top-down section sequence; a rev+flatten iterator rebuilds the
+            // same order per column without a per-chunk Vec allocation.
+            for slot in indexed[..=start].iter().rev().flatten() {
                 let s = slot.get();
                 if s.all_transparent {
                     continue;
@@ -1044,8 +1043,6 @@ pub fn draw_caves(
     let start = ((abs_h >> 4).min(indexed.len() as i32 - 1)).max(0) as usize;
     let oob = oob_entry();
     let mut memo = RgbMemo::default();
-    // same flattened top-down order for every column.
-    let order: Vec<&SectionSlot> = indexed[..=start].iter().rev().flatten().collect();
     for cx in (0..16usize).step_by(scale as usize) {
         'zloop: for cz in (0..16usize).step_by(scale as usize) {
             let pixel_index =
@@ -1053,7 +1050,8 @@ pub fn draw_caves(
             let mut ignored = 0;
             let mut done_skipping = false;
             let col = cz * 16 + cx;
-            for slot in &order {
+            // same flattened top-down order for every column, no Vec needed.
+            for slot in indexed[..=start].iter().rev().flatten() {
                 let s = slot.get();
                 if s.caves_inert {
                     continue;

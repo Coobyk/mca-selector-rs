@@ -322,8 +322,13 @@ impl<R: Read> NbtReader<R> {
         Ok(f64::from_bits(self.i64()? as u64))
     }
     fn bytes(&mut self, n: usize) -> io::Result<Vec<u8>> {
-        let mut v = vec![0u8; n];
-        self.read_exact(&mut v)?;
+        // read_to_end fills the Vec's spare capacity directly — skips the
+        // vec![0;n] memset the old version paid before overwriting it.
+        let mut v = Vec::with_capacity(n);
+        let got = (&mut self.r).take(n as u64).read_to_end(&mut v)?;
+        if got < n {
+            return Err(eof());
+        }
         Ok(v)
     }
     fn string(&mut self) -> io::Result<String> {
@@ -409,6 +414,163 @@ impl<R: Read> NbtReader<R> {
                     Tag::ByteArray(self.bytes(n * 8)?)
                 } else {
                     let raw = self.bytes(n * 8)?;
+                    let mut v = Vec::with_capacity(n);
+                    for c in raw.chunks_exact(8) {
+                        v.push(i64::from_be_bytes(c.try_into().unwrap()));
+                    }
+                    Tag::LongArray(v)
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid tag type {ty}"),
+                ))
+            }
+        })
+    }
+}
+
+#[inline]
+fn eof() -> io::Error {
+    // same error Read::read_exact produces on a short input
+    io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
+}
+
+/// Slice-cursor NBT reader: identical output to [`NbtReader`] but driven off
+/// a `&[u8]` instead of `Read`. Scalars are a pointer bump + `from_be_bytes`
+/// (no per-read `read_exact` call), and array/string payloads borrow the
+/// input then `to_vec` — skipping the zero-init + overwrite the generic
+/// reader performs. Used on the hot region-load path; the parsed `Tag` tree
+/// is byte-for-byte identical to `NbtReader`'s.
+pub(crate) struct SliceReader<'a> {
+    s: &'a [u8],
+    pub raw_arrays: bool,
+}
+
+impl<'a> SliceReader<'a> {
+    pub fn new(s: &'a [u8]) -> Self {
+        SliceReader { s, raw_arrays: false }
+    }
+
+    /// advance the cursor by `n`, returning the skipped-over bytes
+    #[inline]
+    fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
+        if self.s.len() < n {
+            return Err(eof());
+        }
+        let (head, tail) = self.s.split_at(n);
+        self.s = tail;
+        Ok(head)
+    }
+    #[inline]
+    fn u8(&mut self) -> io::Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+    #[inline]
+    fn u16(&mut self) -> io::Result<u16> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    #[inline]
+    fn i16(&mut self) -> io::Result<i16> {
+        Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    #[inline]
+    fn i32(&mut self) -> io::Result<i32> {
+        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    #[inline]
+    fn i64(&mut self) -> io::Result<i64> {
+        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    #[inline]
+    fn f32(&mut self) -> io::Result<f32> {
+        Ok(f32::from_bits(self.i32()? as u32))
+    }
+    #[inline]
+    fn f64(&mut self) -> io::Result<f64> {
+        Ok(f64::from_bits(self.i64()? as u64))
+    }
+    fn string(&mut self) -> io::Result<String> {
+        let len = self.u16()? as usize;
+        // from_utf8_lossy borrows on success — into_owned() is the single
+        // copy, same as String::from_utf8 + fallback in the generic reader.
+        Ok(String::from_utf8_lossy(self.take(len)?).into_owned())
+    }
+
+    /// Reads the root tag — same as `NbtReader::read`.
+    pub fn read(&mut self) -> io::Result<Tag> {
+        let ty = self.u8()?;
+        if ty != TAG_COMPOUND {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected compound root, got {ty}"),
+            ));
+        }
+        // root name is discarded — skip it without materialising a String
+        let len = self.u16()? as usize;
+        self.take(len)?;
+        self.payload(TAG_COMPOUND)
+    }
+
+    fn payload(&mut self, ty: u8) -> io::Result<Tag> {
+        Ok(match ty {
+            TAG_BYTE => Tag::Byte(self.u8()? as i8),
+            TAG_SHORT => Tag::Short(self.i16()?),
+            TAG_INT => Tag::Int(self.i32()?),
+            TAG_LONG => Tag::Long(self.i64()?),
+            TAG_FLOAT => Tag::Float(self.f32()?),
+            TAG_DOUBLE => Tag::Double(self.f64()?),
+            TAG_BYTE_ARRAY => {
+                let n = self.i32()? as usize;
+                Tag::ByteArray(self.take(n)?.to_vec())
+            }
+            TAG_STRING => Tag::String(self.string()?),
+            TAG_LIST => {
+                let et = self.u8()?;
+                let n = self.i32()?;
+                let n = if n < 0 { 0 } else { n as usize };
+                let mut items = Vec::with_capacity(n);
+                for _ in 0..n {
+                    items.push(self.payload(et)?);
+                }
+                Tag::List(et, items)
+            }
+            TAG_COMPOUND => {
+                // most chunk compounds are tiny (palette entries, block_states,
+                // biomes have 1-3 keys) — size for that, not the ~8-key root
+                let mut map =
+                    Compound::with_capacity_and_hasher(4, FxBuildHasher::default());
+                loop {
+                    let t = self.u8()?;
+                    if t == TAG_END {
+                        break;
+                    }
+                    let name = self.string()?;
+                    let v = self.payload(t)?;
+                    map.insert(name, v);
+                }
+                Tag::Compound(map)
+            }
+            TAG_INT_ARRAY => {
+                let n = self.i32()? as usize;
+                let raw = self.take(n * 4)?;
+                if self.raw_arrays {
+                    Tag::ByteArray(raw.to_vec())
+                } else {
+                    let mut v = Vec::with_capacity(n);
+                    for c in raw.chunks_exact(4) {
+                        v.push(i32::from_be_bytes(c.try_into().unwrap()));
+                    }
+                    Tag::IntArray(v)
+                }
+            }
+            TAG_LONG_ARRAY => {
+                let n = self.i32()? as usize;
+                let raw = self.take(n * 8)?;
+                if self.raw_arrays {
+                    Tag::ByteArray(raw.to_vec())
+                } else {
                     let mut v = Vec::with_capacity(n);
                     for c in raw.chunks_exact(8) {
                         v.push(i64::from_be_bytes(c.try_into().unwrap()));

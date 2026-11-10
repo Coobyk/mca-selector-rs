@@ -19,8 +19,13 @@ pub const TILE_VISIBILITY_THRESHOLD: i32 = 2;
 // Tile colors (upstream Tile.* + config defaults)
 /// max regions given tile objects / requests per update tick
 pub const MAX_TILE_REQUESTS: usize = 8192;
-/// max concurrent tile/structure jobs in flight
-pub const MAX_IN_FLIGHT_LOADS: usize = 2048;
+/// max queued+running image jobs. Queued jobs are small (~200B of args —
+/// fds are only touched by the ~8 pool threads actually running jobs), so
+/// the cap only needs to stop `loading` growing without bound when results
+/// stall. Aligned with MAX_TILE_REQUESTS: a fully-visible screen at far
+/// zoom must be enqueueable in one pass instead of trickling in over
+/// multiple update ticks behind a tighter cap.
+pub const MAX_IN_FLIGHT_LOADS: usize = MAX_TILE_REQUESTS;
 
 pub const REGION_GRID_COLOR: u32 = 0xB300_0000; // black 70%
 pub const CHUNK_GRID_COLOR: u32 = 0x7300_0000; // black 45%
@@ -109,14 +114,40 @@ fn render_hash(cfg: &crate::config::WorldConfig) -> i64 {
         | RENDER_CACHE_VERSION << 20
 }
 
+/// a tile image shipped from a worker: raw argb pixels (kept for pool
+/// scale_down + disk-cache writes) plus the gpu image built on the worker —
+/// the ~1MB u32->BGRA repack + RgbaImage/RenderImage construction no longer
+/// happens on the UI thread. `render` is only None when RgbaImage
+/// construction failed (non-square input — can't happen for tile sizes).
+pub struct TileImage {
+    argb: Vec<u32>,
+    render: Option<std::sync::Arc<gpui::RenderImage>>,
+}
+
+/// memory-pool entry: same payload, Arc-shared so pool hits and tile
+/// adoptions are refcount bumps. The shared RenderImage also shares its
+/// ImageId, so re-adopted tiles hit the same GPU atlas slot.
+pub struct PooledImage {
+    argb: Arc<Vec<u32>>,
+    render: std::sync::Arc<gpui::RenderImage>,
+}
+
 pub enum TileResult {
     Image {
         region: Point2i,
-        image: Option<Vec<u32>>,
+        /// worker sends Some(TileImage) with a prebuilt gpu image; batch-op
+        /// invalidations in view.rs/ops.rs only ever send `image: None`.
+        image: Option<TileImage>,
         zoom: i32,
         structures: Option<HashMap<i64, Vec<String>>>,
         /// write to disk cache as well
         cache_write: bool,
+    },
+    /// worker-side structures-cache read for a tile that adopted a pooled
+    /// image (was a UI-side file read per tile per invalidation).
+    Structures {
+        region: Point2i,
+        structures: Option<HashMap<i64, Vec<String>>>,
     },
     /// far-zoom chunk-presence placeholder (sent before the real render)
     Presence {
@@ -163,8 +194,9 @@ pub struct TileMapState {
     pub hovered_block: Option<Point2i>,
     pub pasted: Option<Pasted>,
     pub disabled: bool,
-    /// memory image pool: zoomLevel -> region->image (buffers shared with tiles)
-    pub pool: HashMap<i32, HashMap<i64, Arc<Vec<u32>>>>,
+    /// memory image pool: zoomLevel -> region->image (pixels + gpu image,
+    /// both Arc-shared with tiles so adoptions are refcount bumps)
+    pub pool: HashMap<i32, HashMap<i64, PooledImage>>,
     pub pool_order: HashMap<i32, Vec<i64>>, // keys currently in the pool, for trim
     /// region -> render-settings hash at enqueue; results that land with a
     /// stale hash are discarded so obsolete renders never resurface.
@@ -174,6 +206,9 @@ pub struct TileMapState {
     prio_bounds: Option<(Point2i, Point2i)>,
     /// amortizes the O(visible regions) visible-set build in `trim_pool`
     pool_trim_defer: u32,
+    /// reusable drain buffer for poll_results — was a fresh Vec alloc on
+    /// every UI tick, spiking to thousands of entries during pan/zoom.
+    pending_scratch: Vec<TileResult>,
     pub results_rx: Option<Receiver<TileResult>>,
     pub result_tx: Sender<TileResult>,
     /// active overlay parser (overlayPool.parser)
@@ -220,6 +255,7 @@ impl TileMapState {
             loading: HashMap::new(),
             prio_bounds: None,
             pool_trim_defer: 0,
+            pending_scratch: Vec::new(),
             results_rx: Some(rx),
             result_tx: tx,
             overlay: None,
@@ -609,58 +645,61 @@ impl TileMapState {
         // them exhausts file descriptors, the job queue and the GPU atlas.
         let zoom_level = get_zoom_level(self.scale);
         let bounds = self.visible_region_bounds(Point2f::ZERO);
-        let visible = (bounds.1.x as i64 - bounds.0.x as i64 + 1)
-            .saturating_mul(bounds.1.z as i64 - bounds.0.z as i64 + 1)
-            .clamp(0, MAX_TILE_REQUESTS as i64) as usize;
-        let mut requests: Vec<Point2i> = Vec::with_capacity(visible);
-        if self.prio_bounds == Some(bounds) {
-            // viewport unchanged: the spiral (and thus every priority value)
-            // is identical to last update — keep the existing map.
-            Self::for_regions_spiral(bounds.0, bounds.1, MAX_TILE_REQUESTS, |region| {
-                requests.push(region);
-            });
-        } else {
+        if self.prio_bounds != Some(bounds) {
+            // viewport moved: rebuild priorities in spiral order (one pass).
+            let visible = (bounds.1.x as i64 - bounds.0.x as i64 + 1)
+                .saturating_mul(bounds.1.z as i64 - bounds.0.z as i64 + 1)
+                .clamp(0, MAX_TILE_REQUESTS as i64) as usize;
             let mut new_prios = HashMap::with_capacity(visible);
             let mut prio = 1i64;
             Self::for_regions_spiral(bounds.0, bounds.1, MAX_TILE_REQUESTS, |region| {
                 new_prios.insert(region.as_long(), prio);
                 prio += 1;
-                requests.push(region);
             });
             self.tile_priorities = new_prios;
             self.prio_bounds = Some(bounds);
         }
-
-        for region in requests {
+        // single fused spiral pass — the old two-pass loop materialized a
+        // `requests` Vec (up to 8k entries = alloc + copy) between the
+        // priority assignment and the request loop even when priorities were
+        // already current. Steady-state ticks are now alloc-free here.
+        Self::for_regions_spiral(bounds.0, bounds.1, MAX_TILE_REQUESTS, |region| {
             let key = region.as_long();
-            // single lookup per region (was contains+get+get_mut).
-            let (request, need_overlay) = {
-                let tile = self.tiles.entry(key).or_insert_with(|| Tile::new(region));
-                let need_overlay = self.overlay.is_some() && !tile.overlay_loaded;
-                // Any existing image is paintable at ANY zoom: paint_map
-                // draws render_image into a fixed-size screen rect and the
-                // GPU does the stretching. A finer-than-needed image
-                // (img_zoom < zoom_level) just paints smaller — keeping it
-                // is free, while the old scale_down + texture rebuild cost
-                // a ~1MB CPU rescale and an atlas upload per tile per zoom
-                // boundary. Only an image too coarse for the current zoom
-                // (img_zoom > zoom_level) still needs a finer render; it
-                // stays on screen until that lands.
-                let request = !tile.loaded
-                    || (tile.image.is_some() && tile.image_zoom_level() > zoom_level);
-                (request, need_overlay)
+            // get_mut before insert: visible tiles almost always already
+            // exist, so the common case is one hash lookup with no entry()
+            // churn (new regions insert once, then hit the Some arm).
+            let (request, need_overlay) = match self.tiles.get_mut(&key) {
+                Some(tile) => {
+                    let need_overlay = self.overlay.is_some() && !tile.overlay_loaded;
+                    // Any existing image is paintable at ANY zoom: paint_map
+                    // draws render_image into a fixed-size screen rect and the
+                    // GPU does the stretching. A finer-than-needed image
+                    // (img_zoom < zoom_level) just paints smaller — keeping it
+                    // is free, while the old scale_down + texture rebuild cost
+                    // a ~1MB CPU rescale and an atlas upload per tile per zoom
+                    // boundary. Only an image too coarse for the current zoom
+                    // (img_zoom > zoom_level) still needs a finer render; it
+                    // stays on screen until that lands.
+                    let request = !tile.loaded
+                        || (tile.image.is_some() && tile.image_zoom_level() > zoom_level);
+                    (request, need_overlay)
+                }
+                None => {
+                    self.tiles.insert(key, Tile::new(region));
+                    (true, self.overlay.is_some())
+                }
             };
             if request {
                 self.request_image(&ws, region, zoom_level);
             } else {
-                // ready tile: pick up cached structure data once, then this
-                // becomes a couple of hash lookups per update.
-                self.fetch_or_parse_structures(&ws, region);
+                // ready tile: kick off the one-shot worker-side structures
+                // read unless it already ran for this image.
+                self.request_structures(&ws, region);
             }
             if need_overlay {
                 self.request_overlay(&ws, region);
             }
-        }
+        });
     }
 
     /// OverlayPool.requestImage: parse overlay data for a region and send back
@@ -831,32 +870,54 @@ impl TileMapState {
         }
         let hash = render_hash(&ws.cfg);
 
-        if let Some(img) = self.pool.get(&zoom_level).and_then(|m| m.get(&key)) {
-            let img = img.clone();
+        if let Some(p) = self.pool.get(&zoom_level).and_then(|m| m.get(&key)) {
+            // exact pool hit: pixels + gpu image are already Arc'd — adopt
+            // with refcount bumps, no per-tile BGRA repack on the UI thread.
+            let argb = p.argb.clone();
+            let render_img = p.render.clone();
             let t = self.tiles.get_mut(&key).unwrap();
-            t.image = Some((img.clone(), zoom_level));
-            t.render_image = argb_to_render_image(&img, TILE_SIZE / zoom_level as usize);
+            t.image = Some((argb, zoom_level));
+            t.render_image = Some(render_img);
             t.loaded = true;
-            self.fetch_or_parse_structures(ws, region);
+            self.request_structures(ws, region);
             return;
         }
         for zl in (1..=crate::config::MAX_ZOOM_LEVEL).step_by(1) {
             if (zl & (zl - 1)) != 0 || zl == zoom_level {
                 continue;
             }
-            if let Some(img) = self.pool.get(&zl).and_then(|m| m.get(&key)) {
-                let img = img.clone();
+            if let Some(p) = self.pool.get(&zl).and_then(|m| m.get(&key)) {
                 if zl < zoom_level {
-                    // larger than needed -> scale down
+                    // larger than needed -> scale down. The ~1MB rescale +
+                    // BGRA repack run on a worker; the result lands through
+                    // the normal Image path (stale-hash drop still applies —
+                    // scaled pixels inherit the source render's settings —
+                    // and the landing pushes the pool entry once).
+                    let argb = p.argb.clone();
+                    self.loading.insert(key, hash);
+                    let tx = self.result_tx.clone();
+                    let uuid = ws.uuid.clone();
+                    let priority = self.tile_priority(region);
                     let from = TILE_SIZE / zl as usize;
                     let to = TILE_SIZE / zoom_level as usize;
-                    let scaled = Arc::new(render::scale_down(&img, from, to));
-                    self.push_pool(zoom_level, region, scaled.clone());
-                    let t = self.tiles.get_mut(&key).unwrap();
-                    t.render_image = argb_to_render_image(&scaled, TILE_SIZE / zoom_level as usize);
-                    t.image = Some((scaled, zoom_level));
-                    t.loaded = true;
-                    self.fetch_or_parse_structures(ws, region);
+                    jobs::pools().add_process(Job::new(
+                        jobs::PRIORITY_LOW,
+                        Some(Box::new(move || priority)),
+                        move || {
+                            let scaled = render::scale_down(&argb, from, to);
+                            let gpu_img = argb_to_render_image(&scaled, to);
+                            let _ = tx.send(TileResult::Image {
+                                region,
+                                image: Some(TileImage {
+                                    argb: scaled,
+                                    render: gpu_img,
+                                }),
+                                zoom: zoom_level,
+                                structures: cache::get_structures(&uuid, region),
+                                cache_write: false,
+                            });
+                        },
+                    ));
                     return;
                 } else {
                     // lower res: use as a progressive placeholder and keep
@@ -869,12 +930,14 @@ impl TileMapState {
                         .map(|t| t.image.is_some() && t.image_zoom_level() <= zl)
                         .unwrap_or(false);
                     if !dominated {
+                        let argb = p.argb.clone();
+                        let render_img = p.render.clone();
                         let t = self.tiles.get_mut(&key).unwrap();
-                        t.render_image = argb_to_render_image(&img, TILE_SIZE / zl as usize);
-                        t.image = Some((img, zl));
+                        t.render_image = Some(render_img);
+                        t.image = Some((argb, zl));
                         t.loaded = true;
                     }
-                    self.fetch_or_parse_structures(ws, region);
+                    self.request_structures(ws, region);
                     break;
                 }
             }
@@ -921,23 +984,32 @@ impl TileMapState {
         ));
     }
 
-    fn fetch_or_parse_structures(&mut self, ws: &crate::config::WorldState, region: Point2i) {
+    /// structures-cache lookup for a ready tile: one-shot worker job (was a
+    /// UI-side file read per tile). `structures_checked` is set at enqueue so
+    /// update() can't queue duplicates; the Structures result fills
+    /// `t.structures` without clobbering a fresher render-supplied map.
+    fn request_structures(&mut self, ws: &crate::config::WorldState, region: Point2i) {
         let key = region.as_long();
-        // one-shot: the structures cache file can only be written by a
-        // completed render job (which sets `structures` directly), so
-        // re-reading it every update for every visible tile was pure syscalls.
         match self.tiles.get(&key) {
             Some(t) if t.structures.is_none() && !t.structures_checked => {}
             _ => return,
         }
-        let s = cache::get_structures(&ws.uuid, region);
         if let Some(t) = self.tiles.get_mut(&key) {
             t.structures_checked = true;
-            if let Some(s) = s {
-                t.structures = Some(s);
-            }
         }
-        // structure parsing piggybacks on the normal image job in our impl
+        let tx = self.result_tx.clone();
+        let uuid = ws.uuid.clone();
+        let priority = self.tile_priority(region);
+        // structure parsing itself piggybacks on the image job; this only
+        // reads the small bincode cache file for pool-adopted tiles.
+        jobs::pools().add_process(Job::new(
+            jobs::PRIORITY_MEDIUM,
+            Some(Box::new(move || priority)),
+            move || {
+                let s = cache::get_structures(&uuid, region);
+                let _ = tx.send(TileResult::Structures { region, structures: s });
+            },
+        ));
     }
 
     fn record_file_time(&self, ws: &crate::config::WorldState, region: Point2i) {
@@ -952,7 +1024,9 @@ impl TileMapState {
         cache::set_render_hash(&ws.uuid, region, render_hash(&ws.cfg));
     }
 
-    fn push_pool(&mut self, zoom: i32, region: Point2i, img: Arc<Vec<u32>>) {
+    /// the only pool writer — called once per landed worker result, so each
+    /// pooled Arc is inserted exactly once (re-adopts read, never re-push).
+    fn push_pool(&mut self, zoom: i32, region: Point2i, img: PooledImage) {
         let key = region.as_long();
         // trim removes every non-visible entry anyway, so position in `order`
         // is irrelevant — a plain deduped append keeps pushes O(1) instead of
@@ -1049,19 +1123,22 @@ impl TileMapState {
 
     pub fn poll_results(&mut self) -> bool {
         let mut changed = false;
-        let mut pending = Vec::new();
+        // reusable drain buffer — a fresh Vec per tick used to realloc to
+        // thousands of entries on every burst during pan/zoom.
+        let mut pending = std::mem::take(&mut self.pending_scratch);
         if let Some(rx) = &self.results_rx {
             while let Ok(res) = rx.try_recv() {
                 pending.push(res);
             }
         }
         if pending.is_empty() {
+            self.pending_scratch = pending;
             return false;
         }
         // world lookup hoisted: it takes a lock + clones strings, and used to
         // run 2-3x per drained result.
         let ws = crate::config::world();
-        for res in pending {
+        for res in pending.drain(..) {
             changed = true;
             match res {
                 TileResult::Image {
@@ -1084,7 +1161,19 @@ impl TileMapState {
                             continue;
                         }
                     }
-                    let image = image.map(Arc::new);
+                    // workers ship the gpu image prebuilt; the UI thread just
+                    // moves Arcs. A render is only rebuilt here for senders
+                    // that ship raw pixels — batch ops always send None.
+                    let (image, mut render) = match image {
+                        Some(ti) => (Some(Arc::new(ti.argb)), ti.render),
+                        None => (None, None),
+                    };
+                    if render.is_none() {
+                        if let Some(img) = image.as_deref() {
+                            let size = (img.len() as f64).sqrt() as usize;
+                            render = argb_to_render_image(img, size);
+                        }
+                    }
                     let view_zoom = get_zoom_level(self.scale);
                     // renders that land at a stale zoom are still valid
                     // data — keep them in the pool and adopt them as the
@@ -1094,7 +1183,16 @@ impl TileMapState {
                     // image at exactly the current zoom is never clobbered.
                     if image.is_some() && zoom != view_zoom {
                         if let Some(img) = &image {
-                            self.push_pool(zoom, region, img.clone());
+                            if let Some(ri) = &render {
+                                self.push_pool(
+                                    zoom,
+                                    region,
+                                    PooledImage {
+                                        argb: img.clone(),
+                                        render: ri.clone(),
+                                    },
+                                );
+                            }
                             let adopt = match self.tiles.get(&key) {
                                 Some(t) if t.image.is_some() => {
                                     let cur = t.image_zoom_level();
@@ -1103,9 +1201,8 @@ impl TileMapState {
                                 _ => true,
                             };
                             if adopt {
-                                let size = (img.len() as f64).sqrt() as usize;
                                 let t = self.tiles.entry(key).or_insert_with(|| Tile::new(region));
-                                t.render_image = argb_to_render_image(img, size);
+                                t.render_image = render.clone();
                                 t.image = Some((img.clone(), zoom));
                                 if let Some(s) = structures {
                                     t.structures = Some(s);
@@ -1116,13 +1213,19 @@ impl TileMapState {
                         }
                         continue;
                     }
-                    if let Some(img) = &image {
-                        self.push_pool(zoom, region, img.clone());
+                    if let (Some(img), Some(ri)) = (&image, &render) {
+                        self.push_pool(
+                            zoom,
+                            region,
+                            PooledImage {
+                                argb: img.clone(),
+                                render: ri.clone(),
+                            },
+                        );
                     }
                     if let Some(t) = self.tiles.get_mut(&key) {
                         if let Some(img) = image {
-                            let size = TILE_SIZE / zoom as usize;
-                            if let Some(ri) = argb_to_render_image(&img, size) {
+                            if let Some(ri) = render {
                                 t.render_image = Some(ri);
                             }
                             t.image = Some((img, zoom));
@@ -1138,6 +1241,16 @@ impl TileMapState {
                             self.write_image_cache(ws, region);
                             self.record_file_time(ws, region);
                         }
+                    }
+                }
+                TileResult::Structures { region, structures } => {
+                    if let Some(t) = self.tiles.get_mut(&region.as_long()) {
+                        // don't clobber fresher structures a completed render
+                        // result already installed.
+                        if t.structures.is_none() {
+                            t.structures = structures;
+                        }
+                        t.structures_checked = true;
                     }
                 }
                 TileResult::Presence { region, image } => {
@@ -1162,6 +1275,12 @@ impl TileMapState {
                 }
             }
         }
+        // hand the (now empty) buffer back for the next tick; drop it after a
+        // huge burst so a one-time spike doesn't pin capacity forever.
+        if pending.capacity() > MAX_TILE_REQUESTS {
+            pending = Vec::new();
+        }
+        self.pending_scratch = pending;
         changed
     }
 
@@ -1220,15 +1339,14 @@ pub fn set_corrupted_overlay(argb: [u32; 256]) {
 
 
 /// Build a gpu-side image from an argb buffer of size×size pixels.
+/// Called on worker threads (tile jobs) — the only UI-thread callers left
+/// are the tiny 32x32 Presence/Overlay images and view.rs icons.
 pub fn argb_to_render_image(argb: &[u32], size: usize) -> Option<std::sync::Arc<gpui::RenderImage>> {
-    // the blade atlas texture is Bgra8Unorm — bytes go B,G,R,A.
+    // the blade atlas texture is Bgra8Unorm — bytes go B,G,R,A, which is
+    // exactly the little-endian memory layout of a 0xAARRGGBB u32, so this
+    // is a straight widen-and-copy (was a 4x per-byte push loop).
     let mut rgba = Vec::with_capacity(size * size * 4);
-    for &p in argb.iter() {
-        rgba.push(p as u8);
-        rgba.push((p >> 8) as u8);
-        rgba.push((p >> 16) as u8);
-        rgba.push((p >> 24) as u8);
-    }
+    rgba.extend(argb.iter().flat_map(|p| p.to_le_bytes()));
     let buf = image::RgbaImage::from_raw(size as u32, size as u32, rgba)?;
     Some(std::sync::Arc::new(gpui::RenderImage::new(
         smallvec::SmallVec::from_elem(image::Frame::new(buf), 1),
@@ -1259,7 +1377,13 @@ struct ProbeArgs {
     corrupted: [u32; 256],
 }
 
-fn decode_png_scaled(path: &std::path::Path, load_zoom: i32, target_zoom: i32) -> Option<Vec<u32>> {
+/// decode a cached png (+ downscale to target zoom) and build the gpu image
+/// while still on the worker — returns (argb pixels, render image).
+fn decode_png_scaled(
+    path: &std::path::Path,
+    load_zoom: i32,
+    target_zoom: i32,
+) -> Option<(Vec<u32>, std::sync::Arc<gpui::RenderImage>)> {
     let im = image::open(path).ok()?;
     let rgba = im.to_rgba8();
     let (w, _h) = rgba.dimensions();
@@ -1272,7 +1396,8 @@ fn decode_png_scaled(path: &std::path::Path, load_zoom: i32, target_zoom: i32) -
     if load_zoom != target_zoom {
         px = render::scale_down(&px, w as usize, TILE_SIZE / target_zoom as usize);
     }
-    Some(px)
+    let gpu_img = argb_to_render_image(&px, TILE_SIZE / target_zoom as usize)?;
+    Some((px, gpu_img))
 }
 
 /// Everything the UI thread used to do synchronously per tile request:
@@ -1310,7 +1435,10 @@ fn worker_probe_and_render(a: ProbeArgs) {
             if let Some((img, size)) = cache::get_lod_image(&a.uuid, region) {
                 let _ = a.tx.send(TileResult::Image {
                     region,
-                    image: Some(img),
+                    image: Some(TileImage {
+                        render: argb_to_render_image(&img, size),
+                        argb: img,
+                    }),
                     zoom: (TILE_SIZE / size) as i32,
                     structures: cache::get_structures(&a.uuid, region),
                     cache_write: false,
@@ -1320,10 +1448,13 @@ fn worker_probe_and_render(a: ProbeArgs) {
         } else {
             let png = files::png_cache_path(&a.cache_dir, a.zoom_level, region);
             if png.exists() {
-                if let Some(img) = decode_png_scaled(&png, a.zoom_level, a.zoom_level) {
+                if let Some((img, gpu_img)) = decode_png_scaled(&png, a.zoom_level, a.zoom_level) {
                     let _ = a.tx.send(TileResult::Image {
                         region,
-                        image: Some(img),
+                        image: Some(TileImage {
+                            argb: img,
+                            render: Some(gpu_img),
+                        }),
                         zoom: a.zoom_level,
                         structures: cache::get_structures(&a.uuid, region),
                         cache_write: false,
@@ -1338,10 +1469,13 @@ fn worker_probe_and_render(a: ProbeArgs) {
                 }
                 let png = files::png_cache_path(&a.cache_dir, zl, region);
                 if png.exists() {
-                    if let Some(img) = decode_png_scaled(&png, zl, a.zoom_level) {
+                    if let Some((img, gpu_img)) = decode_png_scaled(&png, zl, a.zoom_level) {
                         let _ = a.tx.send(TileResult::Image {
                             region,
-                            image: Some(img),
+                            image: Some(TileImage {
+                                argb: img,
+                                render: Some(gpu_img),
+                            }),
                             zoom: a.zoom_level,
                             structures: cache::get_structures(&a.uuid, region),
                             cache_write: false,
@@ -1360,7 +1494,11 @@ fn worker_probe_and_render(a: ProbeArgs) {
                 }
                 let png = files::png_cache_path(&a.cache_dir, zl, region);
                 if png.exists() {
-                    let img = decode_png_scaled(&png, zl, zl);
+                    let img = decode_png_scaled(&png, zl, zl)
+                        .map(|(argb, gpu_img)| TileImage {
+                            argb,
+                            render: Some(gpu_img),
+                        });
                     let _ = a.tx.send(TileResult::Image {
                         region,
                         image: img,
@@ -1429,7 +1567,10 @@ fn worker_probe_and_render(a: ProbeArgs) {
 
     let _ = a.tx.send(TileResult::Image {
         region,
-        image: Some(img),
+        image: Some(TileImage {
+            render: argb_to_render_image(&img, TILE_SIZE / a.zoom_level as usize),
+            argb: img,
+        }),
         zoom: a.zoom_level,
         structures: Some(structures),
         cache_write: false,

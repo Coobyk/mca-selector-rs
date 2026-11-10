@@ -73,7 +73,7 @@ impl Default for GlobalConfig {
             region_selection_color: Color::new(1.0, 0.45, 0.0, 0.8),
             chunk_selection_color: Color::new(1.0, 0.45, 0.0, 0.8),
             paste_chunks_color: Color::new(0.0, 1.0, 0.0, 0.8),
-            process_threads: (num_cpus() as i32 - 2).clamp(1, 4),
+            process_threads: (num_cpus() as i32 - 2).max(4),
             write_threads: (num_cpus() as i32).clamp(1, 4),
             max_loaded_files: 1,
             mc_saves_dir: mc_saves_dir(),
