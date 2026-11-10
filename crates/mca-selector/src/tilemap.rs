@@ -1221,11 +1221,12 @@ pub fn set_corrupted_overlay(argb: [u32; 256]) {
 
 /// Build a gpu-side image from an argb buffer of size×size pixels.
 pub fn argb_to_render_image(argb: &[u32], size: usize) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    // the blade atlas texture is Bgra8Unorm — bytes go B,G,R,A.
     let mut rgba = Vec::with_capacity(size * size * 4);
     for &p in argb.iter() {
-        rgba.push((p >> 16) as u8);
-        rgba.push((p >> 8) as u8);
         rgba.push(p as u8);
+        rgba.push((p >> 8) as u8);
+        rgba.push((p >> 16) as u8);
         rgba.push((p >> 24) as u8);
     }
     let buf = image::RgbaImage::from_raw(size as u32, size as u32, rgba)?;

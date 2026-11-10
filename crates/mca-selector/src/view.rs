@@ -1328,7 +1328,10 @@ fn load_icon(
 
             _ => return None,
         };
-    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let mut img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    for c in img.chunks_exact_mut(4) {
+        c.swap(0, 2); // blade atlas is Bgra8Unorm
+    }
     let r = Arc::new(RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(img), 1)));
     icon_cache.insert(icon.to_string(), r.clone());
     Some(r)
@@ -1521,7 +1524,10 @@ fn nbt_icon(type_id: u8) -> Option<Arc<RenderImage>> {
         "compound" => include_bytes!("../resources/img/nbt/compound.png"),
         _ => return None,
     };
-    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let mut img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    for c in img.chunks_exact_mut(4) {
+        c.swap(0, 2); // blade atlas is Bgra8Unorm
+    }
     let r = Arc::new(RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(img), 1)));
     CACHE.lock().unwrap().insert(type_id, r.clone());
     Some(r)
