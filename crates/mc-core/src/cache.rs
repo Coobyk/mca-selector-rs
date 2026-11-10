@@ -48,6 +48,19 @@ pub fn set_file_time(world_uuid: &str, r: Point2i, t: i64) {
     let _ = write(&meta_path(world_uuid, "time", r), &t.to_le_bytes());
 }
 
+/// render settings hash recorded when the image was generated; a cached
+/// image is stale when the world's current render settings differ.
+pub fn get_render_hash(world_uuid: &str, r: Point2i) -> i64 {
+    let p = meta_path(world_uuid, "rset", r);
+    let b = std::fs::read(p).unwrap_or_default();
+    let a: [u8; 8] = b.get(..8).unwrap_or(&[0; 8]).try_into().unwrap_or([0; 8]);
+    i64::from_le_bytes(a)
+}
+
+pub fn set_render_hash(world_uuid: &str, r: Point2i, h: i64) {
+    let _ = write(&meta_path(world_uuid, "rset", r), &h.to_le_bytes());
+}
+
 // -- chunk sets (header-only LOD data) ------------------------------------------
 
 pub fn get_chunks(world_uuid: &str, r: Point2i) -> Option<ChunkSet> {

@@ -93,6 +93,22 @@ impl Tile {
 }
 
 /// Async results channel: worker -> UI.
+/// bump when the renderer's pixel output changes — forces every cached
+/// PNG/LOD image to be treated as stale and re-rendered once.
+const RENDER_CACHE_VERSION: i64 = 2;
+
+/// fingerprint of everything that changes a tile's pixels. keyed caches
+/// (disk PNGs, meta) are invalidated by comparing this.
+fn render_hash(cfg: &crate::config::WorldConfig) -> i64 {
+    ((cfg.render_height.clamp(-64, 319) + 64) as i64)
+        | (cfg.render_layer_only as i64) << 10
+        | (cfg.render_caves as i64) << 11
+        | (cfg.shade as i64) << 12
+        | (cfg.shade_water as i64) << 13
+        | (cfg.shade_altitude as i64) << 14
+        | RENDER_CACHE_VERSION << 20
+}
+
 pub enum TileResult {
     Image {
         region: Point2i,
@@ -145,7 +161,9 @@ pub struct TileMapState {
     /// memory image pool: zoomLevel -> region->image (buffers shared with tiles)
     pub pool: HashMap<i32, HashMap<i64, Arc<Vec<u32>>>>,
     pub pool_order: HashMap<i32, Vec<i64>>, // keys currently in the pool, for trim
-    pub loading: HashSet<i64>,
+    /// region -> render-settings hash at enqueue; results that land with a
+    /// stale hash are discarded so obsolete renders never resurface.
+    pub loading: HashMap<i64, i64>,
     /// visible bounds `tile_priorities` was last built for — rebuilding the
     /// map is skipped while the viewport stays put
     prio_bounds: Option<(Point2i, Point2i)>,
@@ -194,7 +212,7 @@ impl TileMapState {
             disabled: true,
             pool: HashMap::new(),
             pool_order: HashMap::new(),
-            loading: HashSet::new(),
+            loading: HashMap::new(),
             prio_bounds: None,
             pool_trim_defer: 0,
             results_rx: Some(rx),
@@ -820,12 +838,13 @@ impl TileMapState {
             }
             return;
         }
-        if self.loading.contains(&key) {
+        if self.loading.contains_key(&key) {
             return;
         }
         if self.loading.len() >= MAX_IN_FLIGHT_LOADS {
             return;
         }
+        let hash = render_hash(&ws.cfg);
 
         if let Some(img) = self.pool.get(&zoom_level).and_then(|m| m.get(&key)) {
             let img = img.clone();
@@ -866,43 +885,46 @@ impl TileMapState {
             }
         }
 
-        if zoom_level >= 32 {
-            if let Some((img, _)) = cache::get_lod_image(&ws.uuid, region) {
-                let img = Arc::new(img);
-                self.push_pool(zoom_level, region, img.clone());
-                if let Some(t) = self.tiles.get_mut(&key) {
-                    t.render_image = argb_to_render_image(&img, TILE_SIZE / zoom_level as usize);
-                    t.image = Some((img, zoom_level));
-                }
-                if self.is_image_outdated(ws, region) {
-                    self.discard_cached_image(region);
+        // disk caches are only usable when the mca mtime AND the render
+        // settings fingerprint match — otherwise serve nothing and render.
+        let outdated = self.is_image_outdated(ws, region);
+        if outdated {
+            self.discard_cached_image(region);
+        }
+        if !outdated {
+            if zoom_level >= 32 {
+                if let Some((img, _)) = cache::get_lod_image(&ws.uuid, region) {
+                    let img = Arc::new(img);
+                    self.push_pool(zoom_level, region, img.clone());
                     if let Some(t) = self.tiles.get_mut(&key) {
-                        t.loaded = false;
+                        t.render_image = argb_to_render_image(&img, TILE_SIZE / zoom_level as usize);
+                        t.image = Some((img, zoom_level));
+                        t.loaded = true;
+                    }
+                    return;
+                }
+            } else {
+                let png = files::png_cache_path(&ws.cache_dir, zoom_level, region);
+                if png.exists() {
+                    if self.load_cached_image(region, png, zoom_level, zoom_level, hash) {
+                        return;
                     }
                 }
-                return;
             }
-        } else {
-            let png = files::png_cache_path(&ws.cache_dir, zoom_level, region);
-            if png.exists() {
-                if self.load_cached_image(region, png, zoom_level, zoom_level) {
-                    return;
+            for zl in [1, 2, 4, 8, 16, 32] {
+                if zl == zoom_level {
+                    continue;
                 }
-            }
-        }
-        for zl in [1, 2, 4, 8, 16, 32] {
-            if zl == zoom_level {
-                continue;
-            }
-            let png = files::png_cache_path(&ws.cache_dir, zl, region);
-            if png.exists() {
-                let (load_zl, target) = if zl < zoom_level {
-                    (zl, zoom_level)
-                } else {
-                    (zl, zl)
-                };
-                if self.load_cached_image(region, png, load_zl, target) {
-                    return;
+                let png = files::png_cache_path(&ws.cache_dir, zl, region);
+                if png.exists() {
+                    let (load_zl, target) = if zl < zoom_level {
+                        (zl, zoom_level)
+                    } else {
+                        (zl, zl)
+                    };
+                    if self.load_cached_image(region, png, load_zl, target, hash) {
+                        return;
+                    }
                 }
             }
         }
@@ -922,7 +944,7 @@ impl TileMapState {
             }
         }
 
-        if self.loading.contains(&key) {
+        if self.loading.contains_key(&key) {
             return;
         }
         let tx = self.result_tx.clone();
@@ -930,7 +952,7 @@ impl TileMapState {
             Some(p) => p,
             None => return,
         };
-        self.loading.insert(key);
+        self.loading.insert(key, hash);
         let cfg = mc_core::render::RenderSettings {
             render_height: ws.cfg.render_height,
             layer_only: ws.cfg.render_layer_only,
@@ -983,11 +1005,11 @@ impl TileMapState {
     }
 
     /// LoadCachedImageJob — read png on a pool thread, scaled to target zoom.
-    fn load_cached_image(&mut self, region: Point2i, path: std::path::PathBuf, load_zoom: i32, target_zoom: i32) -> bool {
-        if self.loading.contains(&region.as_long()) {
+    fn load_cached_image(&mut self, region: Point2i, path: std::path::PathBuf, load_zoom: i32, target_zoom: i32, settings: i64) -> bool {
+        if self.loading.contains_key(&region.as_long()) {
             return false;
         }
-        self.loading.insert(region.as_long());
+        self.loading.insert(region.as_long(), settings);
         let tx = self.result_tx.clone();
         jobs::pools().add_process(Job::new(jobs::PRIORITY_MEDIUM, None, move || {
             let img = image::open(&path).ok().map(|im| {
@@ -1035,6 +1057,15 @@ impl TileMapState {
     }
 
     fn is_image_outdated(&self, ws: &crate::config::WorldState, region: Point2i) -> bool {
+        if cache::get_render_hash(&ws.uuid, region) != render_hash(&ws.cfg) {
+            // rendered under different settings (or before rset existed)
+            if cache::get_file_time(&ws.uuid, region) != -1
+                || files::png_cache_path(&ws.cache_dir, 1, region).exists()
+            {
+                return true;
+            }
+            return false;
+        }
         let t = cache::get_file_time(&ws.uuid, region);
         if t == -1 {
             return false;
@@ -1180,7 +1211,18 @@ impl TileMapState {
                     cache_write,
                 } => {
                     let key = region.as_long();
-                    self.loading.remove(&key);
+                    let enq = self.loading.remove(&key);
+                    // a result rendered (or a cached png loaded) under old
+                    // render settings must not land — keep it unloaded so the
+                    // next update re-renders under current settings.
+                    if let (Some(h), Some(ws)) = (enq, &ws) {
+                        if h != render_hash(&ws.cfg) {
+                            if let Some(t) = self.tiles.get_mut(&key) {
+                                t.loaded = false;
+                            }
+                            continue;
+                        }
+                    }
                     let image = image.map(Arc::new);
                     // renders that landed at a stale zoom are still valid
                     // data — keep them in the pool but don't clobber the
