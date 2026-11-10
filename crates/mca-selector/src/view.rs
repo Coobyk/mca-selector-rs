@@ -76,6 +76,33 @@ pub enum Dialog {
     },
 }
 
+/// cache key for shaped coordinate labels: edge labels hold a single axis
+/// value, grid labels an (x, z) block-coord pair. Shaped lines are
+/// position-independent, so one entry serves every frame.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum CoordKey {
+    Edge(i64),
+    Grid(i64, i64),
+}
+
+/// every input that can change the status-bar text; the formatted string is
+/// rebuilt only when this differs from the cached key (see status_text).
+#[derive(PartialEq)]
+struct StatusKey {
+    visible_tiles: i32,
+    visible_regions: usize,
+    scale_bits: u32,
+    hovered: Option<Point2i>,
+    selected_chunks: i64,
+    unsaved_selection: bool,
+    /// (names[0], len > 1) — only when structure icons are on and the
+    /// hovered chunk has entries
+    structure: Option<(String, bool)>,
+    /// (typ, min, max, hovered value)
+    overlay: Option<(mc_core::overlay::OverlayType, Option<i32>, Option<i32>, Option<i32>)>,
+    jobs: usize,
+}
+
 pub struct MainView {
     pub map: TileMapState,
     focus: FocusHandle,
@@ -85,12 +112,21 @@ pub struct MainView {
     pressed_keys: u8,
     dialog: Option<Dialog>,
     pub update_needed: bool,
+    /// set alongside update_needed so map.update() runs at the next paint
+    /// instead of the next 100ms poll; also coalesces bursts of
+    /// scroll/zoom events into one O(visible-regions) update per frame.
+    update_now: bool,
     height_slider_drag: bool,
     height_slider_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
     icon_cache: std::collections::HashMap<String, Arc<RenderImage>>,
     /// reusable per-frame scratch: (x, z, key) of loaded tiles, kept sorted in
     /// raster order — avoids re-allocating the list every paint.
     visible_tiles_buf: Vec<(i32, i32, i64)>,
+    /// shaped coordinate labels — shaping is the expensive part of the
+    /// coordinate pass and the label set repeats across frames.
+    coord_line_cache: std::collections::HashMap<CoordKey, ShapedLine>,
+    /// last status-bar text + the inputs it was built from.
+    status_cache: Option<(StatusKey, SharedString)>,
     /// paste-ghost images keyed by (offset.x, offset.z, color, dir); rebuilt
     /// only when the paste state changes, not once per region per frame.
     paste_overlay_cache:
@@ -121,10 +157,13 @@ impl MainView {
             pressed_keys: 0,
             dialog: None,
             update_needed: true,
+            update_now: true,
             height_slider_drag: false,
             height_slider_bounds: Default::default(),
             icon_cache: std::collections::HashMap::new(),
             visible_tiles_buf: Vec::new(),
+            coord_line_cache: std::collections::HashMap::new(),
+            status_cache: None,
             paste_overlay_cache: None,
             last_frame: std::time::Instant::now(),
         };
@@ -138,6 +177,14 @@ impl MainView {
         })
         .detach();
         v
+    }
+
+    /// mark the tile set dirty: the next paint runs map.update() so new
+    /// tiles are requested frame-paced, and the 100ms poll still re-runs
+    /// update() + evict_invisible() as before.
+    fn request_update(&mut self) {
+        self.update_needed = true;
+        self.update_now = true;
     }
 
     fn poll_tick(&mut self, cx: &mut Context<Self>) {
@@ -164,7 +211,10 @@ impl MainView {
         } else if !busy && matches!(self.dialog, Some(Dialog::JobProgress)) {
             self.dialog = None;
         }
-        if self.pressed_keys != 0 || self.drag.is_move() || busy
+        // `changed` covers tile results that landed after the job counter
+        // already drained — without it the last batch waits for the next
+        // unrelated repaint before it shows.
+        if self.pressed_keys != 0 || self.drag.is_move() || busy || changed
             || matches!(self.dialog, Some(Dialog::JobProgress)) || mc_core::jobs::active_jobs() > 0
         {
             cx.notify();
@@ -261,7 +311,7 @@ impl MainView {
         self.map.disabled = false;
         self.map.clear_selection();
         self.map.unsaved_selection = false;
-        self.update_needed = true;
+        self.request_update();
         let mut g = config::global();
         g.add_recent_world(root, dims);
         config::set_global(g);
@@ -294,7 +344,7 @@ impl MainView {
         self.map.pool_order.clear();
         self.map.mark_all_tiles_obsolete();
         self.map.loading.clear();
-        self.update_needed = true;
+        self.request_update();
         cx.notify();
     }
 
@@ -316,11 +366,17 @@ impl MainView {
             self.map.scale /= factor;
             let pos = Point2f::new(f32::from(event.position.x), f32::from(event.position.y));
             if self.map.update_scale(old, pos) {
-                // request fresh-resolution tiles now, not on the next 100ms poll.
-                self.map.update();
-                self.update_needed = true;
+                // request fresh-resolution tiles at the next paint — a wheel
+                // burst then costs one O(visible) update per frame instead
+                // of one per event.
+                self.request_update();
             }
-            cx.notify();
+            // update_scale only mutates the view when the scale actually
+            // changed; a scroll fully eaten by the min/max clamp repaints
+            // an identical frame, so skip it.
+            if self.map.scale != old {
+                cx.notify();
+            }
         }
     }
 
@@ -409,33 +465,120 @@ impl MainView {
             return;
         }
         let pos = Point2f::new(f32::from(event.position.x), f32::from(event.position.y));
-        self.map.hovered_block = Some(self.map.mouse_block(pos.x, pos.z));
+        // repaint only when something visible actually changed: mouse moves
+        // that keep the same hovered block / paste offset / selection used
+        // to repaint the full scene for every event.
+        let hovered = self.map.mouse_block(pos.x, pos.z);
+        let mut dirty = self.map.hovered_block != Some(hovered);
+        self.map.hovered_block = Some(hovered);
         if self.map.disabled || self.dialog.is_some() {
             self.previous = pos;
-            cx.notify();
+            if dirty {
+                cx.notify();
+            }
             return;
         }
         let pressed = event.pressed_button;
         if self.drag == Drag::PasteMove {
+            // the ghost is quantized to whole chunks — most sub-chunk moves
+            // leave the pasted offset (and the frame) unchanged.
+            let off = self.map.pasted.as_ref().map(|p| p.offset);
             self.map.drag_paste_offset(pos);
+            dirty |= off != self.map.pasted.as_ref().map(|p| p.offset);
             self.previous = pos;
-            cx.notify();
+            if dirty {
+                cx.notify();
+            }
             return;
         }
         if self.drag.is_move() || pressed == Some(MouseButton::Middle) {
             let dx = (self.previous.x - pos.x) * self.map.scale;
             let dz = (self.previous.z - pos.z) * self.map.scale;
-            self.map.offset = self.map.offset.add(dx, dz);
+            if dx != 0.0 || dz != 0.0 {
+                self.map.offset = self.map.offset.add(dx, dz);
+                dirty = true;
+            }
         } else if pressed.is_some() && self.drag != Drag::None {
             if let Some(mark) = self.drag.mark() {
                 // upstream: paintMode = SHIFT held (other keys ignored)
                 let paint_mode = event.modifiers.shift;
-                self.map.mark(pos.x, pos.z, mark, self.first, paint_mode);
-                self.map.selection_version += 1;
+                // mark() only touches regions in the drag rect — hash their
+                // effective selection before/after and repaint only when the
+                // painted overlay would differ (selected_chunks alone can't
+                // see no-op drags over already-marked territory, or the rare
+                // Some(full-set) -> whole-region color swap).
+                let (a, b) = if self.map.scale > CHUNK_GRID_SCALE {
+                    let mouse = self.map.mouse_region(pos.x, pos.z);
+                    let first = if paint_mode {
+                        mouse
+                    } else {
+                        self.map.mouse_region(self.first.x, self.first.z)
+                    };
+                    (mouse, first)
+                } else {
+                    let mouse = self.map.mouse_chunk(pos.x, pos.z).chunk_to_region();
+                    let first = if paint_mode {
+                        mouse
+                    } else {
+                        self.map.mouse_chunk(self.first.x, self.first.z).chunk_to_region()
+                    };
+                    (mouse, first)
+                };
+                let (rx0, rx1) = (a.x.min(b.x), a.x.max(b.x));
+                let (rz0, rz1) = (a.z.min(b.z), a.z.max(b.z));
+                let rect_area = (rx1 - rx0 + 1) as i64 * (rz1 - rz0 + 1) as i64;
+                if rect_area > 64 {
+                    // hashing every affected region costs more than the
+                    // repaint it would save — mark() on a rect this big is
+                    // already the dominant cost.
+                    self.map.mark(pos.x, pos.z, mark, self.first, paint_mode);
+                    self.map.selection_version += 1;
+                    dirty = true;
+                } else {
+                    // FNV-1a over what the selection overlay paints per region:
+                    // region_selected flag + effective chunk bitmask.
+                    let sel_hash = |sel: &mc_core::selection::Selection| -> u64 {
+                        let mut h = 0xcbf29ce484222325u64;
+                        for x in rx0..=rx1 {
+                            for z in rz0..=rz1 {
+                                let p = Point2i::new(x, z);
+                                let l = p.as_long();
+                                h = (h ^ l as u64).wrapping_mul(0x100000001b3);
+                                h = (h ^ sel.is_region_selected(l) as u64).wrapping_mul(0x100000001b3);
+                                match sel.selected_chunks(p) {
+                                    None => h = (h ^ 0xff).wrapping_mul(0x100000001b3),
+                                    Some(None) => h = (h ^ 0xaa).wrapping_mul(0x100000001b3),
+                                    Some(Some(cs)) => {
+                                        for i in cs.iter() {
+                                            h = (h ^ i as u64).wrapping_mul(0x100000001b3);
+                                        }
+                                        h = (h ^ 0xbb).wrapping_mul(0x100000001b3);
+                                    }
+                                }
+                            }
+                        }
+                        h
+                    };
+                    let sel_state = (
+                        sel_hash(&self.map.selection),
+                        self.map.selected_chunks,
+                        self.map.unsaved_selection,
+                    );
+                    self.map.mark(pos.x, pos.z, mark, self.first, paint_mode);
+                    self.map.selection_version += 1;
+                    dirty |= sel_state
+                        != (
+                            sel_hash(&self.map.selection),
+                            self.map.selected_chunks,
+                            self.map.unsaved_selection,
+                        );
+                }
             }
         }
         self.previous = pos;
-        cx.notify();
+        if dirty {
+            cx.notify();
+        }
     }
 
     fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -449,7 +592,7 @@ impl MainView {
             p.first_mouse = None;
         }
         self.drag = Drag::None;
-        self.update_needed = true;
+        self.request_update();
         cx.notify();
     }
 
@@ -459,21 +602,27 @@ impl MainView {
             return;
         }
         let k = event.keystroke.key.as_str();
+        let before = self.pressed_keys;
         match k {
             "w" | "up" => self.pressed_keys |= 1,
             "a" | "left" => self.pressed_keys |= 2,
             "s" | "down" => self.pressed_keys |= 4,
             "d" | "right" => self.pressed_keys |= 8,
 
-            "+" | "=" => self.zoom_key(2.0, cx),
-            "-" => self.zoom_key(0.5, cx),
+            // zoom_key notifies internally when it changes the view
+            "+" | "=" => { self.zoom_key(2.0, cx); return; }
+            "-" => { self.zoom_key(0.5, cx); return; }
             "escape" => {}
             _ => {}
         }
-        cx.notify();
+        // held-key repeats and untracked keys change nothing on screen
+        if self.pressed_keys != before {
+            cx.notify();
+        }
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let before = self.pressed_keys;
         match event.keystroke.key.as_str() {
             "w" | "up" => self.pressed_keys &= !1,
             "a" | "left" => self.pressed_keys &= !2,
@@ -482,7 +631,9 @@ impl MainView {
 
             _ => {}
         }
-        cx.notify();
+        if self.pressed_keys != before {
+            cx.notify();
+        }
     }
 
     fn dialog_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -492,7 +643,7 @@ impl MainView {
                 "enter" => {
                     if let (Ok(xi), Ok(zi)) = (x.parse::<i32>(), z.parse::<i32>()) {
                         self.map.go_to(xi, zi);
-                        self.update_needed = true;
+                        self.request_update();
                         self.dialog = None;
                     }
                 }
@@ -733,7 +884,7 @@ impl MainView {
         let old = self.map.scale;
         self.map.scale *= zoom;
         if self.map.update_scale(old, center) {
-            self.update_needed = true;
+            self.request_update();
         }
         cx.notify();
     }
@@ -745,6 +896,14 @@ impl MainView {
         self.map.height = f32::from(bounds.size.height);
         self.last_frame = std::time::Instant::now();
 
+        // frame-paced tile dispatch: scroll/zoom/view changes arm update_now
+        // per input event; running the O(visible-regions) update once here
+        // coalesces bursts (scroll wheels can fire many events per frame).
+        if self.update_now {
+            self.map.update();
+            self.update_now = false;
+        }
+
         if self.pressed_keys != 0 && !self.map.disabled {
             let speed = 10.0;
             let dx = if self.pressed_keys & 2 != 0 { -speed } else if self.pressed_keys & 8 != 0 { speed } else { 0.0 };
@@ -754,8 +913,11 @@ impl MainView {
         }
 
         let scale = self.map.scale;
+        // read-guard instead of config::world(): world() clones the whole
+        // WorldState (dirs, dimensions, cfg) and this ran every frame.
         let show_empty = self.map.show_nonexistent_regions
-            && config::world().map(|w| w.cfg.show_nonexistent_regions).unwrap_or(true);
+            && config::WORLD.read().unwrap().as_ref()
+                .map(|w| w.cfg.show_nonexistent_regions).unwrap_or(true);
         // upstream draws the empty tile image under every unloaded/missing
         // region — one fullscreen quad does the same job. EMPTY_COLOR is
         // opaque and covers the same bounds, so the black clear is only
@@ -805,14 +967,17 @@ impl MainView {
                 *paste_cache = None;
             }
             // config reads used to run per tile (each clones BTreeMaps);
-            // hoist to once per frame, and only when something needs them.
-            let g_cfg = if map.pasted.is_some() || map.show_structure_icons {
-                Some(config::global())
+            // now a read-guard held for the tile pass — zero clones, still
+            // only taken when something needs it.
+            let g_guard = if map.pasted.is_some() || map.show_structure_icons {
+                Some(config::GLOBAL.read().unwrap())
             } else {
                 None
             };
+            let g_cfg = g_guard.as_ref().and_then(|g| g.as_ref());
             let icon_size_cfg = if map.show_structure_icons {
-                config::world().map(|w| w.cfg.structure_icon_size).unwrap_or(32)
+                config::WORLD.read().unwrap().as_ref()
+                    .map(|w| w.cfg.structure_icon_size).unwrap_or(32)
             } else {
                 0
             };
@@ -902,27 +1067,26 @@ impl MainView {
             let zoom = get_zoom_level(scale);
             let edge = style == crate::tilemap::CoordinateStyle::Edge
                 || (style == crate::tilemap::CoordinateStyle::Dynamic && scale > 30.0);
-            let mut paint = |text: String, sx: f32, sz: f32| {
-                let line = ts.shape_line(
-                    SharedString::from(text),
-                    px(12.),
-                    &[TextRun {
-                        len: usize::MAX,
-                        font: Font {
-                            family: "Sans".into(),
-                            features: FontFeatures::default(),
-                            weight: FontWeight::NORMAL,
-                            style: FontStyle::Normal,
-                            fallbacks: None,
-                        },
-                        color: rgba(COORDINATES_COLOR).into(),
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    }],
-                    None,
-                );
-                let _ = line.paint(point(px(sx), px(sz)), px(14.), window, _cx);
+            let run = [TextRun {
+                len: usize::MAX,
+                font: Font {
+                    family: "Sans".into(),
+                    features: FontFeatures::default(),
+                    weight: FontWeight::NORMAL,
+                    style: FontStyle::Normal,
+                    fallbacks: None,
+                },
+                color: rgba(COORDINATES_COLOR).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }];
+            let coord_cache = &mut self.coord_line_cache;
+            // label text repeats across frames; shaping is the expensive
+            // part, so cache ShapedLine by coordinate and only paint here.
+            // `text` is lazy so a cache hit doesn't even format the label.
+            let mut paint = |key: CoordKey, text: &mut dyn FnMut() -> String, sx: f32, sz: f32| {
+                paint_coord(coord_cache, &ts, &run, key, text, sx, sz, window, _cx);
             };
             if edge {
                 // edge labels: x along top, z along left (upstream rotates x;
@@ -936,7 +1100,7 @@ impl MainView {
                     let bx = rx as i64 * 512;
                     let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
                     if sx >= 0.0 && sx <= self.map.width {
-                        paint(abbrev_coord(bx as i32), sx, 2.0);
+                        paint(CoordKey::Edge(bx), &mut || abbrev_coord(bx as i32), sx, 2.0);
                     }
                 }
                 let z0 = vmin.z + (step - vmin.z.rem_euclid(step)) % step;
@@ -944,7 +1108,7 @@ impl MainView {
                     let bz = rz as i64 * 512;
                     let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
                     if sz >= 0.0 && sz <= self.map.height {
-                        paint(abbrev_coord(bz as i32), 2.0, sz);
+                        paint(CoordKey::Edge(bz), &mut || abbrev_coord(bz as i32), 2.0, sz);
                     }
                 }
             } else {
@@ -964,7 +1128,9 @@ impl MainView {
                         if sx < 0.0 || sz < 0.0 || sx > self.map.width || sz > self.map.height {
                             continue;
                         }
-                        paint(format!("{}, {}", abbrev_coord(bx as i32), abbrev_coord(bz as i32)), sx, sz);
+                        paint(CoordKey::Grid(bx, bz), &mut || {
+                            format!("{}, {}", abbrev_coord(bx as i32), abbrev_coord(bz as i32))
+                        }, sx, sz);
                     }
                 }
             }
@@ -1019,6 +1185,35 @@ impl MainView {
         }
     }
 
+}
+
+/// paint one coordinate label, reusing the cached ShapedLine when the same
+/// coordinate was shaped before. `text` runs only on a cache miss.
+#[allow(clippy::too_many_arguments)]
+fn paint_coord(
+    cache: &mut std::collections::HashMap<CoordKey, ShapedLine>,
+    ts: &WindowTextSystem,
+    run: &[TextRun],
+    key: CoordKey,
+    text: &mut dyn FnMut() -> String,
+    sx: f32,
+    sz: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let line = match cache.get(&key) {
+        Some(l) => l,
+        None => {
+            // bound the cache: a panning session would otherwise accumulate
+            // an entry per coordinate ever shown.
+            if cache.len() >= 1024 {
+                cache.clear();
+            }
+            let l = ts.shape_line(SharedString::from(text()), px(12.), run, None);
+            cache.entry(key).or_insert(l)
+        }
+    };
+    let _ = line.paint(point(px(sx), px(sz)), px(14.), window, cx);
 }
 
 /// upstream TileMap.drawStructureIcons: first enabled structure icon per
@@ -1210,25 +1405,19 @@ fn build_paste_overlay(
 
 impl MainView {
     fn render_layer_only_only(&self) -> bool {
-        config::world().map(|w| w.cfg.render_layer_only).unwrap_or(false)
+        config::WORLD.read().unwrap().as_ref()
+            .map(|w| w.cfg.render_layer_only).unwrap_or(false)
     }
 
-    fn status_text(&mut self) -> String {
+    /// status-bar text; the formatted string is cached and rebuilt only
+    /// when an input that can change it differs (StatusKey).
+    fn status_text(&mut self) -> SharedString {
         let (min, max) = self.map.visible_region_bounds(Point2f::ZERO);
-        let visible_regions = ((max.x - min.x + 1) * (max.z - min.z + 1)).max(0) as usize;
-        let mut parts = vec![
-            format!("{} visible tiles", self.map.visible_tiles()),
-            format!("{} visible regions", visible_regions),
-            format!("{} visible chunks", self.map.visible_tiles() as i64 * 1024),
-            format!("zoom {}", self.map.scale),
-        ];
-        if let Some(h) = self.map.hovered_block {
-            parts.push(format!("{} {}", h.x, h.z));
-        }
-        parts.push(format!("{} selected chunks", self.map.selected_chunks));
+        let visible_tiles = (max.x - min.x + 1) * (max.z - min.z + 1);
+        let visible_regions = visible_tiles.max(0) as usize;
         // upstream status bar: hovered structure names
-        if self.map.show_structure_icons {
-            let st = self.map.hovered_block.and_then(|h| {
+        let structure = if self.map.show_structure_icons {
+            self.map.hovered_block.and_then(|h| {
                 let c = h.block_to_chunk();
                 let r = c.chunk_to_region();
                 self.map
@@ -1236,22 +1425,14 @@ impl MainView {
                     .get(&r.as_long())
                     .and_then(|t| t.structures.as_ref())
                     .and_then(|m| m.get(&c.as_long()))
-            });
-            if let Some(names) = st {
-                if !names.is_empty() {
-                    parts.push(format!(
-                        "structures: {}{}",
-                        names[0],
-                        if names.len() > 1 { ", ..." } else { "" }
-                    ));
-                }
-            }
-        }
-        if self.map.unsaved_selection {
-            parts.push("selection not saved".into());
-        }
-        if let Some(ov) = &self.map.overlay {
-            // upstream: "type(min, max), hoveredValue"
+                    .filter(|names| !names.is_empty())
+                    .map(|names| (names[0].clone(), names.len() > 1))
+            })
+        } else {
+            None
+        };
+        // upstream: "type(min, max), hoveredValue"
+        let overlay = self.map.overlay.as_ref().map(|ov| {
             let val = self.map.hovered_block.and_then(|h| {
                 let c = h.block_to_chunk();
                 let r = c.chunk_to_region();
@@ -1262,19 +1443,58 @@ impl MainView {
                     .and_then(|t| t.overlay_data.as_ref())
                     .map(|d| d[(rel.z * 32 + rel.x) as usize])
             });
-            let mm = match (ov.min, ov.max) {
+            (ov.typ, ov.min, ov.max, val)
+        });
+        let key = StatusKey {
+            visible_tiles,
+            visible_regions,
+            scale_bits: self.map.scale.to_bits(),
+            hovered: self.map.hovered_block,
+            selected_chunks: self.map.selected_chunks,
+            unsaved_selection: self.map.unsaved_selection,
+            structure,
+            overlay,
+            jobs: mc_core::jobs::active_jobs(),
+        };
+        if let Some((k, s)) = &self.status_cache {
+            if *k == key {
+                return s.clone();
+            }
+        }
+        use std::fmt::Write;
+        let mut s = String::with_capacity(160);
+        let _ = write!(
+            s,
+            "{} visible tiles | {} visible regions | {} visible chunks | zoom {}",
+            visible_tiles, visible_regions, visible_tiles as i64 * 1024, self.map.scale
+        );
+        if let Some(h) = self.map.hovered_block {
+            let _ = write!(s, " | {} {}", h.x, h.z);
+        }
+        let _ = write!(s, " | {} selected chunks", self.map.selected_chunks);
+        if let Some((name, more)) = &key.structure {
+            let _ = write!(s, " | structures: {}{}", name, if *more { ", ..." } else { "" });
+        }
+        if self.map.unsaved_selection {
+            s.push_str(" | selection not saved");
+        }
+        if let Some((typ, mn, mx, val)) = key.overlay {
+            let mm = match (mn, mx) {
                 (Some(a), Some(b)) => format!("{}, {}", a, b),
                 _ => "-".to_string(),
             };
-            parts.push(format!(
-                "overlay: {}({}), {}",
-                ov.typ.display_name(),
+            let _ = write!(
+                s,
+                " | overlay: {}({}), {}",
+                typ.display_name(),
                 mm,
                 val.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
-            ));
+            );
         }
-        parts.push(format!("{} jobs in queue", mc_core::jobs::active_jobs()));
-        parts.join(" | ")
+        let _ = write!(s, " | {} jobs in queue", key.jobs);
+        let s = SharedString::from(s);
+        self.status_cache = Some((key, s.clone()));
+        s
     }
 }
 
@@ -1349,8 +1569,13 @@ fn selection_overlay_image(tile: &Tile, sel: &mc_core::selection::Selection, ver
 
 impl Render for MainView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let status = self.status_text();
-        let show_bar = config::world().is_some();
+        // read-guard: config::world() clones the whole WorldState per call.
+        let show_bar = config::WORLD.read().unwrap().is_some();
+        let status: SharedString = if show_bar {
+            self.status_text()
+        } else {
+            "no world loaded — File > Open World".into()
+        };
         self.focus.focus(window);
         let view = cx.entity();
 
@@ -1403,7 +1628,7 @@ impl Render for MainView {
                 if let Some(ws) = config::world() {
                     v.map.regions = files::scan_region_files(ws.region_dir());
                     v.map.mark_all_tiles_obsolete();
-                    v.update_needed = true;
+                    v.request_update();
                 }
                 cx.notify();
             }))
@@ -1476,7 +1701,7 @@ impl Render for MainView {
                 let old = v.map.scale;
                 v.map.scale = 1.0;
                 v.map.update_scale(old, center);
-                v.update_needed = true;
+                v.request_update();
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &SaveScreenshotAction, _w, cx| {
@@ -1487,7 +1712,7 @@ impl Render for MainView {
                     let _ = std::fs::remove_dir_all(&ws.cache_dir);
                 }
                 v.map.mark_all_tiles_obsolete();
-                v.update_needed = true;
+                v.request_update();
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &ClearAllCacheAction, _w, cx| v.clear_all_caches(cx)))
@@ -1513,7 +1738,7 @@ impl Render for MainView {
                     v.map.discard_cached_image(Point2i::from_long(k));
                 }
                 v.map.mark_all_tiles_obsolete();
-                v.update_needed = true;
+                v.request_update();
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &DeleteChunksAction, _w, cx| v.delete_chunks(cx)))
@@ -1591,7 +1816,7 @@ impl Render for MainView {
                     .px_2()
                     .text_size(px(11.))
                     .text_color(rgb(0xbbbbbb))
-                    .child(if show_bar { status } else { "no world loaded — File > Open World".to_string() }),
+                    .child(status),
             )
     }
 }
@@ -1681,7 +1906,8 @@ impl MainView {
 
 
     fn height_from_slider_x(&self, x: f32) -> i32 {
-        let cur = config::world().map(|w| w.cfg.render_height).unwrap_or(319);
+        let cur = config::WORLD.read().unwrap().as_ref()
+            .map(|w| w.cfg.render_height).unwrap_or(319);
         let Some(b) = *self.height_slider_bounds.borrow() else {
             return cur;
         };
@@ -1695,24 +1921,30 @@ impl MainView {
 
     fn set_render_height(&mut self, h: i32, persist: bool, cx: &mut Context<Self>) {
         let h = h.clamp(-64, 319);
-        let cur = config::world().map(|w| w.cfg.render_height).unwrap_or(319);
+        let cur = config::WORLD.read().unwrap().as_ref()
+            .map(|w| w.cfg.render_height).unwrap_or(319);
         if h == cur && !persist {
             return;
         }
-        if let Some(mut ws) = config::world() {
+        // mutate under the write lock — cloning WorldState + set_world per
+        // slider-move event was avoidable alloc work on the drag path.
+        // (save runs after the lock is released, as before.)
+        if let Some(ws) = config::WORLD.write().unwrap().as_mut() {
             ws.cfg.render_height = h;
-            if persist {
+        }
+        if persist {
+            if let Some(ws) = config::WORLD.read().unwrap().as_ref() {
                 ws.cfg.save(&ws.cache_dir);
             }
-            config::set_world(Some(ws));
         }
         self.map.mark_all_tiles_obsolete();
-        self.update_needed = true;
+        self.request_update();
         cx.notify();
     }
 
     fn render_height_slider(&self, cx: &mut Context<Self>) -> AnyElement {
-        let h = config::world().map(|w| w.cfg.render_height).unwrap_or(319);
+        let h = config::WORLD.read().unwrap().as_ref()
+            .map(|w| w.cfg.render_height).unwrap_or(319);
         let frac = (((h + 64) as f32) / 383.).clamp(0., 1.);
         let slot = self.height_slider_bounds.clone();
         div()
@@ -2253,7 +2485,7 @@ impl MainView {
                     }));
                 let _ = this.update(&mut *cx, |v, cx| {
                     v.map.mark_all_tiles_obsolete();
-                    v.update_needed = true;
+                    v.request_update();
                     cx.notify();
                 });
             }
@@ -2670,7 +2902,7 @@ impl MainView {
                                     if let Some(Dialog::Goto { x, z, .. }) = &v.dialog {
                                         if let (Ok(xi), Ok(zi)) = (x.parse::<i32>(), z.parse::<i32>()) {
                                             v.map.go_to(xi, zi);
-                                            v.update_needed = true;
+                                            v.request_update();
                                         }
                                     }
                                     v.dialog = None;
@@ -2851,7 +3083,7 @@ impl MainView {
                                     v.map.clear();
                                     v.map.regions = files::scan_region_files(ws.region_dir());
                                     v.map.disabled = false;
-                                    v.update_needed = true;
+                                    v.request_update();
                                 }
                                 v.dialog = None;
                                 cx.notify();

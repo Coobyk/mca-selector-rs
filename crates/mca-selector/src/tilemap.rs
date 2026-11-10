@@ -326,9 +326,10 @@ impl TileMapState {
         self.offset = self.offset.add_p(diff);
         let changed = get_zoom_level(old_scale) != get_zoom_level(self.scale);
         if changed {
-            // keep the stale tile images: update() replaces them with an
-            // instant downscale or a fresh render — clearing them here makes
-            // the map flash black on every wheel tick.
+            // keep the stale tile images: they stay painted at whatever
+            // resolution they have (the GPU stretches them) until a fresh
+            // render lands — clearing them here makes the map flash black
+            // on every wheel tick.
             jobs::pools().clear_queues();
             // dropped jobs never send results; clear the in-flight flags so
             // update() can re-request at the new zoom.
@@ -628,44 +629,23 @@ impl TileMapState {
         for region in requests {
             let key = region.as_long();
             // single lookup per region (was contains+get+get_mut).
-            let (downscale, request, need_overlay) = {
+            let (request, need_overlay) = {
                 let tile = self.tiles.entry(key).or_insert_with(|| Tile::new(region));
                 let need_overlay = self.overlay.is_some() && !tile.overlay_loaded;
-                let (downscale, request) = if tile.image.is_some() && tile.loaded {
-                    match tile.image_zoom_level().cmp(&zoom_level) {
-                        std::cmp::Ordering::Less => (true, false),
-                        // image already at the right zoom: upstream's pool
-                        // would just hand back the same buffer. re-requesting
-                        // here paid a pooled-buffer clone + RenderImage
-                        // rebuild for every visible tile on every update.
-                        std::cmp::Ordering::Equal => (false, false),
-                        // zoomed in past the image's resolution — need a render
-                        std::cmp::Ordering::Greater => (false, true),
-                    }
-                } else {
-                    (false, !tile.loaded)
-                };
-                (downscale, request, need_overlay)
+                // Any existing image is paintable at ANY zoom: paint_map
+                // draws render_image into a fixed-size screen rect and the
+                // GPU does the stretching. A finer-than-needed image
+                // (img_zoom < zoom_level) just paints smaller — keeping it
+                // is free, while the old scale_down + texture rebuild cost
+                // a ~1MB CPU rescale and an atlas upload per tile per zoom
+                // boundary. Only an image too coarse for the current zoom
+                // (img_zoom > zoom_level) still needs a finer render; it
+                // stays on screen until that lands.
+                let request = !tile.loaded
+                    || (tile.image.is_some() && tile.image_zoom_level() > zoom_level);
+                (request, need_overlay)
             };
-            if downscale {
-                // image has more detail than needed — downscale instantly
-                // (upstream's pyramid does the same) instead of paying a
-                // full NBT re-render on zoom-out.
-                if let Some((img, _)) = self.tiles.get_mut(&key).and_then(|t| t.image.take()) {
-                    let from = (img.len() as f64).sqrt() as usize;
-                    let to = (TILE_SIZE / zoom_level as usize).max(1);
-                    let scaled: Arc<Vec<u32>> = if from > to {
-                        Arc::new(render::scale_down(&img, from, to))
-                    } else {
-                        img
-                    };
-                    if let Some(tile) = self.tiles.get_mut(&key) {
-                        tile.render_image = argb_to_render_image(&scaled, to);
-                        tile.image = Some((scaled.clone(), zoom_level));
-                    }
-                    self.push_pool(zoom_level, region, scaled);
-                }
-            } else if request {
+            if request {
                 self.request_image(&ws, region, zoom_level);
             } else {
                 // ready tile: pick up cached structure data once, then this
@@ -874,11 +854,21 @@ impl TileMapState {
                     self.fetch_or_parse_structures(ws, region);
                     return;
                 } else {
-                    // lower res: use anyway, keep looking on disk
-                    let t = self.tiles.get_mut(&key).unwrap();
-                    t.render_image = argb_to_render_image(&img, TILE_SIZE / zoom_level as usize);
-                    t.image = Some((img, zoom_level));
-                    t.loaded = true;
+                    // lower res: use as a progressive placeholder and keep
+                    // looking on disk — but only if it beats what the tile
+                    // already shows, and tag/render it at the image's own
+                    // zoom, not the view's.
+                    let dominated = self
+                        .tiles
+                        .get(&key)
+                        .map(|t| t.image.is_some() && t.image_zoom_level() <= zl)
+                        .unwrap_or(false);
+                    if !dominated {
+                        let t = self.tiles.get_mut(&key).unwrap();
+                        t.render_image = argb_to_render_image(&img, TILE_SIZE / zl as usize);
+                        t.image = Some((img, zl));
+                        t.loaded = true;
+                    }
                     self.fetch_or_parse_structures(ws, region);
                     break;
                 }
@@ -893,12 +883,13 @@ impl TileMapState {
         }
         if !outdated {
             if zoom_level >= 32 {
-                if let Some((img, _)) = cache::get_lod_image(&ws.uuid, region) {
+                if let Some((img, size)) = cache::get_lod_image(&ws.uuid, region) {
                     let img = Arc::new(img);
-                    self.push_pool(zoom_level, region, img.clone());
+                    let img_zoom = (TILE_SIZE / size) as i32;
+                    self.push_pool(img_zoom, region, img.clone());
                     if let Some(t) = self.tiles.get_mut(&key) {
-                        t.render_image = argb_to_render_image(&img, TILE_SIZE / zoom_level as usize);
-                        t.image = Some((img, zoom_level));
+                        t.render_image = argb_to_render_image(&img, size);
+                        t.image = Some((img, img_zoom));
                         t.loaded = true;
                     }
                     return;
@@ -939,7 +930,9 @@ impl TileMapState {
                 if !t.loaded {
                     let img = render::lod_image(&cs, ws.cfg.zoom_level_lod_color);
                     t.render_image = argb_to_render_image(&img, 32);
-                    t.image = Some((Arc::new(img), zoom_level));
+                    // the tuple always carries the image's own zoom: a
+                    // 32x32 tile image is zoom 16 regardless of view zoom.
+                    t.image = Some((Arc::new(img), (TILE_SIZE / 32) as i32));
                 }
             }
         }
@@ -1224,12 +1217,34 @@ impl TileMapState {
                         }
                     }
                     let image = image.map(Arc::new);
-                    // renders that landed at a stale zoom are still valid
-                    // data — keep them in the pool but don't clobber the
-                    // tile's current-zoom image.
-                    if image.is_some() && zoom != get_zoom_level(self.scale) {
+                    let view_zoom = get_zoom_level(self.scale);
+                    // renders that land at a stale zoom are still valid
+                    // data — keep them in the pool and adopt them as the
+                    // tile's progressive image (paint_map stretches any
+                    // resolution to the tile rect on the GPU), unless the
+                    // tile already shows an image at least as sharp. An
+                    // image at exactly the current zoom is never clobbered.
+                    if image.is_some() && zoom != view_zoom {
                         if let Some(img) = &image {
                             self.push_pool(zoom, region, img.clone());
+                            let adopt = match self.tiles.get(&key) {
+                                Some(t) if t.image.is_some() => {
+                                    let cur = t.image_zoom_level();
+                                    cur != view_zoom && zoom <= cur
+                                }
+                                _ => true,
+                            };
+                            if adopt {
+                                let size = (img.len() as f64).sqrt() as usize;
+                                let t = self.tiles.get_mut(&key).unwrap();
+                                t.render_image = argb_to_render_image(img, size);
+                                t.image = Some((img.clone(), zoom));
+                                if let Some(s) = structures {
+                                    t.structures = Some(s);
+                                    t.structures_checked = true;
+                                }
+                                t.loaded = true;
+                            }
                         }
                         continue;
                     }
@@ -1252,7 +1267,7 @@ impl TileMapState {
                     }
                     if let Some(ws) = &ws {
                         if cache_write {
-                            self.write_image_cache(ws, region, zoom);
+                            self.write_image_cache(ws, region);
                         }
                         self.record_file_time(ws, region);
                     }
@@ -1275,9 +1290,12 @@ impl TileMapState {
     }
 
     /// write the tile's current image to the disk caches (RegionImageGeneratorSaveJob).
-    fn write_image_cache(&self, ws: &crate::config::WorldState, region: Point2i, zoom: i32) {
+    /// Keyed by the image's own zoom (the tuple's stored zoom), which may
+    /// differ from the view's current zoom.
+    fn write_image_cache(&self, ws: &crate::config::WorldState, region: Point2i) {
         let Some(t) = self.tiles.get(&region.as_long()) else { return };
-        let Some((img, _)) = &t.image else { return };
+        let Some((img, zoom)) = &t.image else { return };
+        let zoom = *zoom;
         if zoom >= 32 {
             cache::set_lod_image(&ws.uuid, region, img);
         } else {

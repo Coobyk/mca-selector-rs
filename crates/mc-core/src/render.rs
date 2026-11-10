@@ -62,14 +62,23 @@ pub fn generate_image(
     let mut terrain_heights = vec![0i16; pixels];
     let mut water_heights = if shade_water { vec![0i16; pixels] } else { Vec::new() };
 
+    // chunks in a region almost always share a DataVersion — cache the
+    // last dispatch (chunk_format + color_mapping) instead of re-walking
+    // the tables and OnceLocks per chunk.
+    let mut last_dv: Option<i32> = None;
+    let mut format = version::ChunkFormat::Null;
+    let mut cm = version::ColorMap::Null;
     for cx in 0..SIZE_IN_CHUNKS {
         for cz in 0..SIZE_IN_CHUNKS {
             let index = cz * SIZE_IN_CHUNKS + cx;
             let Some(chunk) = &mca.chunks[index] else { continue };
             let Some(data) = &chunk.data else { continue };
             let data_version = nbt::data_version(Some(data));
-            let format = version::chunk_format(data_version);
-            let cm = version::color_mapping(data_version);
+            if last_dv != Some(data_version) {
+                last_dv = Some(data_version);
+                format = version::chunk_format(data_version);
+                cm = version::color_mapping(data_version);
+            }
             let x = cx * chunk_size;
             let z = cz * chunk_size;
             // upstream wraps each chunk's draw in try/catch and paints the

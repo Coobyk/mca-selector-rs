@@ -87,7 +87,9 @@ pub fn world_cache_dir(region_dir: &Path) -> PathBuf {
 
 /// per-zoom-level png cache: world_cache/<zoom>/r.x.z.png
 pub fn png_cache_path(world_cache: &Path, zoom: i32, r: Point2i) -> PathBuf {
-    world_cache.join(zoom.to_string()).join(png_file_name(r))
+    // one join+format (2 allocs) instead of zoom.to_string()+two joins (~4);
+    // called ~8x per tile request while probing the png pyramid.
+    world_cache.join(format!("{}/{}", zoom, png_file_name(r)))
 }
 
 pub fn has_mca_files(dir: &Path) -> bool {

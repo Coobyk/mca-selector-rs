@@ -38,8 +38,21 @@ impl Job {
         self.base + self.prio.as_ref().map(|p| p()).unwrap_or(0)
     }
     fn run(self) {
-        (self.work)();
+        // a panicking job must not take its worker thread down — upstream
+        // runs on an ExecutorService which replaces dead workers. Without
+        // this the pool silently shrank (progressive lag) and ACTIVE leaked,
+        // leaving the UI in permanent "jobs in queue" repaint mode.
+        let Job { work, .. } = self;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
         ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        if let Err(e) = result {
+            let msg = e
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| e.downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("unknown panic");
+            eprintln!("process pool job panicked: {msg}");
+        }
     }
 }
 
@@ -65,11 +78,14 @@ impl PartialOrd for HeapEntry {
 }
 impl Ord for HeapEntry {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-        // lower priority value = run first (Java PriorityBlockingQueue)
+        // lower priority value = run first (Java PriorityBlockingQueue);
+        // both keys must be reversed for the max-heap so that the smallest
+        // (priority, id) tuple pops first — the id tie-break was forward,
+        // making equal-priority jobs run newest-first (LIFO).
         o.job
             .priority()
             .cmp(&self.job.priority())
-            .then_with(|| self.job.id.cmp(&o.job.id))
+            .then_with(|| o.job.id.cmp(&self.job.id))
     }
 }
 

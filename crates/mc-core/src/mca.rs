@@ -6,8 +6,9 @@ use anyhow::{bail, Context as _, Result};
 use flate2::bufread::{GzDecoder, ZlibDecoder};
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const HEADER_SIZE: usize = 8192;
 pub const HEADER_OFFSETS_SIZE: usize = 4096;
@@ -237,6 +238,48 @@ fn offset_at(buf: &[u8], i: usize) -> i32 {
     ((buf[o] as i32) << 16) | ((buf[o + 1] as i32) << 8) | (buf[o + 2] as i32)
 }
 
+// -- raw region-file image cache ------------------------------------------------
+
+/// Bounded cache of raw `.mca` bytes shared by repeated `load` calls.
+/// Entries are keyed by path, validated by (mtime, len) on every access and
+/// evicted oldest-first. Parsed `McaFile`s can't be shared — jobs consume
+/// owned files and `chunk.data` is mutated by callers — but the raw image is
+/// immutable, so `Arc<Vec<u8>>` handouts are cheap and safe.
+struct RawFileCache {
+    map: std::collections::HashMap<PathBuf, RawFileEntry>,
+    order: std::collections::VecDeque<PathBuf>,
+    bytes: usize,
+}
+
+struct RawFileEntry {
+    mtime_ms: i64,
+    len: u64,
+    data: Arc<Vec<u8>>,
+}
+
+const RAW_CACHE_MAX_ENTRIES: usize = 24;
+const RAW_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+fn raw_file_cache() -> &'static parking_lot::Mutex<RawFileCache> {
+    static C: std::sync::OnceLock<parking_lot::Mutex<RawFileCache>> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        parking_lot::Mutex::new(RawFileCache {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+        })
+    })
+}
+
+/// drop any cached image for `path` (called after writes/renames).
+fn invalidate_file_cache(path: &Path) {
+    let mut c = raw_file_cache().lock();
+    if let Some(e) = c.map.remove(path) {
+        c.bytes = c.bytes.saturating_sub(e.len as usize);
+        c.order.retain(|p| p != path);
+    }
+}
+
 impl McaFile {
     pub fn new(file: PathBuf) -> Result<Self> {
         let location = crate::files::parse_mca_file_name(
@@ -264,8 +307,54 @@ impl McaFile {
         }
     }
 
-    fn read_file(&self) -> Result<Vec<u8>> {
-        Ok(std::fs::read(&self.file)?)
+    /// Read the region file image. Repeated loads of the same file — the
+    /// image + overlay jobs for one region, re-renders at a new zoom level,
+    /// or a defragment right after a render — hit a small bounded cache
+    /// instead of re-reading several MB per job. Entries are validated by
+    /// (mtime, len) so any rewrite automatically misses, and are dropped
+    /// explicitly by the write paths below.
+    fn read_file(&self) -> Result<Arc<Vec<u8>>> {
+        let stamp = std::fs::metadata(&self.file).ok().and_then(|m| {
+            let ms = m
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis() as i64;
+            Some((ms, m.len()))
+        });
+        if let Some((mtime_ms, len)) = stamp {
+            let c = raw_file_cache().lock();
+            if let Some(e) = c.map.get(&self.file) {
+                if e.mtime_ms == mtime_ms && e.len == len {
+                    return Ok(e.data.clone());
+                }
+            }
+        }
+        let data = Arc::new(std::fs::read(&self.file)?);
+        if let Some((mtime_ms, len)) = stamp {
+            let mut c = raw_file_cache().lock();
+            if let Some(old) = c.map.insert(
+                self.file.clone(),
+                RawFileEntry { mtime_ms, len, data: data.clone() },
+            ) {
+                c.bytes = c.bytes.saturating_sub(old.len as usize);
+                c.order.retain(|p| p != &self.file);
+            }
+            c.order.push_back(self.file.clone());
+            c.bytes = c.bytes.saturating_add(len as usize);
+            while c.map.len() > RAW_CACHE_MAX_ENTRIES || c.bytes > RAW_CACHE_MAX_BYTES {
+                match c.order.pop_front() {
+                    Some(k) => {
+                        if let Some(e) = c.map.remove(&k) {
+                            c.bytes = c.bytes.saturating_sub(e.len as usize);
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+        Ok(data)
     }
 
     
@@ -309,33 +398,41 @@ impl McaFile {
         }
         self.parse_header(&data[..HEADER_SIZE]);
         let origin = self.location.region_to_chunk();
-        let offsets = self.offsets;
-        let timestamps = self.timestamps;
+        let data: &[u8] = data.as_slice();
+        let offsets = &self.offsets;
+        let timestamps = &self.timestamps;
         let file = &self.file;
+        let parse = |i: usize| -> Option<Chunk> {
+            if offsets[i] == 0 {
+                return None;
+            }
+            let loc = origin.add_p(Point2i::from_chunk_index(i as i32));
+            let pos = offsets[i] as usize * 4096;
+            match Self::parse_chunk(data, pos, loc, file, raw) {
+                Ok(Some(mut c)) => {
+                    c.timestamp = timestamps[i];
+                    Some(c)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("failed to load chunk at {loc}: {e}");
+                    None
+                }
+            }
+        };
         // decompress+parse is the dominant region-load cost and chunks are
         // independent: spread them over the rayon pool. collect() preserves
         // index order so chunks[i] still corresponds to header slot i.
-        self.chunks = (0..1024)
-            .into_par_iter()
-            .map(|i| {
-                if offsets[i] == 0 {
-                    return None;
-                }
-                let loc = origin.add_p(Point2i::from_chunk_index(i as i32));
-                let pos = offsets[i] as usize * 4096;
-                match Self::parse_chunk(&data, pos, loc, file, raw) {
-                    Ok(Some(mut c)) => {
-                        c.timestamp = timestamps[i];
-                        Some(c)
-                    }
-                    Ok(None) => None,
-                    Err(e) => {
-                        eprintln!("failed to load chunk at {loc}: {e}");
-                        None
-                    }
-                }
-            })
-            .collect();
+        // Nearly-empty regions stay sequential — the process-pool workers
+        // already saturate all cores, so cross-thread dispatch of a handful
+        // of tiny chunk tasks is pure overhead.
+        const PAR_CHUNK_THRESHOLD: usize = 64;
+        let present = offsets.iter().filter(|&&o| o != 0).count();
+        self.chunks = if present >= PAR_CHUNK_THRESHOLD {
+            (0..1024).into_par_iter().map(parse).collect()
+        } else {
+            (0..1024).map(parse).collect()
+        };
         Ok(())
     }
 
@@ -355,10 +452,15 @@ impl McaFile {
         // from the slice and uncompressed chunks parse in place (no copies).
         let payload: Cow<'_, [u8]> = if compression.is_external() {
             let mcc = mcc_path(file, loc);
-            if !mcc.exists() {
-                bail!("mcc file {} does not exist", mcc.display());
+            // one syscall instead of exists()+read; missing file keeps the
+            // same bail message as before.
+            match std::fs::read(&mcc) {
+                Ok(b) => Cow::Owned(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    bail!("mcc file {} does not exist", mcc.display())
+                }
+                Err(e) => return Err(e.into()),
             }
-            Cow::Owned(std::fs::read(&mcc)?)
         } else {
             let end = (pos + 5 + length.saturating_sub(1)).min(data.len());
             Cow::Borrowed(&data[pos + 5..end])
@@ -379,21 +481,50 @@ impl McaFile {
     }
 
     pub fn load_single_chunk(&self, chunk: Point2i, raw: bool) -> Result<Option<Chunk>> {
-        let data = self.read_file()?;
-        if data.len() < HEADER_SIZE {
-            return Ok(None);
-        }
         let rel = chunk.as_relative_chunk();
         let idx = rel.as_chunk_index();
-        let offset = offset_at(&data, idx);
-        let o = idx * 4;
-        let timestamp = i32::from_be_bytes(data[4096 + o..4096 + o + 4].try_into().unwrap());
         let abs = self.location.region_to_chunk().add_p(rel);
+        // only the 8KiB header + the target chunk's sectors are needed —
+        // the old version pulled the whole multi-MB region file into memory.
+        let mut f = std::fs::File::open(&self.file)?;
+        let mut hdr = [0u8; HEADER_SIZE];
+        let mut n = 0usize;
+        while n < HEADER_SIZE {
+            match f.read(&mut hdr[n..]) {
+                Ok(0) => break,
+                Ok(k) => n += k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if n < HEADER_SIZE {
+            return Ok(None);
+        }
+        let offset = offset_at(&hdr, idx);
+        let o = idx * 4;
+        let timestamp = i32::from_be_bytes(hdr[4096 + o..4096 + o + 4].try_into().unwrap());
         if offset <= 0 {
             return Ok(Some(Chunk::new(abs)));
         }
         let pos = offset as usize * 4096;
-        match Self::parse_chunk(&data, pos, abs, &self.file, raw) {
+        // parse_chunk wants a buffer laid out as [len i32][type u8][payload]
+        // starting at `pos`; build exactly that slice instead of the file.
+        let file_len = f.metadata()?.len() as usize;
+        f.seek(SeekFrom::Start(pos as u64))?;
+        let mut head = [0u8; 5];
+        if f.read_exact(&mut head).is_err() {
+            // pos+5 beyond EOF — same failure parse_chunk produced when the
+            // offset pointed outside the whole-file image.
+            bail!("chunk offset out of bounds");
+        }
+        let length = i32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
+        let payload_len = length
+            .saturating_sub(1)
+            .min(file_len.saturating_sub(pos + 5));
+        let mut data = Vec::with_capacity(5 + payload_len);
+        data.extend_from_slice(&head);
+        (&mut f).take(payload_len as u64).read_to_end(&mut data)?;
+        match Self::parse_chunk(&data, 0, abs, &self.file, raw) {
             Ok(mut c) => {
                 if let Some(c) = c.as_mut() {
                     c.timestamp = timestamp;
@@ -442,13 +573,14 @@ impl McaFile {
         let mut sectors = [0u8; 1024];
         let mut timestamps = [0i32; 1024];
 
-        w.seek(SeekFrom::Start((global_offset * 4096) as u64))?;
         for i in 0..1024 {
-            w.seek(SeekFrom::Start((global_offset * 4096) as u64))?;
             let Some(chunk) = &self.chunks[i] else { continue };
             if chunk.is_empty() {
                 continue;
             }
+            // seek only right before a write (skips the padding gap); empty
+            // slots no longer cost an lseek each.
+            w.seek(SeekFrom::Start((global_offset * 4096) as u64))?;
             last_written = write_chunk_data(w, chunk, &self.file, chunk.absolute_location)?;
             let secs = (last_written >> 12) + usize::from(last_written % 4096 != 0);
             offsets[i] = global_offset as i32;
@@ -496,6 +628,7 @@ impl McaFile {
         } else {
             std::fs::rename(&tmp, dest)?;
         }
+        invalidate_file_cache(dest);
         Ok(result)
     }
 
@@ -546,10 +679,12 @@ impl McaFile {
                 if dest == self.file {
                     let _ = std::fs::remove_file(dest);
                 }
+                invalidate_file_cache(dest);
                 return Ok(());
             }
         }
         std::fs::rename(&tmp, dest)?;
+        invalidate_file_cache(dest);
         Ok(())
     }
 
