@@ -141,6 +141,7 @@ impl MainView {
         let changed = self.map.poll_results();
         if self.update_needed || changed {
             self.map.update();
+            self.map.evict_invisible();
             self.update_needed = false;
         }
         let busy = mc_core::jobs::current_progress().is_some();

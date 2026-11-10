@@ -537,12 +537,9 @@ impl TileMapState {
     // -- the periodic update (updateService) ------------------------------------
 
     /// Called ~every 100ms or when the view changes. Mirrors
-    /// TileMap.initUpdateService: unload invisible tiles, drop stale jobs,
-    /// assign priorities center-out, request images.
-    pub fn update(&mut self) {
-        let Some(ws) = crate::config::world() else { return };
-        // unload invisible tiles — pixels stay in `pool`, so offscreen tiles
-        // are dropped entirely (bounds live GPU textures to the viewport).
+    /// evict tiles outside the viewport margin — O(total tiles), so it runs
+    /// on the slow poll rather than per scroll event.
+    pub fn evict_invisible(&mut self) {
         let mut to_remove = Vec::new();
         for (k, t) in &self.tiles {
             if !t.is_visible(self, TILE_VISIBILITY_THRESHOLD) {
@@ -552,6 +549,12 @@ impl TileMapState {
         for k in to_remove {
             self.tiles.remove(&k);
         }
+    }
+
+    /// TileMap.initUpdateService: assign priorities center-out, request images.
+    /// cheap enough to run per input event (O(visible regions)).
+    pub fn update(&mut self) {
+        let Some(ws) = crate::config::world() else { return };
 
         // priorities + image requests, spiral order. cap the request count —
         // at max zoom-out a huge screen can see >100k regions; loading all of
