@@ -84,6 +84,8 @@ pub struct MainView {
     pressed_keys: u8,
     dialog: Option<Dialog>,
     pub update_needed: bool,
+    height_slider_drag: bool,
+    height_slider_bounds: std::rc::Rc<std::cell::RefCell<Option<Bounds<Pixels>>>>,
     icon_cache: std::collections::HashMap<String, Arc<RenderImage>>,
     last_frame: std::time::Instant,
 }
@@ -111,6 +113,8 @@ impl MainView {
             pressed_keys: 0,
             dialog: None,
             update_needed: true,
+            height_slider_drag: false,
+            height_slider_bounds: Default::default(),
             icon_cache: std::collections::HashMap::new(),
             last_frame: std::time::Instant::now(),
         };
@@ -389,6 +393,11 @@ impl MainView {
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.height_slider_drag {
+            let h = self.height_from_slider_x(f32::from(event.position.x));
+            self.set_render_height(h, false, cx);
+            return;
+        }
         let pos = Point2f::new(f32::from(event.position.x), f32::from(event.position.y));
         self.map.hovered_block = Some(self.map.mouse_block(pos.x, pos.z));
         if self.map.disabled || self.dialog.is_some() {
@@ -420,6 +429,12 @@ impl MainView {
     }
 
     fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.height_slider_drag {
+            self.height_slider_drag = false;
+            if let Some(ws) = config::world() {
+                ws.cfg.save(&ws.cache_dir);
+            }
+        }
         if let Some(p) = &mut self.map.pasted {
             p.first_mouse = None;
         }
@@ -1348,6 +1363,20 @@ impl Render for MainView {
             }))
             .on_key_down(cx.listener(|v, e, w, cx| v.on_key_down(e, w, cx)))
             .on_key_up(cx.listener(|v, e, w, cx| v.on_key_up(e, w, cx)))
+            .on_mouse_move(cx.listener(|v, e: &MouseMoveEvent, _w, cx| {
+                if v.height_slider_drag {
+                    let h = v.height_from_slider_x(f32::from(e.position.x));
+                    v.set_render_height(h, false, cx);
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|v, _e: &MouseUpEvent, _w, cx| {
+                if v.height_slider_drag {
+                    v.height_slider_drag = false;
+                    if let Some(ws) = config::world() {
+                        ws.cfg.save(&ws.cache_dir);
+                    }
+                }
+            }))
             .child(
                 div()
                     .flex_grow()
@@ -1471,8 +1500,41 @@ impl MainView {
 
 
 
+    fn height_from_slider_x(&self, x: f32) -> i32 {
+        let cur = config::world().map(|w| w.cfg.render_height).unwrap_or(319);
+        let Some(b) = *self.height_slider_bounds.borrow() else {
+            return cur;
+        };
+        let w = f32::from(b.size.width);
+        if w <= 0. {
+            return cur;
+        }
+        let frac = ((x - f32::from(b.origin.x)) / w).clamp(0., 1.);
+        (-64. + frac * 383.).round() as i32
+    }
+
+    fn set_render_height(&mut self, h: i32, persist: bool, cx: &mut Context<Self>) {
+        let h = h.clamp(-64, 319);
+        let cur = config::world().map(|w| w.cfg.render_height).unwrap_or(319);
+        if h == cur && !persist {
+            return;
+        }
+        if let Some(mut ws) = config::world() {
+            ws.cfg.render_height = h;
+            if persist {
+                ws.cfg.save(&ws.cache_dir);
+            }
+            config::set_world(Some(ws));
+        }
+        self.map.mark_all_tiles_obsolete();
+        self.update_needed = true;
+        cx.notify();
+    }
+
     fn render_height_slider(&self, cx: &mut Context<Self>) -> AnyElement {
         let h = config::world().map(|w| w.cfg.render_height).unwrap_or(319);
+        let frac = (((h + 64) as f32) / 383.).clamp(0., 1.);
+        let slot = self.height_slider_bounds.clone();
         div()
             .h(px(22.))
             .w_full()
@@ -1483,30 +1545,45 @@ impl MainView {
             .gap_2()
             .text_size(px(11.))
             .text_color(rgb(0xbbbbbb))
-            .child(format!("height {}", h))
+            .child(div().w(px(70.)).flex_none().child(format!("height {}", h)))
             .child(
-                // simple - and + controls matching slider behavior (16px step)
-                h_flex().gap_1()
-                    .child(button("-", cx, |v, _w, cx| {
-                        if let Some(mut ws) = config::world() {
-                            ws.cfg.render_height = (ws.cfg.render_height - 16).max(-64);
-                            ws.cfg.save(&ws.cache_dir);
-                            config::set_world(Some(ws));
-                        }
-                        v.map.mark_all_tiles_obsolete();
-                        v.update_needed = true;
-                        cx.notify();
+                div()
+                    .id("height-slider")
+                    .flex_grow()
+                    .h_full()
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|v, e: &MouseDownEvent, _w, cx| {
+                        v.height_slider_drag = true;
+                        let hh = v.height_from_slider_x(f32::from(e.position.x));
+                        v.set_render_height(hh, false, cx);
                     }))
-                    .child(button("+", cx, |v, _w, cx| {
-                        if let Some(mut ws) = config::world() {
-                            ws.cfg.render_height = (ws.cfg.render_height + 16).min(319);
-                            ws.cfg.save(&ws.cache_dir);
-                            config::set_world(Some(ws));
-                        }
-                        v.map.mark_all_tiles_obsolete();
-                        v.update_needed = true;
-                        cx.notify();
-                    })),
+                    .child(canvas(
+                        move |b, _w, _cx| {
+                            *slot.borrow_mut() = Some(b);
+                        },
+                        move |b, _t, window, _cx| {
+                            let cy = b.center().y;
+                            let tx = b.origin.x + b.size.width * frac;
+                            window.paint_quad(fill(
+                                Bounds {
+                                    origin: point(b.origin.x, cy - px(2.)),
+                                    size: gpui::size(b.size.width, px(4.)),
+                                },
+                                rgb(0x181818),
+                            ));
+                            window.paint_quad(quad(
+                                Bounds {
+                                    origin: point(tx - px(5.), cy - px(8.)),
+                                    size: gpui::size(px(10.), px(16.)),
+                                },
+                                px(3.),
+                                rgb(0xcccccc),
+                                px(1.),
+                                rgb(0x555555),
+                                BorderStyle::Solid,
+                            ));
+                        },
+                    )),
             )
             .into_any_element()
     }
