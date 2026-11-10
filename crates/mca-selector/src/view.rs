@@ -301,6 +301,8 @@ impl MainView {
             self.map.scale /= factor;
             let pos = Point2f::new(f32::from(event.position.x), f32::from(event.position.y));
             if self.map.update_scale(old, pos) {
+                // request fresh-resolution tiles now, not on the next 100ms poll.
+                self.map.update();
                 self.update_needed = true;
             }
             cx.notify();

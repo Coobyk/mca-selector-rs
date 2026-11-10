@@ -578,35 +578,10 @@ impl TileMapState {
             if tile.image.is_some() && tile.loaded {
                 let img_zoom = tile.image_zoom_level();
                 if img_zoom != zoom_level {
-                    if zoom_level >= header_zoom && img_zoom < header_zoom {
-                        self.request_image(region, zoom_level);
-                    } else if img_zoom < zoom_level {
-                        // image larger than needed: scale down immediately.
-                        // use the actual pixel count as the source size — LOD
-                        // tiles don't follow the 512/zoom rule.
-                        if let Some((img, iz)) = tile.image.take() {
-                            let from = (img.len() as f64).sqrt() as usize;
-                            let to = TILE_SIZE / zoom_level as usize;
-                            let scaled = if from > to && to > 0 {
-                                render::scale_down(&img, from, to)
-                            } else {
-                                img
-                            };
-                            let mut rgba = Vec::with_capacity(to * to * 4);
-                            for &p in scaled.iter() {
-                                rgba.push((p >> 16) as u8);
-                                rgba.push((p >> 8) as u8);
-                                rgba.push(p as u8);
-                                rgba.push((p >> 24) as u8);
-                            }
-                            if let Some(buf) = image::RgbaImage::from_raw(to as u32, to as u32, rgba) {
-                                tile.render_image = Some(std::sync::Arc::new(gpui::RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(buf), 1))));
-                            }
-                            tile.image = Some((scaled, zoom_level));
-                        }
-                    } else {
-                        self.request_image(region, zoom_level);
-                    }
+                    // zoomed-out stale image: keep it painted stretched (same as
+                    // upstream's smoothed draw) and just re-render at the new
+                    // zoom — the higher-res interim is better than a rescale.
+                    self.request_image(region, zoom_level);
                 }
             } else if !tile.loaded {
                 self.request_image(region, zoom_level);
