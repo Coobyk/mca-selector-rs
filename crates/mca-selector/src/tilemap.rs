@@ -1104,7 +1104,7 @@ impl TileMapState {
                             };
                             if adopt {
                                 let size = (img.len() as f64).sqrt() as usize;
-                                let t = self.tiles.get_mut(&key).unwrap();
+                                let t = self.tiles.entry(key).or_insert_with(|| Tile::new(region));
                                 t.render_image = argb_to_render_image(img, size);
                                 t.image = Some((img.clone(), zoom));
                                 if let Some(s) = structures {
