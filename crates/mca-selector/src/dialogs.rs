@@ -424,12 +424,13 @@ impl MainView {
 // -- rendering --------------------------------------------------------------
 
 impl MainView {
-    pub(crate) fn render_dialog(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let d = self.dialog.as_ref()?;
+        let vp = window.viewport_size();
         let overlay = div()
             .id("modal-backdrop")
-            .absolute()
-            .size_full()
+            .w(vp.width)
+            .h(vp.height)
             .flex()
             .items_center()
             .justify_center()
@@ -1189,22 +1190,29 @@ impl MainView {
                     )
             }
         };
+        let overlay = overlay
+            .on_mouse_down(MouseButton::Left, cx.listener(|v, e, _w, cx| {
+                let _ = e;
+                match v.dialog {
+                    Some(Dialog::Confirm { .. }) | Some(Dialog::Info { .. }) | Some(Dialog::Goto { .. })
+                        | Some(Dialog::JobProgress) | Some(Dialog::NbtEditor { .. }) | Some(Dialog::TextInput { .. })
+                        | Some(Dialog::Filter { .. }) | Some(Dialog::ChangeFields { .. })
+                        | Some(Dialog::Import { .. }) | Some(Dialog::OverlayEditor { .. })
+                        | Some(Dialog::PasteConfirm { .. }) => {}
+                    _ => v.dialog = None,
+                }
+                cx.notify();
+            }))
+            .child(body);
         Some(
-            overlay
-                .on_mouse_down(MouseButton::Left, cx.listener(|v, e, _w, cx| {
-                    let _ = e;
-                    match v.dialog {
-                        Some(Dialog::Confirm { .. }) | Some(Dialog::Info { .. }) | Some(Dialog::Goto { .. })
-                            | Some(Dialog::JobProgress) | Some(Dialog::NbtEditor { .. }) | Some(Dialog::TextInput { .. })
-                            | Some(Dialog::Filter { .. }) | Some(Dialog::ChangeFields { .. })
-                            | Some(Dialog::Import { .. }) | Some(Dialog::OverlayEditor { .. })
-                            | Some(Dialog::PasteConfirm { .. }) => {}
-                        _ => v.dialog = None,
-                    }
-                    cx.notify();
-                }))
-                .child(body)
-                .into_any_element(),
+            deferred(
+                anchored()
+                    .position(point(px(0.), px(0.)))
+                    .snap_to_window()
+                    .child(overlay),
+            )
+            .priority(10)
+            .into_any_element(),
         )
     }
 }
@@ -1416,8 +1424,8 @@ fn button(
         .on_click(cx.listener(move |v, _, w, cx| (on)(v, w, cx)))
 }
 
-fn v_flex() -> Div { div().flex().flex_col() }
-fn h_flex() -> Div { div().flex() }
+pub(crate) fn v_flex() -> Div { div().flex().flex_col() }
+pub(crate) fn h_flex() -> Div { div().flex() }
 
 fn fmt_hue(h: f32) -> String {
     let s = format!("{h:.4}");

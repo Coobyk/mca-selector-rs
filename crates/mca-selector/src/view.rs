@@ -25,6 +25,10 @@ pub struct MainView {
     pub(crate) first: Point2f,
     pub(crate) pressed_keys: u8,
     pub(crate) dialog: Option<Dialog>,
+    /// index into crate::menus() of the open top-level dropdown, and of a
+    /// submenu row inside it showing its flyout.
+    pub(crate) open_menu: Option<usize>,
+    pub(crate) open_submenu: Option<usize>,
     pub update_needed: bool,
     /// set alongside update_needed so map.update() runs at the next paint
     /// instead of the next 100ms poll; also coalesces bursts of
@@ -77,6 +81,8 @@ impl MainView {
             first: Point2f::ZERO,
             pressed_keys: 0,
             dialog: None,
+            open_menu: None,
+            open_submenu: None,
             update_needed: true,
             update_now: true,
             height_slider_drag: false,
@@ -425,6 +431,7 @@ impl Render for MainView {
                     }
                 }
             }))
+            .child(self.render_menu_bar(cx))
             .child(
                 div()
                     .flex_grow()
@@ -442,7 +449,8 @@ impl Render for MainView {
                             .on_scroll_wheel(cx.listener(|v, e, w, cx| v.on_scroll(e, w, cx)))
                             .child(map_el),
                     )
-                    .children(self.render_dialog(cx)),
+                    .children(self.render_menu_overlay(window, cx))
+                    .children(self.render_dialog(window, cx)),
             )
             .children(if show_bar {
                 vec![self.render_height_slider(cx)]

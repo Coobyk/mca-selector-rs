@@ -283,6 +283,11 @@ impl MainView {
             return;
         }
         let k = event.keystroke.key.as_str();
+        if k == "escape" && self.open_menu.take().is_some() {
+            self.open_submenu = None;
+            cx.notify();
+            return;
+        }
         let before = self.pressed_keys;
         match k {
             "w" | "up" => self.pressed_keys |= 1,

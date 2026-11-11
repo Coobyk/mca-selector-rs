@@ -2,6 +2,7 @@ mod actions;
 mod config;
 mod dialogs;
 mod input;
+mod menubar;
 mod nbt_editor;
 mod ops;
 mod paint;
