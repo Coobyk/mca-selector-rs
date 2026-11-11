@@ -2,9 +2,11 @@
 
 pub mod bitset;
 pub mod cache;
+pub mod changer;
 pub mod colors;
 pub mod files;
 pub mod filter;
+pub mod filter_ops;
 pub mod jobs;
 pub mod mca;
 pub mod nbt;

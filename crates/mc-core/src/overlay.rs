@@ -37,14 +37,17 @@ impl OverlayType {
         }
     }
 
+    /// all overlay types in upstream OverlayType.values() order.
+    pub const VALUES: [OverlayType; 10] = [
+        Self::InhabitedTime, Self::Timestamp, Self::LastUpdate,
+        Self::EntityAmount, Self::TileEntityAmount, Self::DataVersion,
+        Self::AverageHeight, Self::BlockAmount, Self::Path, Self::Script,
+    ];
+
     pub fn by_name(name: &str) -> Option<Self> {
-        [
-            Self::InhabitedTime, Self::Timestamp, Self::LastUpdate,
-            Self::EntityAmount, Self::TileEntityAmount, Self::DataVersion,
-            Self::AverageHeight, Self::BlockAmount, Self::Path, Self::Script,
-        ]
-        .into_iter()
-        .find(|t| t.name() == name || t.display_name() == name)
+        Self::VALUES
+            .into_iter()
+            .find(|t| t.name() == name || t.display_name() == name)
     }
 
     /// Overlay.name() shown to the user
@@ -78,6 +81,10 @@ pub struct Overlay {
     path: Vec<PathNode>,
     path_size: bool,
     pub raw_multi: String,
+    /// raw text the min/max bounds were entered as (upstream Overlay.rawMin/
+    /// rawMax) — durations/timestamps serialize back losslessly.
+    pub raw_min: String,
+    pub raw_max: String,
 }
 
 impl Overlay {
@@ -94,6 +101,8 @@ impl Overlay {
             path: Vec::new(),
             path_size: false,
             raw_multi: String::new(),
+            raw_min: String::new(),
+            raw_max: String::new(),
         }
     }
 
@@ -106,11 +115,13 @@ impl Overlay {
     /// setMin/setMax: plain int, or duration ("1d2h") for InhabitedTime/LastUpdate
     /// (seconds*20), or timestamp ("yyyy-MM-dd HH:mm:ss") for Timestamp.
     pub fn set_min_str(&mut self, raw: &str) -> bool {
+        self.raw_min = raw.to_string();
         self.min = self.parse_bound(raw);
         self.is_valid()
     }
 
     pub fn set_max_str(&mut self, raw: &str) -> bool {
+        self.raw_max = raw.to_string();
         self.max = self.parse_bound(raw);
         self.is_valid()
     }
@@ -628,6 +639,91 @@ pub fn parse_overlay_line(line: &str) -> Result<Overlay, String> {
         return Err(format!("failed to parse values for {type_name} overlay"));
     }
     o.active = true;
+    Ok(o)
+}
+
+/// serialize one overlay to a single config line.
+///
+/// Format: `Type min max [data] ;min_hue=F;max_hue=F;active=B` — the
+/// ` ;`-separated extension section carries the fields the plain
+/// `Type min max [data]` line can't express (hue gradient, active flag).
+/// Empty bounds are written as `-` so the positional layout is preserved.
+pub fn serialize_overlay_line(o: &Overlay) -> String {
+    let mut line = format!(
+        "{} {} {}",
+        o.typ.display_name(),
+        if o.raw_min.is_empty() { "-" } else { o.raw_min.as_str() },
+        if o.raw_max.is_empty() { "-" } else { o.raw_max.as_str() },
+    );
+    if !o.raw_multi.is_empty() {
+        line.push(' ');
+        line.push_str(&o.raw_multi);
+    }
+    line.push_str(&format!(
+        " ;min_hue={};max_hue={};active={}",
+        o.min_hue, o.max_hue, o.active
+    ));
+    line
+}
+
+/// parse a config line produced by [`serialize_overlay_line`].
+///
+/// Tolerant variant of [`parse_overlay_line`]: missing or unparseable bounds
+/// (`-`/empty) produce a non-drawing overlay instead of an error, and the
+/// optional ` ;key=value` extension restores hue range + active flag. A line
+/// without the extension behaves like before, except `active` defaults to
+/// false (config lines carry it explicitly).
+pub fn parse_config_line(line: &str) -> Result<Overlay, String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Err("empty".into());
+    }
+    // the extension section starts at the first " ;" whose remainder is a
+    // pure `key=value;...` list — a " ;" inside the data value (e.g. block
+    // lists) does not look like one and stays part of the base line.
+    let (base, ext) = match line.find(" ;") {
+        Some(i)
+            if line[i + 2..]
+                .split(';')
+                .all(|t| t.trim().contains('=')) =>
+        {
+            (&line[..i], &line[i + 2..])
+        }
+        _ => (line, ""),
+    };
+    let mut it = base.splitn(4, char::is_whitespace).map(str::trim);
+    let type_name = it.next().ok_or("missing type")?;
+    let typ = OverlayType::by_name(type_name)
+        .ok_or_else(|| format!("invalid overlay type \"{type_name}\""))?;
+    let min = it.next().unwrap_or("");
+    let max = it.next().unwrap_or("");
+    let data = it.next().unwrap_or("");
+    let mut o = Overlay::new(typ);
+    if !min.is_empty() && min != "-" {
+        o.set_min_str(min);
+    }
+    if !max.is_empty() && max != "-" {
+        o.set_max_str(max);
+    }
+    o.set_multi_values_str(data);
+    o.active = false;
+    for kv in ext.split(';') {
+        let Some((k, v)) = kv.trim().split_once('=') else { continue };
+        match k.trim() {
+            "min_hue" => {
+                if let Ok(f) = v.trim().parse::<f32>() {
+                    o.min_hue = f;
+                }
+            }
+            "max_hue" => {
+                if let Ok(f) = v.trim().parse::<f32>() {
+                    o.max_hue = f;
+                }
+            }
+            "active" => o.active = matches!(v.trim(), "true" | "1"),
+            _ => {}
+        }
+    }
     Ok(o)
 }
 

@@ -786,6 +786,17 @@ pub fn parse_snbt(s: &str) -> Result<Tag, String> {
     Ok(t)
 }
 
+/// Parse an SNBT value starting at the beginning of `s` (after leading
+/// whitespace); returns the tag and the number of bytes consumed. Trailing
+/// input is allowed — needed by the `ReplaceBlocks` field parser where an
+/// SNBT compound may be followed by `;` or `,`.
+pub fn parse_snbt_partial(s: &str) -> Result<(Tag, usize), String> {
+    let mut p = SnbtParser { b: s.as_bytes(), i: 0 };
+    p.skip_ws();
+    let t = p.value()?;
+    Ok((t, p.i))
+}
+
 struct SnbtParser<'a> {
     b: &'a [u8],
     i: usize,

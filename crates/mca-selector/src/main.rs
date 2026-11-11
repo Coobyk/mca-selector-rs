@@ -10,7 +10,15 @@ use gpui::*;
 
 fn menus(cx: &App) -> Vec<Menu> {
     let _ = cx;
-    let recent: Vec<MenuItem> = config::global()
+    // the vendored gpui MenuItem (patches/gpui/src/platform/app_menu.rs)
+    // has no checked/disabled state — checkmarks are faked with a "✓ "
+    // name prefix and selection-dependent items can't be disabled, so
+    // upstream's item disabling is skipped. The view rebuilds menus via
+    // cx.set_menus(menus(cx)) after every toggle that changes these.
+    let g = config::global();
+    let style = g.coordinate_style.to_ascii_uppercase();
+    let on = |b: bool| if b { "✓ " } else { "  " };
+    let recent: Vec<MenuItem> = g
         .recent_worlds
         .values()
         .rev()
@@ -49,25 +57,25 @@ fn menus(cx: &App) -> Vec<Menu> {
             items: vec![
                 MenuItem::action("Reload", ReloadAction),
                 MenuItem::separator(),
-                MenuItem::action("Chunk Grid", ChunkGridAction),
-                MenuItem::action("Region Grid", RegionGridAction),
-                MenuItem::action("Coordinates", CoordinatesAction),
+                MenuItem::action(format!("{}Chunk Grid", on(g.show_chunk_grid)), ChunkGridAction),
+                MenuItem::action(format!("{}Region Grid", on(g.show_region_grid)), RegionGridAction),
+                MenuItem::action(format!("{}Coordinates", on(g.show_coordinates)), CoordinatesAction),
                 MenuItem::submenu(Menu {
                     name: "Coordinate Style".into(),
                     items: vec![
-                        MenuItem::action("Dynamic", CoordStyleDynamicAction),
-                        MenuItem::action("Edge", CoordStyleEdgeAction),
-                        MenuItem::action("Grid", CoordStyleGridAction),
+                        MenuItem::action(format!("{}Dynamic", on(style == "DYNAMIC")), CoordStyleDynamicAction),
+                        MenuItem::action(format!("{}Edge", on(style == "EDGE")), CoordStyleEdgeAction),
+                        MenuItem::action(format!("{}Grid", on(style == "GRID")), CoordStyleGridAction),
                     ],
                 }),
-                MenuItem::action("Structures", StructureIconsAction),
+                MenuItem::action(format!("{}Structures", on(g.show_structure_icons)), StructureIconsAction),
                 MenuItem::submenu(Menu {
                     name: "Select Structures".into(),
                     items: mc_core::structures::structures()
                         .display_names
                         .iter()
                         .map(|(display, id)| MenuItem::action(
-                            display.clone(),
+                            format!("{}{}", on(g.structure_icons.get(id).copied().unwrap_or(true)), display),
                             ToggleStructureIcon { id: id.clone() },
                         ))
                         .collect(),

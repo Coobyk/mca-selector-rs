@@ -43,8 +43,61 @@ pub enum NbtEdit {
     Rename,
 }
 
+/// upstream FilterChunksDialog.HandleType.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FilterAction {
+    Select,
+    Export,
+    Delete,
+}
+
+/// upstream NBTEditorDialog: one state per mca kind (region/poi/entities).
+pub struct NbtTab {
+    pub root: Option<mc_core::nbt::Compound>,
+    pub expanded: std::collections::HashSet<String>,
+    pub sel: usize,
+    pub dirty: bool,
+    /// why there is nothing to edit ("region file does not exist" /
+    /// "no chunk data found", matching upstream placeholders)
+    pub note: Option<String>,
+}
+
+impl NbtTab {
+    fn missing(note: &str) -> Self {
+        NbtTab {
+            root: None,
+            expanded: std::collections::HashSet::new(),
+            sel: 0,
+            dirty: false,
+            note: Some(note.to_string()),
+        }
+    }
+}
+
+/// one editable row of Dialog::OverlayEditor (upstream component.OverlayBox).
+#[derive(Clone)]
+pub struct OverlayRow {
+    pub active: bool,
+    pub typ: mc_core::overlay::OverlayType,
+    pub min: String,
+    pub max: String,
+    pub data: String,
+    pub min_hue: String,
+    pub max_hue: String,
+}
+
+/// which text field of an OverlayRow currently holds keyboard focus.
+#[derive(Clone, Copy, PartialEq)]
+pub enum OverlayField {
+    Min,
+    Max,
+    Data,
+    MinHue,
+    MaxHue,
+}
+
 pub enum Dialog {
-    Goto { x: String, z: String, focus_x: bool },
+    Goto { x: String, z: String, focus_x: bool, invalid: bool },
     About,
     Error { msg: String },
     Confirm { msg: String, action: Box<dyn FnOnce(&mut MainView, &mut Window, &mut Context<MainView>) + 'static> },
@@ -59,14 +112,13 @@ pub enum Dialog {
         region: i64,
         chunk_abs: Point2i,
         index: usize,
-        root: mc_core::nbt::Compound,
-        expanded: std::collections::HashSet<String>,
-        sel: usize,
+        /// 0 = region, 1 = poi, 2 = entities (upstream tab order)
+        tab: usize,
+        tabs: [NbtTab; 3],
         /// 0 = none, 1 = value edit, 2 = add child, 3 = rename
         editing: NbtEdit,
         buf: String,
         status: String,
-        dirty: bool,
     },
     TextInput {
         title: String,
@@ -74,6 +126,51 @@ pub enum Dialog {
         text: String,
         on_done: Box<dyn Fn(&mut MainView, &mut Window, &mut Context<MainView>, String) + 'static>,
     },
+    /// upstream FilterChunksDialog (options part — the GroupFilterBox is
+    /// replaced by the raw query field, same as the old TextInput).
+    Filter {
+        query: String,
+        action: FilterAction,
+        apply: mc_core::filter_ops::ApplyType,
+        radius: String,
+        sel_only: bool,
+        /// false = query field focused, true = radius field focused
+        focus_radius: bool,
+    },
+    /// upstream ChangeNBTDialog.
+    ChangeFields {
+        text: String,
+        force: bool,
+        sel_only: bool,
+    },
+    /// upstream ImportConfirmationDialog (minus y-offset/section ranges).
+    Import {
+        dir: PathBuf,
+        ox: String,
+        oz: String,
+        overwrite: bool,
+        sel_only: bool,
+        focus_x: bool,
+        invalid: bool,
+    },
+    /// upstream OverlayEditorDialog (modal apply-on-OK instead of live).
+    OverlayEditor {
+        rows: Vec<OverlayRow>,
+        focus: Option<(usize, OverlayField)>,
+    },
+}
+
+/// one-shot Info dialog payload published by finished batch jobs (filtered
+/// delete/export, change fields, import) — consumed by poll_tick.
+static JOB_INFO: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// title line for the sum-selection Info dialog (upstream NumberDialog shows
+/// the overlay type + its multi-values); stashed when the job starts because
+/// the overlay may change before the result lands.
+static SUM_TITLE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn job_info(msg: impl Into<String>) {
+    *JOB_INFO.lock().unwrap() = Some(msg.into());
 }
 
 /// cache key for shaped coordinate labels: edge labels hold a single axis
@@ -82,18 +179,20 @@ pub enum Dialog {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum CoordKey {
     Edge(i64),
+    /// first line of a two-line "x,\nz" grid label
     Grid(i64, i64),
+    /// second line of a two-line "x,\nz" grid label
+    GridB(i64, i64),
 }
 
 /// every input that can change the status-bar text; the formatted string is
 /// rebuilt only when this differs from the cached key (see status_text).
 #[derive(PartialEq)]
 struct StatusKey {
-    visible_tiles: i32,
-    visible_regions: usize,
-    scale_bits: u32,
+    total_tiles: usize,
     hovered: Option<Point2i>,
     selected_chunks: i64,
+    inverted: bool,
     unsaved_selection: bool,
     /// (names[0], len > 1) — only when structure icons are on and the
     /// hovered chunk has entries
@@ -101,6 +200,8 @@ struct StatusKey {
     /// (typ, min, max, hovered value)
     overlay: Option<(mc_core::overlay::OverlayType, Option<i32>, Option<i32>, Option<i32>)>,
     jobs: usize,
+    /// busy-spinner frame, cycles 0..4 while jobs are queued
+    spin: u8,
 }
 
 pub struct MainView {
@@ -132,6 +233,13 @@ pub struct MainView {
     paste_overlay_cache:
         Option<(i32, i32, u32, PathBuf, std::collections::HashMap<i64, Arc<RenderImage>>)>,
     last_frame: std::time::Instant,
+    /// held-key pan accumulator — upstream KeyActivator applies a fixed
+    /// step every 33ms, so frame dt accumulates here between steps.
+    pan_accum: std::time::Duration,
+    /// shift held during held-key pan (10*scale instead of 5*scale)
+    pan_shift: bool,
+    /// status-bar busy-spinner frame
+    spin: u8,
 }
 
 impl MainView {
@@ -166,7 +274,20 @@ impl MainView {
             status_cache: None,
             paste_overlay_cache: None,
             last_frame: std::time::Instant::now(),
+            pan_accum: std::time::Duration::ZERO,
+            pan_shift: false,
+            spin: 0,
         };
+        // upstream loads the persisted overlay config (OverlayConfig) globally;
+        // restore serialized overlay lines saved by the overlay editor.
+        let saved: Vec<mc_core::overlay::Overlay> = config::global()
+            .overlays
+            .iter()
+            .filter_map(|l| mc_core::overlay::parse_config_line(l).ok())
+            .collect();
+        if !saved.is_empty() {
+            v.map.set_overlays(saved);
+        }
         cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
             loop {
                 smol::Timer::after(std::time::Duration::from_millis(100)).await;
@@ -189,7 +310,9 @@ impl MainView {
 
     fn poll_tick(&mut self, cx: &mut Context<Self>) {
         if let Some(sum) = self.map.take_sum_result() {
-            self.dialog = Some(Dialog::Info { msg: format!("sum: {sum}") });
+            // upstream NumberDialog: "<overlay type>(<multi values>) — <sum>"
+            let title = SUM_TITLE.lock().unwrap().take().unwrap_or_else(|| "sum".into());
+            self.dialog = Some(Dialog::Info { msg: format!("{title}: {sum}") });
         }
         if let Some(sel) = self.map.take_filter_result() {
             let n = sel.count();
@@ -197,7 +320,13 @@ impl MainView {
             self.map.selected_chunks = n as i64;
             self.map.unsaved_selection = true;
             self.map.selection_version += 1;
-            self.dialog = Some(Dialog::Info { msg: format!("filter matched {n} chunks") });
+            if JOB_INFO.lock().unwrap().is_none() {
+                self.dialog = Some(Dialog::Info { msg: format!("filter matched {n} chunks") });
+            }
+        }
+        // batch-job completion messages win over the generic filter text
+        if let Some(m) = JOB_INFO.lock().unwrap().take() {
+            self.dialog = Some(Dialog::Info { msg: m });
         }
         let changed = self.map.poll_results();
         if self.update_needed || changed {
@@ -205,6 +334,8 @@ impl MainView {
             self.map.evict_invisible();
             self.update_needed = false;
         }
+        let jobs = mc_core::jobs::active_jobs();
+        self.spin = if jobs > 0 { (self.spin + 1) % 4 } else { 0 };
         let busy = mc_core::jobs::current_progress().is_some();
         if busy && self.dialog.is_none() {
             self.dialog = Some(Dialog::JobProgress);
@@ -443,12 +574,12 @@ impl MainView {
                 }
             }
             MouseButton::Right => {
-                if self.map.pasted.is_some() {
-                    self.map.cancel_paste();
-                    cx.notify();
-                    return;
-                }
+                // upstream: a right-press unmarks immediately — including
+                // while pasting (paste is cancelled by ESC, not right-click);
+                // holding the button continues as a right-drag unmark.
                 self.drag = Drag::RightSelect;
+                self.map.mark(pos.x, pos.z, false, pos, false);
+                self.map.selection_version += 1;
             }
             MouseButton::Middle => self.drag = Drag::MiddleMove,
             _ => {}
@@ -597,6 +728,8 @@ impl MainView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // held-key pan speed modifier (upstream: SHIFT -> 10*scale)
+        self.pan_shift = event.keystroke.modifiers.shift;
         if self.dialog.is_some() {
             self.dialog_key(event, _window, cx);
             return;
@@ -610,9 +743,15 @@ impl MainView {
             "d" | "right" => self.pressed_keys |= 8,
 
             // zoom_key notifies internally when it changes the view
-            "+" | "=" => { self.zoom_key(2.0, cx); return; }
-            "-" => { self.zoom_key(0.5, cx); return; }
-            "escape" => {}
+            "+" | "=" | "add" => { self.zoom_key(1.05, cx); return; }
+            "-" | "subtract" => { self.zoom_key(0.95, cx); return; }
+            "escape" => {
+                // upstream: ESC clears the paste state
+                if self.map.pasted.is_some() {
+                    self.map.cancel_paste();
+                    cx.notify();
+                }
+            }
             _ => {}
         }
         // held-key repeats and untracked keys change nothing on screen
@@ -622,6 +761,7 @@ impl MainView {
     }
 
     fn on_key_up(&mut self, event: &KeyUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.pan_shift = event.keystroke.modifiers.shift;
         let before = self.pressed_keys;
         match event.keystroke.key.as_str() {
             "w" | "up" => self.pressed_keys &= !1,
@@ -638,13 +778,17 @@ impl MainView {
 
     fn dialog_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = event.keystroke.key.as_str();
-        if let Some(Dialog::Goto { x, z, focus_x }) = &mut self.dialog {
+        if let Some(Dialog::Goto { x, z, focus_x, invalid }) = &mut self.dialog {
             match k {
                 "enter" => {
+                    // upstream disables OK on invalid input; we keep the dialog
+                    // open and flag it instead.
                     if let (Ok(xi), Ok(zi)) = (x.parse::<i32>(), z.parse::<i32>()) {
                         self.map.go_to(xi, zi);
                         self.request_update();
                         self.dialog = None;
+                    } else {
+                        *invalid = true;
                     }
                 }
                 "escape" => self.dialog = None,
@@ -652,6 +796,7 @@ impl MainView {
                 "backspace" => {
                     let f = if *focus_x { x } else { z };
                     f.pop();
+                    *invalid = false;
                 }
                 "space" => *focus_x = !*focus_x,
                 _ => {
@@ -659,6 +804,7 @@ impl MainView {
                         if k.len() == 1 && (c.is_ascii_digit() || c == '-') {
                             let f = if *focus_x { x } else { z };
                             f.push(c);
+                            *invalid = false;
                         }
                     }
                 }
@@ -680,6 +826,177 @@ impl MainView {
                 "s" => { *sel_only = !*sel_only; cx.notify(); return; }
                 _ => {}
             }
+        }
+        if let Some(Dialog::Filter { query, radius, focus_radius, .. }) = &mut self.dialog {
+            match k {
+                "escape" => self.dialog = None,
+                "tab" => *focus_radius = !*focus_radius,
+                "backspace" => {
+                    if *focus_radius { radius.pop(); } else { query.pop(); }
+                }
+                "enter" => {
+                    // upstream disables OK on an invalid filter — ours stays
+                    // open (the red hint line shows the parse error)
+                    let valid = !query.trim().is_empty() && mc_core::filter::parse(query).is_ok();
+                    if valid {
+                        if let Some(Dialog::Filter { query, action, apply, radius, sel_only, .. }) = self.dialog.take() {
+                            self.run_filter_dialog(query, action, apply, radius, sel_only, window, cx);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+                _ => {
+                    if *focus_radius {
+                        // upstream validates digits-only on the radius field
+                        if k.len() == 1 && k.as_bytes()[0].is_ascii_digit() {
+                            radius.push_str(k);
+                        }
+                    } else {
+                        let c = &event.keystroke.key_char;
+                        if let Some(c) = c {
+                            for ch in c.chars() { query.push(ch); }
+                        } else if k.len() == 1 {
+                            query.push_str(k);
+                        } else if k == "space" {
+                            query.push(' ');
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(Dialog::ChangeFields { text, .. }) = &mut self.dialog {
+            match k {
+                "escape" => self.dialog = None,
+                "backspace" => { text.pop(); }
+                "enter" => {
+                    // upstream disables OK on invalid input — stay open
+                    let valid = matches!(mc_core::changer::parse_fields(text), Ok(f) if !f.is_empty());
+                    if valid {
+                        if let Some(Dialog::ChangeFields { text, force, sel_only, .. }) = self.dialog.take() {
+                            self.run_change_fields_dialog(text, force, sel_only, cx);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+                _ => {
+                    let c = &event.keystroke.key_char;
+                    if let Some(c) = c {
+                        for ch in c.chars() { text.push(ch); }
+                    } else if k.len() == 1 {
+                        text.push_str(k);
+                    } else if k == "space" {
+                        text.push(' ');
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(Dialog::Import { ox, oz, focus_x, overwrite, sel_only, invalid, .. }) = &mut self.dialog {
+            match k {
+                "escape" => self.dialog = None,
+                "tab" => *focus_x = !*focus_x,
+                "backspace" => {
+                    let f = if *focus_x { ox } else { oz };
+                    f.pop();
+                    *invalid = false;
+                }
+                "o" => { *overwrite = !*overwrite; }
+                "s" => { *sel_only = !*sel_only; }
+                "enter" => {
+                    let ok = ox.trim().parse::<i32>().is_ok() && oz.trim().parse::<i32>().is_ok();
+                    if ok {
+                        if let Some(Dialog::Import { dir, ox, oz, overwrite, sel_only, .. }) = self.dialog.take() {
+                            self.do_import(dir, ox.trim().parse().unwrap_or(0), oz.trim().parse().unwrap_or(0), overwrite, sel_only, cx);
+                        }
+                    } else {
+                        *invalid = true;
+                    }
+                }
+                _ => {
+                    if let Some(c) = k.chars().next() {
+                        if k.len() == 1 && (c.is_ascii_digit() || c == '-') {
+                            let f = if *focus_x { ox } else { oz };
+                            f.push(c);
+                            *invalid = false;
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(Dialog::OverlayEditor { rows, focus }) = &mut self.dialog {
+            match k {
+                "escape" => {
+                    if focus.is_some() {
+                        *focus = None;
+                    } else {
+                        self.dialog = None;
+                    }
+                }
+                "enter" => {
+                    if focus.is_some() {
+                        *focus = None;
+                    } else if let Some(Dialog::OverlayEditor { rows, .. }) = self.dialog.take() {
+                        self.apply_overlay_editor(rows, cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+                "tab" => {
+                    const FIELDS: [OverlayField; 5] = [
+                        OverlayField::Min, OverlayField::Max, OverlayField::Data,
+                        OverlayField::MinHue, OverlayField::MaxHue,
+                    ];
+                    *focus = match *focus {
+                        None => Some((0, OverlayField::Min)),
+                        Some((r, f)) => {
+                            let fi = FIELDS.iter().position(|x| *x == f).unwrap_or(0) + 1;
+                            if fi < FIELDS.len() {
+                                Some((r, FIELDS[fi]))
+                            } else if r + 1 < rows.len() {
+                                Some((r + 1, OverlayField::Min))
+                            } else {
+                                Some((0, OverlayField::Min))
+                            }
+                        }
+                    };
+                }
+                "backspace" => {
+                    if let Some((r, f)) = *focus {
+                        if let Some(row) = rows.get_mut(r) {
+                            overlay_field(row, f).pop();
+                        }
+                    }
+                }
+                "a" if focus.is_none() => {
+                    rows.push(default_overlay_row());
+                }
+                _ => {
+                    if let Some((r, f)) = *focus {
+                        let c = &event.keystroke.key_char;
+                        let push = |t: &mut String| {
+                            if let Some(c) = c {
+                                for ch in c.chars() { t.push(ch); }
+                            } else if k.len() == 1 {
+                                t.push_str(k);
+                            } else if k == "space" {
+                                t.push(' ');
+                            }
+                        };
+                        if let Some(row) = rows.get_mut(r) {
+                            push(overlay_field(row, f));
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
         }
         if let Some(Dialog::TextInput { text, .. }) = &mut self.dialog {
             match k {
@@ -711,6 +1028,28 @@ impl MainView {
             cx.notify();
             return;
         }
+        // upstream confirmation dialogs: the default button fires on Enter
+        if let Some(Dialog::Confirm { .. }) = &self.dialog {
+            match k {
+                "enter" => {
+                    if let Some(Dialog::Confirm { action, .. }) = self.dialog.take() {
+                        (action)(self, window, cx);
+                    }
+                }
+                "escape" => self.dialog = None,
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
+        // Info/Error/About all have a single default OK/Close button upstream
+        if matches!(self.dialog, Some(Dialog::Info { .. }) | Some(Dialog::Error { .. }) | Some(Dialog::About)) {
+            if k == "enter" || k == "escape" {
+                self.dialog = None;
+            }
+            cx.notify();
+            return;
+        }
         if k == "escape" {
             if self.map.pasted.is_some() {
                 self.map.cancel_paste();
@@ -721,51 +1060,60 @@ impl MainView {
     }
 
     /// keyboard handling for the NBT tree editor (NBTTreeView edit mode).
+    /// "1"/"2"/"3" switch the region/poi/entities tab (upstream NBTEditorDialog
+    /// tab pane); everything else acts on the current tab.
     fn nbt_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let k = event.keystroke.key.as_str();
         let ctrl = event.keystroke.modifiers.control;
         let Some(Dialog::NbtEditor {
-            root, expanded, sel, editing, buf, status, dirty, region, chunk_abs, index,
+            tab, tabs, editing, buf, status, region, chunk_abs, index,
         }) = &mut self.dialog
         else {
             return;
         };
+        let _ = (region, chunk_abs, index);
         if *editing != NbtEdit::None {
+            let t = &mut tabs[*tab];
             match k {
                 "enter" => {
                     let mode = *editing;
-                    let path = nbt_editor::flatten(root, expanded)
-                        .get(*sel)
-                        .map(|r| r.path.clone())
-                        .unwrap_or_default();
-                    let res = match mode {
-                        NbtEdit::Value => nbt_editor::apply_value_edit(root, &path, buf),
-                        NbtEdit::Add => {
-                            let rows = nbt_editor::flatten(root, expanded);
-                            let container_path: String = rows
-                                .get(*sel)
-                                .map(|r| {
-                                    if r.container {
-                                        r.path.clone()
-                                    } else {
-                                        r.path
-                                            .rsplit_once('.')
-                                            .map(|(p, _)| p.to_string())
-                                            .or_else(|| {
-                                                r.path.rfind('[').map(|i| r.path[..i].to_string())
-                                            })
-                                            .unwrap_or_default()
-                                    }
-                                })
+                    let res = match t.root.as_mut() {
+                        Some(root) => {
+                            let path = nbt_editor::flatten(root, &t.expanded)
+                                .get(t.sel)
+                                .map(|r| r.path.clone())
                                 .unwrap_or_default();
-                            nbt_editor::apply_add(root, &container_path, buf)
+                            match mode {
+                                NbtEdit::Value => nbt_editor::apply_value_edit(root, &path, buf),
+                                NbtEdit::Add => {
+                                    let rows = nbt_editor::flatten(root, &t.expanded);
+                                    let container_path: String = rows
+                                        .get(t.sel)
+                                        .map(|r| {
+                                            if r.container {
+                                                r.path.clone()
+                                            } else {
+                                                r.path
+                                                    .rsplit_once('.')
+                                                    .map(|(p, _)| p.to_string())
+                                                    .or_else(|| {
+                                                        r.path.rfind('[').map(|i| r.path[..i].to_string())
+                                                    })
+                                                    .unwrap_or_default()
+                                            }
+                                        })
+                                        .unwrap_or_default();
+                                    nbt_editor::apply_add(root, &container_path, buf)
+                                }
+                                NbtEdit::Rename => nbt_editor::apply_rename(root, &path, buf),
+                                NbtEdit::None => Ok(()),
+                            }
                         }
-                        NbtEdit::Rename => nbt_editor::apply_rename(root, &path, buf),
-                        NbtEdit::None => Ok(()),
+                        None => Ok(()),
                     };
                     match res {
                         Ok(()) => {
-                            *dirty = true;
+                            t.dirty = true;
                             *status = "modified — ctrl-s to save".into();
                         }
                         Err(e) => *status = format!("error: {e}"),
@@ -792,6 +1140,30 @@ impl MainView {
             }
             return;
         }
+        match k {
+            "1" | "2" | "3" => {
+                let n = (k.as_bytes()[0] - b'1') as usize;
+                if n != *tab {
+                    *tab = n;
+                    *editing = NbtEdit::None;
+                    buf.clear();
+                }
+                return;
+            }
+            "escape" => {
+                self.dialog = None;
+                return;
+            }
+            _ => {}
+        }
+        let t = &mut tabs[*tab];
+        let Some(root) = t.root.as_mut() else {
+            // no data on this tab — only tab switching/close keys apply
+            return;
+        };
+        let sel = &mut t.sel;
+        let expanded = &mut t.expanded;
+        let dirty = &mut t.dirty;
         let rows = nbt_editor::flatten(root, expanded);
         match k {
             "up" => *sel = sel.saturating_sub(1),
@@ -856,33 +1228,22 @@ impl MainView {
                     }
                 }
             }
-            "s" if ctrl => {
-                let _ = (region, chunk_abs, index);
-                let _ = status;
-                let _ = dirty;
-                // handled after borrow ends below
-            }
-            "escape" => self.dialog = None,
             _ => {}
         }
+        let _ = status;
         if k == "s" && ctrl {
             self.nbt_editor_save(cx);
         }
     }
 
-    fn zoom_key(&mut self, zoom: f32, cx: &mut Context<Self>) {
+    /// upstream zoomFactor: scale /= factor, anchored at the canvas center.
+    fn zoom_key(&mut self, factor: f32, cx: &mut Context<Self>) {
         if self.map.disabled {
             return;
         }
-        let (min, max) = self.map.visible_region_bounds(Point2f::ZERO);
-        let mid = min.region_to_block().add_p(max.region_to_block()).div(2);
-        let center = if self.map.regions.is_empty() {
-            Point2f::new(self.map.width / 2.0, self.map.height / 2.0)
-        } else {
-            mid.to_point2f().sub(self.map.offset).mul(1.0 / self.map.scale)
-        };
+        let center = Point2f::new(self.map.width / 2.0, self.map.height / 2.0);
         let old = self.map.scale;
-        self.map.scale *= zoom;
+        self.map.scale /= factor;
         if self.map.update_scale(old, center) {
             self.request_update();
         }
@@ -894,7 +1255,17 @@ impl MainView {
     fn paint_map(&mut self, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) {
         self.map.width = f32::from(bounds.size.width);
         self.map.height = f32::from(bounds.size.height);
-        self.last_frame = std::time::Instant::now();
+        let now = std::time::Instant::now();
+        let dt = now.saturating_duration_since(self.last_frame);
+        self.last_frame = now;
+
+        // gpui has no window-blur event — poll is_window_active per frame.
+        // Releasing held pan keys while unfocused is the closest equivalent
+        // of upstream's releaseAllKeys on focus loss.
+        if !window.is_window_active() {
+            self.pressed_keys = 0;
+            self.pan_accum = std::time::Duration::ZERO;
+        }
 
         // frame-paced tile dispatch: scroll/zoom/view changes arm update_now
         // per input event; running the O(visible-regions) update once here
@@ -904,11 +1275,17 @@ impl MainView {
             self.update_now = false;
         }
 
+        // held-key pan: upstream KeyActivator ticks every 33ms applying
+        // 5*scale per tick (10*scale while shift is held).
         if self.pressed_keys != 0 && !self.map.disabled {
-            let speed = 10.0;
-            let dx = if self.pressed_keys & 2 != 0 { -speed } else if self.pressed_keys & 8 != 0 { speed } else { 0.0 };
-            let dz = if self.pressed_keys & 1 != 0 { -speed } else if self.pressed_keys & 4 != 0 { speed } else { 0.0 };
-            self.map.offset = self.map.offset.add(dx * self.map.scale, dz * self.map.scale);
+            self.pan_accum += dt;
+            if self.pan_accum >= std::time::Duration::from_millis(33) {
+                self.pan_accum = std::time::Duration::ZERO;
+                let speed = if self.pan_shift { 10.0 } else { 5.0 };
+                let dx = if self.pressed_keys & 2 != 0 { -speed } else if self.pressed_keys & 8 != 0 { speed } else { 0.0 };
+                let dz = if self.pressed_keys & 1 != 0 { -speed } else if self.pressed_keys & 4 != 0 { speed } else { 0.0 };
+                self.map.offset = self.map.offset.add(dx * self.map.scale, dz * self.map.scale);
+            }
             window.on_next_frame(|w, _| w.refresh());
         }
 
@@ -937,10 +1314,10 @@ impl MainView {
         // MAX_TILE_REQUESTS, and hash lookups dominate the per-frame cost.
         // Collect + sort so paint order is identical to the old rx/rz raster
         // scan (x-major, z inner).
+        let tile_px = TILE_SIZE as f32 / scale;
         {
             let map = &self.map;
             let buf = &mut self.visible_tiles_buf;
-            let icon_cache = &mut self.icon_cache;
             let paste_cache = &mut self.paste_overlay_cache;
 
             buf.clear();
@@ -950,7 +1327,6 @@ impl MainView {
                 // int math can exclude a sub-pixel sliver at negative offsets,
                 // so keep the check for pixel-identical output.
                 if t.image.is_some()
-                    && t.loaded
                     && l.x >= vmin.x
                     && l.x <= vmax.x
                     && l.z >= vmin.z
@@ -969,21 +1345,13 @@ impl MainView {
             // config reads used to run per tile (each clones BTreeMaps);
             // now a read-guard held for the tile pass — zero clones, still
             // only taken when something needs it.
-            let g_guard = if map.pasted.is_some() || map.show_structure_icons {
+            let g_guard = if map.pasted.is_some() || map.show_structure_icons || !map.selection.is_empty() {
                 Some(config::GLOBAL.read().unwrap())
             } else {
                 None
             };
             let g_cfg = g_guard.as_ref().and_then(|g| g.as_ref());
-            let icon_size_cfg = if map.show_structure_icons {
-                config::WORLD.read().unwrap().as_ref()
-                    .map(|w| w.cfg.structure_icon_size).unwrap_or(32)
-            } else {
-                0
-            };
-            let has_selection = !map.selection.is_empty();
             let has_overlay = map.overlay.is_some();
-            let tile_px = TILE_SIZE as f32 / scale;
             for &(rx, rz, key) in buf.iter() {
                 // block-space position -> screen px, same convention as the
                 // grids and coordinates below (offset is in world blocks).
@@ -1013,14 +1381,73 @@ impl MainView {
                         let _ = window.paint_image(b, px(0.).into(), oi, 0, false);
                     }
                 }
-                if has_selection {
-                    if let Some(ov) =
-                        selection_overlay_image(tile, &map.selection, map.selection_version)
+            }
+
+            // -- selection + paste-ghost pass -----------------------------------
+            // upstream draws both for every VISIBLE region — not just tiles
+            // with a finished image. Region state follows TileImage.draw: a
+            // region in the tiles map gets its region/chunk overlay, a region
+            // outside it fills only when the selection is inverted.
+            let sel = &map.selection;
+            if !sel.is_empty() || map.pasted.is_some() {
+                let region_color = g_cfg.as_ref().map(|g| g.region_selection_color.to_argb()).unwrap_or(0);
+                let region_rect = |rx: i32, rz: i32| -> Option<Bounds<Pixels>> {
+                    let ox = (rx as f32 * TILE_SIZE as f32 - map.offset.x) / scale;
+                    let oz = (rz as f32 * TILE_SIZE as f32 - map.offset.z) / scale;
+                    if ox + tile_px <= 0.0
+                        || oz + tile_px <= 0.0
+                        || ox >= map.width
+                        || oz >= map.height
+                        || tile_px < 0.5
                     {
-                        let _ = window.paint_image(b, px(0.).into(), ov, 0, false);
+                        None
+                    } else {
+                        Some(Bounds {
+                            origin: point(px(ox), px(oz)),
+                            size: size(px(tile_px), px(tile_px)),
+                        })
+                    }
+                };
+                if !sel.is_empty() {
+                    let draw_sel = |rx: i32, rz: i32, window: &mut Window| {
+                        let Some(b) = region_rect(rx, rz) else { return };
+                        let key = Point2i::new(rx, rz).as_long();
+                        if !map.tiles.contains_key(&key) {
+                            if sel.is_inverted() {
+                                window.paint_quad(fill(b, rgba(region_color)));
+                            }
+                        } else if sel.is_region_selected(key) {
+                            window.paint_quad(fill(b, rgba(region_color)));
+                        } else if sel.is_any_chunk_in_region_selected(key) {
+                            if let Some(ov) =
+                                marked_chunks_image(Point2i::new(rx, rz), sel, map.selection_version)
+                            {
+                                let _ = window.paint_image(b, px(0.).into(), ov, 0, false);
+                            }
+                        }
+                    };
+                    if sel.is_inverted() {
+                        // inverted selection paints every visible region
+                        for rx in vmin.x..=vmax.x {
+                            for rz in vmin.z..=vmax.z {
+                                draw_sel(rx, rz, window);
+                            }
+                        }
+                    } else {
+                        // non-inverted: only regions present in the selection
+                        // map can draw — iterate it clipped to the viewport.
+                        for &key in sel.selection.keys() {
+                            let r = Point2i::from_long(key);
+                            if r.x >= vmin.x && r.x <= vmax.x && r.z >= vmin.z && r.z <= vmax.z {
+                                draw_sel(r.x, r.z, window);
+                            }
+                        }
                     }
                 }
                 if let Some(p) = &map.pasted {
+                    // ghost images are keyed by TARGET region — one image per
+                    // region the paste touches, painted at its own rect for
+                    // every visible region regardless of tile state.
                     let color = g_cfg.as_ref().unwrap().paste_chunks_color.to_argb();
                     let hit = matches!(paste_cache.as_ref(),
                         Some((px_, pz_, c, dir, _))
@@ -1036,16 +1463,36 @@ impl MainView {
                         ));
                     }
                     if let Some((_, _, _, _, imgs)) = paste_cache.as_ref() {
-                        if let Some(pv) = imgs.get(&key) {
-                            let _ = window.paint_image(b, px(0.).into(), pv.clone(), 0, false);
+                        for (&key, img) in imgs.iter() {
+                            let r = Point2i::from_long(key);
+                            if r.x < vmin.x || r.x > vmax.x || r.z < vmin.z || r.z > vmax.z {
+                                continue;
+                            }
+                            if let Some(b) = region_rect(r.x, r.z) {
+                                let _ = window.paint_image(b, px(0.).into(), img.clone(), 0, false);
+                            }
                         }
                     }
                 }
-                if map.show_structure_icons {
-                    if let (Some(st), Some(g)) = (tile.structures.as_ref(), g_cfg.as_ref()) {
+            }
+        }
+
+        self.paint_grids(bounds, vmin, vmax, window);
+
+        // upstream draws structure icons after the grids, gated by the
+        // header-only zoom level; icon size is a constant screen-px size.
+        let header_zoom = config::WORLD.read().unwrap().as_ref()
+            .map(|w| w.cfg.render_header_only_zoom_level).unwrap_or(16);
+        if !self.map.disabled && self.map.show_structure_icons && scale <= header_zoom as f32 {
+            let g_guard = config::GLOBAL.read().unwrap();
+            if let Some(g) = g_guard.as_ref() {
+                let icon_size_cfg = config::WORLD.read().unwrap().as_ref()
+                    .map(|w| w.cfg.structure_icon_size).unwrap_or(32);
+                for &(_, _, key) in self.visible_tiles_buf.iter() {
+                    if let Some(st) = self.map.tiles.get(&key).and_then(|t| t.structures.as_ref()) {
                         paint_structure_icons(
-                            icon_cache,
-                            map,
+                            &mut self.icon_cache,
+                            &self.map,
                             st,
                             &g.structure_icons,
                             icon_size_cfg,
@@ -1057,16 +1504,14 @@ impl MainView {
             }
         }
 
-        self.paint_grids(bounds, vmin, vmax, window);
-
-        // coordinates (upstream TileMap.drawCoordinates): block coords,
-        // EDGE/DYNAMIC edge labels when zoomed, GRID/dynamic intersections otherwise.
-        if self.map.show_coordinates && scale > 1.0 {
+        // coordinates (upstream TileMap.draw): chunk coords while zoomed in
+        // (scale < 1.2), region coords otherwise. EDGE-style X labels are
+        // rotated 90° upstream — gpui can't rotate text, so they stay
+        // horizontal here (known divergence).
+        if self.map.show_coordinates {
             let ts = window.text_system().clone();
             let style = self.map.coordinate_style;
             let zoom = get_zoom_level(scale);
-            let edge = style == crate::tilemap::CoordinateStyle::Edge
-                || (style == crate::tilemap::CoordinateStyle::Dynamic && scale > 30.0);
             let run = [TextRun {
                 len: usize::MAX,
                 font: Font {
@@ -1088,49 +1533,125 @@ impl MainView {
             let mut paint = |key: CoordKey, text: &mut dyn FnMut() -> String, sx: f32, sz: f32| {
                 paint_coord(coord_cache, &ts, &run, key, text, sx, sz, window, _cx);
             };
-            if edge {
-                // edge labels: x along top, z along left (upstream rotates x;
-                // gpui can't rotate text - horizontal is close enough)
-                let mul = ((zoom / 4).max(1) * 512) as i64;
-                // bx % mul == 0 <=> rx % (mul/512) == 0: step the multiples
-                // directly instead of scanning every visible region.
-                let step = (mul / 512) as i32;
-                let x0 = vmin.x + (step - vmin.x.rem_euclid(step)) % step;
-                for rx in (x0..=vmax.x + 1).step_by(step as usize) {
-                    let bx = rx as i64 * 512;
-                    let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
-                    if sx >= 0.0 && sx <= self.map.width {
-                        paint(CoordKey::Edge(bx), &mut || abbrev_coord(bx as i32), sx, 2.0);
+            if scale < 1.2 {
+                // upstream drawChunkCoordinates: block coords at aligned
+                // chunk intersections, thinning out by 2/4/8/16 with zoom.
+                let multiplier: i32 = if scale > 0.8 {
+                    16
+                } else if scale > 0.4 {
+                    8
+                } else if scale > 0.2 {
+                    4
+                } else if scale > 0.1 {
+                    2
+                } else {
+                    1
+                };
+                let cmin = self.map.offset.to_point2i().block_to_chunk();
+                let cmax = self
+                    .map
+                    .offset
+                    .add(self.map.width * scale, self.map.height * scale)
+                    .to_point2i()
+                    .block_to_chunk();
+                let x0 = cmin.x - cmin.x.rem_euclid(multiplier);
+                let z0 = cmin.z - cmin.z.rem_euclid(multiplier);
+                if style == crate::tilemap::CoordinateStyle::Edge {
+                    for cx in (x0..=cmax.x + 1).step_by(multiplier as usize) {
+                        let bx = cx as i64 * 16;
+                        let sx = (cx as f32 * 16.0 - self.map.offset.x) / scale + 2.0;
+                        if sx >= 0.0 && sx <= self.map.width {
+                            paint(CoordKey::Edge(bx), &mut || abbrev_coord(bx as i32), sx, 2.0);
+                        }
                     }
-                }
-                let z0 = vmin.z + (step - vmin.z.rem_euclid(step)) % step;
-                for rz in (z0..=vmax.z + 1).step_by(step as usize) {
-                    let bz = rz as i64 * 512;
-                    let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
-                    if sz >= 0.0 && sz <= self.map.height {
-                        paint(CoordKey::Edge(bz), &mut || abbrev_coord(bz as i32), 2.0, sz);
+                    for cz in (z0..=cmax.z + 1).step_by(multiplier as usize) {
+                        let bz = cz as i64 * 16;
+                        let sz = (cz as f32 * 16.0 - self.map.offset.z) / scale + 2.0;
+                        if sz >= 0.0 && sz <= self.map.height {
+                            paint(CoordKey::Edge(bz), &mut || abbrev_coord(bz as i32), 2.0, sz);
+                        }
+                    }
+                } else {
+                    for cx in (x0..=cmax.x).step_by(multiplier as usize) {
+                        for cz in (z0..=cmax.z).step_by(multiplier as usize) {
+                            let (bx, bz) = (cx as i64 * 16, cz as i64 * 16);
+                            let sx = (cx as f32 * 16.0 - self.map.offset.x) / scale + 2.0;
+                            let sz = (cz as f32 * 16.0 - self.map.offset.z) / scale + 2.0;
+                            if sx > self.map.width || sz > self.map.height {
+                                continue;
+                            }
+                            paint_coord_pair(coord_cache, &ts, &run, bx, bz, sx, sz, window, _cx);
+                        }
                     }
                 }
             } else {
-                let mul = if scale > 7.0 || style == crate::tilemap::CoordinateStyle::Grid {
-                    (zoom / 2).max(1) * 512
-                } else {
-                    512
-                } as i64;
-                let step = (mul / 512) as i32;
-                let x0 = vmin.x + (step - vmin.x.rem_euclid(step)) % step;
-                let z0 = vmin.z + (step - vmin.z.rem_euclid(step)) % step;
-                for rx in (x0..=vmax.x + 1).step_by(step as usize) {
-                    for rz in (z0..=vmax.z + 1).step_by(step as usize) {
-                        let (bx, bz) = (rx as i64 * 512, rz as i64 * 512);
+                // upstream drawRegionCoordinates
+                let edge = style == crate::tilemap::CoordinateStyle::Edge
+                    || (style == crate::tilemap::CoordinateStyle::Dynamic && scale > 30.0);
+                if edge {
+                    // edge labels: x along top, z along left
+                    let mul = ((zoom / 4).max(1) * 512) as i64;
+                    // bx % mul == 0 <=> rx % (mul/512) == 0: step the multiples
+                    // directly instead of scanning every visible region.
+                    let step = (mul / 512) as i32;
+                    let x0 = vmin.x - vmin.x.rem_euclid(step);
+                    for rx in (x0..=vmax.x + 1).step_by(step as usize) {
+                        let bx = rx as i64 * 512;
                         let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
+                        if sx >= 0.0 && sx <= self.map.width {
+                            paint(CoordKey::Edge(bx), &mut || abbrev_coord(bx as i32), sx, 2.0);
+                        }
+                    }
+                    let z0 = vmin.z - vmin.z.rem_euclid(step);
+                    for rz in (z0..=vmax.z + 1).step_by(step as usize) {
+                        let bz = rz as i64 * 512;
                         let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
-                        if sx < 0.0 || sz < 0.0 || sx > self.map.width || sz > self.map.height {
+                        if sz >= 0.0 && sz <= self.map.height {
+                            paint(CoordKey::Edge(bz), &mut || abbrev_coord(bz as i32), 2.0, sz);
+                        }
+                    }
+                } else {
+                    let multiplier = if scale > 7.0 || style == crate::tilemap::CoordinateStyle::Grid {
+                        (zoom / 2).max(1)
+                    } else {
+                        1
+                    };
+                    // two-line "x,\nz" labels at aligned region intersections
+                    let rx0 = vmin.x - vmin.x.rem_euclid(multiplier);
+                    let rz0 = vmin.z - vmin.z.rem_euclid(multiplier);
+                    for rx in (rx0..=vmax.x).step_by(multiplier as usize) {
+                        for rz in (rz0..=vmax.z).step_by(multiplier as usize) {
+                            let (bx, bz) = (rx as i64 * 512, rz as i64 * 512);
+                            let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
+                            let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
+                            if sx > self.map.width || sz > self.map.height {
+                                continue;
+                            }
+                            paint_coord_pair(coord_cache, &ts, &run, bx, bz, sx, sz, window, _cx);
+                        }
+                    }
+                    // edge-guard: one extra label row above / column left of
+                    // the first aligned cell, so labels stay visible while
+                    // panning (upstream drawRegionCoordinates tail pass).
+                    let rzg = rz0 - multiplier;
+                    for rx in ((rx0 - multiplier)..=vmax.x).step_by(multiplier as usize) {
+                        let (bx, bz) = (rx as i64 * 512, rzg as i64 * 512);
+                        let sx = (rx as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
+                        let sz = (rzg as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
+                        if sx > self.map.width {
                             continue;
                         }
-                        paint(CoordKey::Grid(bx, bz), &mut || {
-                            format!("{}, {}", abbrev_coord(bx as i32), abbrev_coord(bz as i32))
-                        }, sx, sz);
+                        paint_coord_pair(coord_cache, &ts, &run, bx, bz, sx, sz, window, _cx);
+                    }
+                    let rxg = rx0 - multiplier;
+                    for rz in (rz0..=vmax.z).step_by(multiplier as usize) {
+                        let (bx, bz) = (rxg as i64 * 512, rz as i64 * 512);
+                        let sx = (rxg as f32 * 512.0 - self.map.offset.x) / scale + 2.0;
+                        let sz = (rz as f32 * 512.0 - self.map.offset.z) / scale + 2.0;
+                        if sz > self.map.height {
+                            continue;
+                        }
+                        paint_coord_pair(coord_cache, &ts, &run, bx, bz, sx, sz, window, _cx);
                     }
                 }
             }
@@ -1216,8 +1737,31 @@ fn paint_coord(
     let _ = line.paint(point(px(sx), px(sz)), px(14.), window, cx);
 }
 
-/// upstream TileMap.drawStructureIcons: first enabled structure icon per
-/// chunk, centered on the chunk. Free function so the tile loop can hold an
+/// upstream two-line "x,\nz" grid label — two cached ShapedLines stacked.
+#[allow(clippy::too_many_arguments)]
+fn paint_coord_pair(
+    cache: &mut std::collections::HashMap<CoordKey, ShapedLine>,
+    ts: &WindowTextSystem,
+    run: &[TextRun],
+    bx: i64,
+    bz: i64,
+    sx: f32,
+    sz: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    paint_coord(cache, ts, run, CoordKey::Grid(bx, bz), &mut || {
+        format!("{},", abbrev_coord(bx as i32))
+    }, sx, sz, window, cx);
+    paint_coord(cache, ts, run, CoordKey::GridB(bx, bz), &mut || {
+        abbrev_coord(bz as i32)
+    }, sx, sz + 11.0, window, cx);
+}
+
+/// upstream TileMap.drawStructureIcons / TileImage.drawStructures: first
+/// enabled structure icon per chunk, centered on the chunk. Icons are
+/// pre-rendered at structureIconSize pixels upstream — a constant screen
+/// size, not scaled by the view. Free function so the tile loop can hold an
 /// immutable borrow of `map` while icons resolve through the mutable cache.
 fn paint_structure_icons(
     icon_cache: &mut std::collections::HashMap<String, Arc<RenderImage>>,
@@ -1230,7 +1774,7 @@ fn paint_structure_icons(
 ) {
     let registry = mc_core::structures::structures();
     let chunk_size = 16.0 / scale;
-    let icon_size = icon_size_cfg as f32 / scale;
+    let icon_size = icon_size_cfg as f32;
     let mut canon = String::with_capacity(32);
     for (chunk_l, names) in structures {
         let chunk = Point2i::from_long(*chunk_l);
@@ -1407,17 +1951,16 @@ fn build_paste_overlay(
 }
 
 impl MainView {
-    fn render_layer_only_only(&self) -> bool {
-        config::WORLD.read().unwrap().as_ref()
-            .map(|w| w.cfg.render_layer_only).unwrap_or(false)
+    /// rebuild the OS menus so checkmark prefixes track toggle state.
+    fn rebuild_menus(cx: &mut Context<Self>) {
+        cx.set_menus(crate::menus(cx));
     }
 
-    /// status-bar text; the formatted string is cached and rebuilt only
-    /// when an input that can change it differs (StatusKey).
+    /// status-bar text (upstream StatusBar): hovered Block/Chunk/Region,
+    /// Selected (∞ when inverted), Total tiles, Queue, Overlay value,
+    /// Structures; "-" placeholders without a hover; a spinner runs while
+    /// jobs are queued. Cached, rebuilt only when a StatusKey input differs.
     fn status_text(&mut self) -> SharedString {
-        let (min, max) = self.map.visible_region_bounds(Point2f::ZERO);
-        let visible_tiles = (max.x - min.x + 1) * (max.z - min.z + 1);
-        let visible_regions = visible_tiles.max(0) as usize;
         // upstream status bar: hovered structure names
         let structure = if self.map.show_structure_icons {
             self.map.hovered_block.and_then(|h| {
@@ -1436,28 +1979,32 @@ impl MainView {
         };
         // upstream: "type(min, max), hoveredValue"
         let overlay = self.map.overlay.as_ref().map(|ov| {
-            let val = self.map.hovered_block.and_then(|h| {
-                let c = h.block_to_chunk();
-                let r = c.chunk_to_region();
-                let rel = c.sub(r.region_to_chunk());
-                self.map
-                    .tiles
-                    .get(&r.as_long())
-                    .and_then(|t| t.overlay_data.as_ref())
-                    .map(|d| d[(rel.z * 32 + rel.x) as usize])
-            });
+            let val = if !ov.active {
+                None
+            } else {
+                self.map.hovered_block.and_then(|h| {
+                    let c = h.block_to_chunk();
+                    let r = c.chunk_to_region();
+                    let rel = c.sub(r.region_to_chunk());
+                    self.map
+                        .tiles
+                        .get(&r.as_long())
+                        .and_then(|t| t.overlay_data.as_ref())
+                        .map(|d| d[(rel.z * 32 + rel.x) as usize])
+                })
+            };
             (ov.typ, ov.min, ov.max, val)
         });
         let key = StatusKey {
-            visible_tiles,
-            visible_regions,
-            scale_bits: self.map.scale.to_bits(),
+            total_tiles: self.map.tiles.len(),
             hovered: self.map.hovered_block,
             selected_chunks: self.map.selected_chunks,
+            inverted: self.map.selection.is_inverted(),
             unsaved_selection: self.map.unsaved_selection,
             structure,
             overlay,
             jobs: mc_core::jobs::active_jobs(),
+            spin: self.spin,
         };
         if let Some((k, s)) = &self.status_cache {
             if *k == key {
@@ -1466,35 +2013,60 @@ impl MainView {
         }
         use std::fmt::Write;
         let mut s = String::with_capacity(160);
-        let _ = write!(
-            s,
-            "{} visible tiles | {} visible regions | {} visible chunks | zoom {}",
-            visible_tiles, visible_regions, visible_tiles as i64 * 1024, self.map.scale
-        );
-        if let Some(h) = self.map.hovered_block {
-            let _ = write!(s, " | {} {}", h.x, h.z);
-        }
-        let _ = write!(s, " | {} selected chunks", self.map.selected_chunks);
-        if let Some((name, more)) = &key.structure {
-            let _ = write!(s, " | structures: {}{}", name, if *more { ", ..." } else { "" });
-        }
-        if self.map.unsaved_selection {
-            s.push_str(" | selection not saved");
-        }
-        if let Some((typ, mn, mx, val)) = key.overlay {
-            let mm = match (mn, mx) {
-                (Some(a), Some(b)) => format!("{}, {}", a, b),
-                _ => "-".to_string(),
-            };
+        if let Some(h) = key.hovered {
+            let c = h.block_to_chunk();
+            let r = h.block_to_region();
             let _ = write!(
                 s,
-                " | overlay: {}({}), {}",
-                typ.display_name(),
-                mm,
-                val.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+                "Block: {}, {}  Chunk: {}, {}  Region: {}, {}",
+                h.x, h.z, c.x, c.z, r.x, r.z
             );
+        } else {
+            s.push_str("Block: -, -  Chunk: -, -  Region: -, -");
         }
-        let _ = write!(s, " | {} jobs in queue", key.jobs);
+        let sel = if key.inverted {
+            "∞".to_string()
+        } else {
+            key.selected_chunks.to_string()
+        };
+        // upstream has no dirty marker; the trailing * is our
+        // unsaved-selection indicator.
+        let _ = write!(
+            s,
+            "  Selected: {}{}  Total: {}  Queue: {}",
+            sel,
+            if key.unsaved_selection { "*" } else { "" },
+            key.total_tiles,
+            key.jobs
+        );
+        match &key.overlay {
+            Some((typ, mn, mx, val)) => {
+                let mm = match (mn, mx) {
+                    (Some(a), Some(b)) => format!("{}, {}", a, b),
+                    _ => "-, -".to_string(),
+                };
+                let _ = write!(
+                    s,
+                    "  Overlay: {}({}), {}",
+                    typ.display_name(),
+                    mm,
+                    val.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+                );
+            }
+            None => s.push_str("  Overlay: -, -"),
+        }
+        match &key.structure {
+            Some((name, more)) => {
+                let _ = write!(s, "  Structures: {}{}", name, if *more { ", ..." } else { "" });
+            }
+            None => s.push_str("  Structures: -"),
+        }
+        if key.jobs > 0 {
+            // cheap busy indicator — the upstream status bar shows a
+            // rotating load icon while the job queue is non-empty.
+            const SPIN: [char; 4] = ['-', '\\', '|', '/'];
+            let _ = write!(s, "  {}", SPIN[key.spin as usize % 4]);
+        }
         let s = SharedString::from(s);
         self.status_cache = Some((key, s.clone()));
         s
@@ -1541,9 +2113,12 @@ fn paste_argb_image(px: &[u32; 1024]) -> Option<Arc<RenderImage>> {
     crate::tilemap::argb_to_render_image(px, 32)
 }
 
-fn selection_overlay_image(tile: &Tile, sel: &mc_core::selection::Selection, version: u64) -> Option<Arc<RenderImage>> {
-    let key = tile.location.as_long();
-    if !sel.is_any_chunk_in_region_selected(key) && !sel.is_region_selected(key) {
+/// 32x32 chunk-selection overlay for a region with partially selected
+/// chunks (whole-region selection paints a fill quad instead — see the
+/// selection pass in paint_map). Mirrors upstream markedChunksImage.
+fn marked_chunks_image(region: Point2i, sel: &mc_core::selection::Selection, version: u64) -> Option<Arc<RenderImage>> {
+    let key = region.as_long();
+    if !sel.is_any_chunk_in_region_selected(key) || sel.is_region_selected(key) {
         return None;
     }
     let mut cache = OVERLAY_CACHE.lock().unwrap();
@@ -1556,13 +2131,7 @@ fn selection_overlay_image(tile: &Tile, sel: &mc_core::selection::Selection, ver
     }
     let g = config::global();
     let mut px = [0u32; 32 * 32];
-    if sel.is_region_selected(key) {
-        // upstream: whole-region selection fills with regionSelectionColor
-        let color = g.region_selection_color.to_argb();
-        for p in px.iter_mut() {
-            *p = color;
-        }
-    } else if let Some(Some(cs)) = sel.selected_chunks(tile.location) {
+    if let Some(Some(cs)) = sel.selected_chunks(region) {
         let color = g.chunk_selection_color.to_argb();
         for i in cs.iter() {
             px[i] = color;
@@ -1633,7 +2202,13 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &ReloadAction, _w, cx| {
                 if let Some(ws) = config::world() {
                     v.map.regions = files::scan_region_files(ws.region_dir());
-                    v.map.mark_all_tiles_obsolete();
+                    // upstream reload() invalidates only visible regions
+                    let (min, max) = v.map.visible_region_bounds(Point2f::ZERO);
+                    for rx in min.x..=max.x {
+                        for rz in min.z..=max.z {
+                            v.map.invalidate_region(Point2i::new(rx, rz), false);
+                        }
+                    }
                     v.request_update();
                 }
                 cx.notify();
@@ -1643,6 +2218,7 @@ impl Render for MainView {
                 let mut g = config::global();
                 g.show_chunk_grid = v.map.show_chunk_grid;
                 config::set_global(g);
+                Self::rebuild_menus(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &RegionGridAction, _w, cx| {
@@ -1650,6 +2226,7 @@ impl Render for MainView {
                 let mut g = config::global();
                 g.show_region_grid = v.map.show_region_grid;
                 config::set_global(g);
+                Self::rebuild_menus(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &CoordStyleDynamicAction, _w, cx| {
@@ -1657,6 +2234,7 @@ impl Render for MainView {
                 let mut g = config::global();
                 g.coordinate_style = "DYNAMIC".into();
                 config::set_global(g);
+                Self::rebuild_menus(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &CoordStyleEdgeAction, _w, cx| {
@@ -1664,6 +2242,7 @@ impl Render for MainView {
                 let mut g = config::global();
                 g.coordinate_style = "EDGE".into();
                 config::set_global(g);
+                Self::rebuild_menus(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &CoordStyleGridAction, _w, cx| {
@@ -1671,6 +2250,7 @@ impl Render for MainView {
                 let mut g = config::global();
                 g.coordinate_style = "GRID".into();
                 config::set_global(g);
+                Self::rebuild_menus(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &CoordinatesAction, _w, cx| {
@@ -1678,6 +2258,7 @@ impl Render for MainView {
                 let mut g = config::global();
                 g.show_coordinates = v.map.show_coordinates;
                 config::set_global(g);
+                Self::rebuild_menus(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|v, a: &ToggleStructureIcon, _w, cx| {
@@ -1685,14 +2266,19 @@ impl Render for MainView {
                 let cur = g.structure_icons.get(&a.id).copied().unwrap_or(true);
                 g.structure_icons.insert(a.id.clone(), !cur);
                 config::set_global(g);
+                Self::rebuild_menus(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &StructureIconsAction, _w, cx| {
                 v.map.show_structure_icons = !v.map.show_structure_icons;
+                let mut g = config::global();
+                g.show_structure_icons = v.map.show_structure_icons;
+                config::set_global(g);
+                Self::rebuild_menus(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &GotoAction, _w, cx| {
-                v.dialog = Some(Dialog::Goto { x: String::new(), z: String::new(), focus_x: true });
+                v.dialog = Some(Dialog::Goto { x: String::new(), z: String::new(), focus_x: true, invalid: false });
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &ResetZoomAction, _w, cx| {
@@ -1714,10 +2300,14 @@ impl Render for MainView {
                 v.save_screenshot(cx);
             }))
             .on_action(cx.listener(|v, _: &ClearViewCacheAction, _w, cx| {
-                if let Some(ws) = config::world() {
-                    let _ = std::fs::remove_dir_all(&ws.cache_dir);
+                // upstream CacheHelper.clearViewCache: cached PNGs of the
+                // VISIBLE regions only, not the whole world cache dir.
+                let (min, max) = v.map.visible_region_bounds(Point2f::ZERO);
+                for rx in min.x..=max.x {
+                    for rz in min.z..=max.z {
+                        v.map.invalidate_region(Point2i::new(rx, rz), true);
+                    }
                 }
-                v.map.mark_all_tiles_obsolete();
                 v.request_update();
                 cx.notify();
             }))
@@ -1738,12 +2328,25 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &ExportSelectionAction, w, cx| v.export_selection(w, cx)))
             .on_action(cx.listener(|v, _: &ExportImageAction, w, cx| v.export_image(w, cx)))
             .on_action(cx.listener(|v, _: &ClearSelectionCacheAction, _w, cx| {
+                // upstream clearSelectionCache uses the TRUE selection —
+                // an inverted selection covers every region file in the
+                // world (region + poi + entities dirs).
                 let sel = v.map.selection.clone();
-                let keys: Vec<i64> = sel.selection.keys().copied().collect();
+                let keys: Vec<i64> = if sel.inverted {
+                    let mut k: std::collections::HashSet<i64> = std::collections::HashSet::new();
+                    if let Some(ws) = config::world() {
+                        k.extend(files::scan_region_files(ws.region_dir()));
+                        for d in [&ws.dirs.poi, &ws.dirs.entities].into_iter().flatten() {
+                            k.extend(files::scan_region_files(d));
+                        }
+                    }
+                    k.into_iter().collect()
+                } else {
+                    sel.selection.keys().copied().collect()
+                };
                 for k in keys {
-                    v.map.discard_cached_image(Point2i::from_long(k));
+                    v.map.invalidate_region(Point2i::from_long(k), true);
                 }
-                v.map.mark_all_tiles_obsolete();
                 v.request_update();
                 cx.notify();
             }))
@@ -1762,10 +2365,12 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &EditOverlaysAction, _w, cx| v.edit_overlays(cx)))
             .on_action(cx.listener(|v, _: &NextOverlayAction, _w, cx| {
                 v.map.next_overlay();
+                v.request_update();
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &NextOverlayTypeAction, _w, cx| {
                 v.map.next_overlay_type();
+                v.request_update();
                 cx.notify();
             }))
             .on_action(cx.listener(|v, _: &AboutAction, _w, cx| {
@@ -1778,6 +2383,18 @@ impl Render for MainView {
                 if v.height_slider_drag {
                     let h = v.height_from_slider_x(f32::from(e.position.x));
                     v.set_render_height(h, false, cx);
+                    return;
+                }
+                // gpui has no mouse-exit event: clear the hovered block when
+                // the cursor leaves the canvas rect (over the slider, status
+                // bar or window edge) so the status bar shows "-, -". Moves
+                // leaving the window entirely are never delivered, so a
+                // stale hover can persist until the next move event.
+                let x = f32::from(e.position.x);
+                let y = f32::from(e.position.y);
+                let inside = x >= 0.0 && y >= 0.0 && x < v.map.width && y < v.map.height;
+                if !inside && v.map.hovered_block.take().is_some() {
+                    cx.notify();
                 }
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|v, _e: &MouseUpEvent, _w, cx| {
@@ -1807,7 +2424,7 @@ impl Render for MainView {
                     )
                     .children(self.render_dialog(cx)),
             )
-            .children(if show_bar && !self.render_layer_only_only() {
+            .children(if show_bar {
                 vec![self.render_height_slider(cx)]
             } else {
                 vec![]
@@ -1925,8 +2542,11 @@ impl MainView {
         (-64. + frac * 383.).round() as i32
     }
 
+    /// upstream HeightSlider: the slider pins at -64..319 but the numeric
+    /// field accepts -64..2047 — render_height keeps the typed value while
+    /// the slider thumb clamps (frac clamps to 0..1 in render).
     fn set_render_height(&mut self, h: i32, persist: bool, cx: &mut Context<Self>) {
-        let h = h.clamp(-64, 319);
+        let h = h.clamp(-64, 2047);
         let cur = config::WORLD.read().unwrap().as_ref()
             .map(|w| w.cfg.render_height).unwrap_or(319);
         if h == cur && !persist {
@@ -1963,7 +2583,8 @@ impl MainView {
             .gap_2()
             .text_size(px(12.))
             .text_color(rgb(0xbbbbbb))
-            .child(div().w(px(76.)).flex_none().child(format!("height {}", h)))
+            // upstream: min label, slider, max label, numeric field
+            .child(div().w(px(30.)).flex_none().child("-64"))
             .child(
                 div()
                     .id("height-slider")
@@ -1974,6 +2595,19 @@ impl MainView {
                         v.height_slider_drag = true;
                         let hh = v.height_from_slider_x(f32::from(e.position.x));
                         v.set_render_height(hh, false, cx);
+                    }))
+                    // upstream slider scroll adjusts the height by +/-1
+                    .on_scroll_wheel(cx.listener(|v, e: &ScrollWheelEvent, _w, cx| {
+                        let dy = match e.delta {
+                            ScrollDelta::Pixels(p) => f32::from(p.y),
+                            ScrollDelta::Lines(l) => l.y,
+                        };
+                        if dy != 0.0 {
+                            let cur = config::WORLD.read().unwrap().as_ref()
+                                .map(|w| w.cfg.render_height).unwrap_or(319);
+                            let next = cur + if dy > 0.0 { 1 } else { -1 };
+                            v.set_render_height(next.clamp(-64, 319), true, cx);
+                        }
                     }))
                     .child(canvas(
                         move |b, _w, _cx| {
@@ -2002,6 +2636,39 @@ impl MainView {
                             ));
                         },
                     )),
+            )
+            .child(div().w(px(30.)).flex_none().child("319"))
+            // upstream NumberTextField(-64..2047): click the value to type a
+            // height — values above 319 pin the slider thumb at max but set
+            // render_height to the typed number.
+            .child(
+                div()
+                    .id("height-field")
+                    .w(px(76.))
+                    .flex_none()
+                    .cursor_pointer()
+                    .child(format!("height {}", h))
+                    .on_click(cx.listener(|v, _, _w, cx| {
+                        let cur = config::WORLD.read().unwrap().as_ref()
+                            .map(|w| w.cfg.render_height).unwrap_or(319);
+                        v.dialog = Some(Dialog::TextInput {
+                            title: "Render height".into(),
+                            hint: "-64 .. 2047".into(),
+                            text: cur.to_string(),
+                            on_done: Box::new(|v, _w, cx, t| {
+                                match t.trim().parse::<i32>() {
+                                    Ok(hh) => v.set_render_height(hh, true, cx),
+                                    Err(_) => {
+                                        v.dialog = Some(Dialog::Error {
+                                            msg: format!("not a number: {t}"),
+                                        });
+                                        cx.notify();
+                                    }
+                                }
+                            }),
+                        });
+                        cx.notify();
+                    })),
             )
             .into_any_element()
     }
@@ -2064,8 +2731,14 @@ impl MainView {
     fn delete_chunks(&mut self, cx: &mut Context<Self>) {
         let sel = self.map.selection.clone();
         if sel.is_empty() { return; }
+        // upstream DeleteConfirmationDialog: verbose header unless inverted
+        let msg = if sel.inverted {
+            "You are about to delete an unknown number of chunks from this world.".to_string()
+        } else {
+            format!("You are about to delete {} chunks from this world.", self.map.selected_chunks)
+        };
         self.dialog = Some(Dialog::Confirm {
-            msg: "Delete selected chunks?".into(),
+            msg: format!("{msg}\nAre you sure?"),
             action: Box::new(move |v, _w, cx| {
                 let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
                 crate::ops::for_each_selected_region(
@@ -2093,8 +2766,14 @@ impl MainView {
     fn defragment(&mut self, cx: &mut Context<Self>) {
         let sel = self.map.selection.clone();
         if sel.is_empty() { return; }
+        // upstream DefragmentConfirmationDialog: verbose header unless inverted
+        let msg = if sel.inverted {
+            "You are about to defragment an unknown number of regions.".to_string()
+        } else {
+            format!("You are about to defragment {} regions.", sel.selection.len())
+        };
         self.dialog = Some(Dialog::Confirm {
-            msg: "Defragment selected regions?".into(),
+            msg: format!("{msg}\nAre you sure?"),
             action: Box::new(move |v, _w, cx| {
                 let tx = v.map.result_tx.clone();
                 mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
@@ -2129,45 +2808,66 @@ impl MainView {
     fn export_chunks(&mut self, cx: &mut Context<Self>) {
         let sel = self.map.selection.clone();
         if sel.is_empty() { return; }
+        let n = self.map.selected_chunks;
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false, directories: true, multiple: false,
             prompt: Some("Select world directory to export to".into()),
         });
+        // upstream ExportConfirmationDialog after the directory pick
         cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
             if let Ok(Ok(Some(paths))) = rx.await {
                 if let Some(dir) = paths.into_iter().next() {
-                    let region_dir = dir.join("region");
-                    let _ = std::fs::create_dir_all(&region_dir);
-                    mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
-                        mc_core::jobs::PRIORITY_LOW, None,
-                        move || {
-                            let __p = mc_core::jobs::Progress::new("Exporting chunks", sel.selection.len() as i64);
-                            for (&region_l, chunks) in &sel.selection {
-                                let __g = __p.inc_guard();
-                                let region = mc_core::point::Point2i::from_long(region_l);
-                                __p.set_current(mc_core::files::mca_file_name(region));
-                                if __p.is_cancelled() { break; }
-                                let Some(src_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
-                                let src = src_dir.join(mc_core::files::mca_file_name(region));
-                                let dst = region_dir.join(mc_core::files::mca_file_name(region));
-                                if !src.exists() { continue; }
-                                match chunks {
-                                    None => { let _ = std::fs::copy(&src, &dst); }
-                                    Some(cs) => {
-                                        let mut m = match mc_core::mca::McaFile::new(src) { Ok(m) => m, Err(_) => continue };
-                                        if m.load(false).is_err() { continue; }
-                                        // keep only selected chunks
-                                        let mut keep = mc_core::selection::ChunkSet::new();
-                                        for i in 0..1024 { if !cs.get(i) { keep.set(i); } }
-                                        m.delete_chunks(&keep);
-                                        let _ = m.save_with_temp_file(&dst);
-                                    }
-                                }
-                            }
-                        }));
+                    let msg = if sel.inverted {
+                        "You are about to export an unknown number of chunks from this world.".to_string()
+                    } else {
+                        format!("You are about to export {n} chunks from this world.")
+                    };
+                    let _ = this.update(&mut *cx, |v, cx| {
+                        v.dialog = Some(Dialog::Confirm {
+                            msg: format!("{msg}\nto {}\nAre you sure?", dir.display()),
+                            action: Box::new(move |v, _w, cx| {
+                                v.do_export_chunks(sel.clone(), dir.clone());
+                                v.dialog = None;
+                                cx.notify();
+                            }),
+                        });
+                        cx.notify();
+                    });
                 }
             }
         }).detach();
+    }
+
+    fn do_export_chunks(&mut self, sel: mc_core::selection::Selection, dir: PathBuf) {
+        let region_dir = dir.join("region");
+        let _ = std::fs::create_dir_all(&region_dir);
+        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+            mc_core::jobs::PRIORITY_LOW, None,
+            move || {
+                let __p = mc_core::jobs::Progress::new("Exporting chunks", sel.selection.len() as i64);
+                for (&region_l, chunks) in &sel.selection {
+                    let __g = __p.inc_guard();
+                    let region = mc_core::point::Point2i::from_long(region_l);
+                    __p.set_current(mc_core::files::mca_file_name(region));
+                    if __p.is_cancelled() { break; }
+                    let Some(src_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
+                    let src = src_dir.join(mc_core::files::mca_file_name(region));
+                    let dst = region_dir.join(mc_core::files::mca_file_name(region));
+                    if !src.exists() { continue; }
+                    match chunks {
+                        None => { let _ = std::fs::copy(&src, &dst); }
+                        Some(cs) => {
+                            let mut m = match mc_core::mca::McaFile::new(src) { Ok(m) => m, Err(_) => continue };
+                            if m.load(false).is_err() { continue; }
+                            // keep only selected chunks
+                            let mut keep = mc_core::selection::ChunkSet::new();
+                            for i in 0..1024 { if !cs.get(i) { keep.set(i); } }
+                            m.delete_chunks(&keep);
+                            let _ = m.save_with_temp_file(&dst);
+                        }
+                    }
+                }
+            }));
     }
 
     fn copy_chunks(&mut self, cx: &mut Context<Self>) {
@@ -2213,7 +2913,7 @@ impl MainView {
         cx.notify();
     }
 
-    fn paste_chunks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn paste_chunks(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.map.pasted.is_some() {
             let o = self.map.pasted.as_ref().unwrap().offset;
             self.dialog = Some(Dialog::PasteConfirm {
@@ -2229,8 +2929,10 @@ impl MainView {
         let sel = mc_core::selection::Selection::read_csv(
             &mc_core::files::base_cache_dir().join("clipboard").join("selection.csv"),
         ).ok();
-        let vs = window.window_bounds().get_bounds().size;
-        let size = Point2f::new(f32::from(vs.width), f32::from(vs.height));
+        // upstream centers the ghost using the CANVAS size in chunks —
+        // map.width/height track the painted canvas rect (window minus
+        // title/status/option bars), not the raw window bounds.
+        let size = Point2f::new(self.map.width, self.map.height);
         self.map.set_pasted(clip, sel, size);
         cx.notify();
     }
@@ -2244,75 +2946,7 @@ impl MainView {
         let offset = mc_core::point::Point2i::new(ox, oz);
         let tx = self.map.result_tx.clone();
         self.map.cancel_paste();
-        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
-            mc_core::jobs::PRIORITY_LOW, None,
-            move || {
-                let Ok(rd) = std::fs::read_dir(&clip) else { return };
-                let files: Vec<_> = rd.flatten().collect();
-                let __p = mc_core::jobs::Progress::new("Importing chunks", files.len() as i64);
-                for e in files {
-                    let __g = __p.inc_guard();
-                    if __p.is_cancelled() { break; }
-                    let name = e.file_name().to_string_lossy().to_string();
-                    __p.set_current(name.clone());
-                    let Some(src_region) = mc_core::files::parse_mca_file_name(&name) else { continue };
-                    let Some(dst_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { return };
-                    let Ok(mut src) = mc_core::mca::McaFile::new(e.path()) else { continue };
-                    if src.load(false).is_err() { continue; }
-                    // chunks to paste from this region
-                    let sel_cs = pasted_sel.as_ref().and_then(|s| {
-                        if s.inverted {
-                            s.selection.get(&src_region.as_long()).map(|c| {
-                                match c { Some(cc) => cc.clone().flip(), None => mc_core::selection::ChunkSet::new() }
-                            })
-                        } else {
-                            match s.selection.get(&src_region.as_long()) {
-                                Some(Some(c)) => Some(c.clone()),
-                                Some(None) => Some({ let mut f = mc_core::selection::ChunkSet::new(); f.fill(); f }),
-                                None => None,
-                            }
-                        }
-                    }).or_else(|| { let mut f = mc_core::selection::ChunkSet::new(); f.fill(); Some(f) });
-                    let Some(sel_cs) = sel_cs else { continue };
-                    // split by target region (chunks may cross region borders)
-                    let mut targets: std::collections::HashMap<mc_core::point::Point2i, Vec<(usize, mc_core::point::Point2i)>> = std::collections::HashMap::new();
-                    for i in sel_cs.iter() {
-                        let c = src_region.region_to_chunk().add(i as i32 % 32, i as i32 / 32).add_p(offset);
-                        if let Some(ts) = &target_sel {
-                            if !ts.is_chunk_selected(c) { continue; }
-                        }
-                        targets.entry(c.chunk_to_region()).or_default().push((i, c));
-                    }
-                    for (tregion, chunks) in targets {
-                        let dst = dst_dir.join(mc_core::files::mca_file_name(tregion));
-                        let mut d = if dst.exists() {
-                            let Ok(mut m) = mc_core::mca::McaFile::new(dst.clone()) else { continue };
-                            if m.load(false).is_err() { continue; }
-                            m
-                        } else {
-                            mc_core::mca::McaFile::empty(tregion, dst.clone())
-                        };
-                        let trel = tregion.region_to_chunk();
-                        for (i, c) in chunks {
-                            if let Some(chunk) = &src.chunks[i] {
-                                let rel = c.sub(trel);
-                                if rel.x < 0 || rel.x > 31 || rel.z < 0 || rel.z > 31 { continue; }
-                                let di = (rel.z * 32 + rel.x) as usize;
-                                if d.chunks[di].is_some() && !overwrite { continue; }
-                                let mut cc = chunk.clone();
-                                cc.timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|t| t.as_secs() as i32).unwrap_or(0);
-                                d.chunks[di] = Some(cc);
-                            }
-                        }
-                        let _ = d.save_with_temp_file(&dst);
-                        let _ = tx.send(crate::tilemap::TileResult::Image {
-                            region: tregion, image: None, zoom: 0, structures: None, cache_write: false,
-                        });
-                    }
-                }
-            }));
+        import_mca_dir(clip, pasted_sel, offset, overwrite, target_sel, tx);
         cx.notify();
     }
     fn export_image(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2322,23 +2956,51 @@ impl MainView {
             cx.notify();
             return;
         }
+        // upstream generateImageFromSelection guards the pixel count before
+        // the file pick; ours is region-aligned (512px per region).
+        let mut minx = i32::MAX; let mut minz = i32::MAX;
+        let mut maxx = i32::MIN; let mut maxz = i32::MIN;
+        for &region_l in sel.selection.keys() {
+            let r = mc_core::point::Point2i::from_long(region_l);
+            minx = minx.min(r.x); minz = minz.min(r.z);
+            maxx = maxx.max(r.x); maxz = maxz.max(r.z);
+        }
+        let w = (maxx - minx + 1) as usize * 512;
+        let h = (maxz - minz + 1) as usize * 512;
+        if (w as i64) * (h as i64) > i32::MAX as i64 {
+            self.dialog = Some(Dialog::Error {
+                msg: format!("dimensions are too large to generate an image: {w}x{h}"),
+            });
+            cx.notify();
+            return;
+        }
         let rx = cx.prompt_for_new_path(
             &PathBuf::from(std::env::var("HOME").unwrap_or_default()),
             Some("selection.png"),
         );
-        let tx = self.map.result_tx.clone();
-        let _ = tx;
+        // upstream ImageExportConfirmationDialog after the file pick
         cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
             if let Ok(Ok(Some(path))) = rx.await {
-                        let mut minx = i32::MAX; let mut minz = i32::MAX;
-                let mut maxx = i32::MIN; let mut maxz = i32::MIN;
-                for &region_l in sel.selection.keys() {
-                    let r = mc_core::point::Point2i::from_long(region_l);
-                    minx = minx.min(r.x); minz = minz.min(r.z);
-                    maxx = maxx.max(r.x); maxz = maxz.max(r.z);
-                }
-                let w = (maxx - minx + 1) as usize * 512;
-                let h = (maxz - minz + 1) as usize * 512;
+                let _ = this.update(&mut *cx, |v, cx| {
+                    v.dialog = Some(Dialog::Confirm {
+                        msg: format!(
+                            "You are about to create an image with the dimensions {w}x{h}.\n{}\nAre you sure?",
+                            path.display()
+                        ),
+                        action: Box::new(move |v, _w, cx| {
+                            v.do_export_image(sel.clone(), path.clone(), w, h, minx, minz);
+                            v.dialog = None;
+                            cx.notify();
+                        }),
+                    });
+                    cx.notify();
+                });
+            }
+        }).detach();
+    }
+
+    fn do_export_image(&mut self, sel: mc_core::selection::Selection, path: PathBuf, w: usize, h: usize, minx: i32, minz: i32) {
+        {
                 let cfg = crate::config::world().map(|w| {
                     mc_core::render::RenderSettings {
                         render_height: w.cfg.render_height,
@@ -2385,8 +3047,7 @@ impl MainView {
                         }
                         let _ = image::save_buffer(&path, &rgba, w as u32, h as u32, image::ColorType::Rgba8);
                     }));
-            }
-        }).detach();
+        }
     }
 
 
@@ -2396,6 +3057,13 @@ impl MainView {
         let sel = self.map.selection.clone();
         let Some(ov) = self.map.overlay.clone() else { return };
         if sel.is_empty() { return; }
+        // upstream NumberDialog title: "<type>(<short multi values>)"
+        let mv = ov.raw_multi.trim();
+        *SUM_TITLE.lock().unwrap() = Some(if mv.is_empty() {
+            ov.typ.display_name().to_string()
+        } else {
+            format!("{}({})", ov.typ.display_name(), mv)
+        });
         let dirs = crate::config::world().map(|w| w.dirs.clone());
         mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
             mc_core::jobs::PRIORITY_LOW, None,
@@ -2443,59 +3111,59 @@ impl MainView {
         cx.notify();
     }
 
+    /// upstream importChunks: pick a source WORLD directory, then the
+    /// ImportConfirmationDialog (offset, overwrite, selection only) — the
+    /// y-offset and section-range options are not ported (they would need
+    /// section-level NBT rewriting).
     fn import_chunks(&mut self, cx: &mut Context<Self>) {
+        if self.map.disabled { return; }
         let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true, directories: false, multiple: true,
-            prompt: Some("Select region files to import".into()),
+            files: false, directories: true, multiple: false,
+            prompt: Some("Select world directory to import from".into()),
         });
-        let tx = self.map.result_tx.clone();
         cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
             if let Ok(Ok(Some(paths))) = rx.await {
-                mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
-                    mc_core::jobs::PRIORITY_LOW, None,
-                    move || {
-                        let __p = mc_core::jobs::Progress::new("Importing chunks", paths.len() as i64);
-                        for p in paths {
-                            let __g = __p.inc_guard();
-                            if __p.is_cancelled() { break; }
-                            let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                            __p.set_current(name.clone());
-                            let Some(region) = mc_core::files::parse_mca_file_name(&name) else { continue };
-                            let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { return };
-                            let dst = dir.join(&name);
-                            let Ok(mut src) = mc_core::mca::McaFile::new(p) else { continue };
-                            let mut dstf = if dst.exists() {
-                                mc_core::mca::McaFile::new(dst.clone()).ok()
-                            } else {
-                                Some(mc_core::mca::McaFile::empty(region, dst.clone()))
-                            };
-                            if src.load(false).is_err() { continue; }
-                            if let Some(d) = dstf.as_mut() {
-                                if dst.exists() && d.load(false).is_err() { continue; }
-                                for (i, c) in src.chunks.iter().enumerate() {
-                                    if c.is_some() {
-                                        d.chunks[i] = c.clone();
-                                        if let Some(cc) = &mut d.chunks[i] {
-                                            cc.timestamp = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .map(|t| t.as_secs() as i32).unwrap_or(0);
-                                        }
-                                    }
-                                }
-                                let _ = d.save_with_temp_file(&dst);
-                            }
-                            let _ = tx.send(crate::tilemap::TileResult::Image {
-                                region, image: None, zoom: 0, structures: None, cache_write: false,
+                if let Some(dir) = paths.into_iter().next() {
+                    let _ = this.update(&mut *cx, |v, cx| {
+                        let src = mc_core::files::detect_world_directories(&dir);
+                        if src.region.is_none() {
+                            v.dialog = Some(Dialog::Error {
+                                msg: "invalid world directory, missing 'region' directory".into(),
+                            });
+                        } else {
+                            v.dialog = Some(Dialog::Import {
+                                dir,
+                                ox: "0".into(),
+                                oz: "0".into(),
+                                overwrite: true,
+                                sel_only: false,
+                                focus_x: true,
+                                invalid: false,
                             });
                         }
-                    }));
-                let _ = this.update(&mut *cx, |v, cx| {
-                    v.map.mark_all_tiles_obsolete();
-                    v.request_update();
-                    cx.notify();
-                });
+                        cx.notify();
+                    });
+                }
             }
         }).detach();
+    }
+
+    /// run the import after the confirmation dialog (upstream ImportJob):
+    /// merge every chunk of the source world's region dir into the open
+    /// world, shifted by the chunk offset.
+    fn do_import(&mut self, dir: PathBuf, ox: i32, oz: i32, overwrite: bool, sel_only: bool, cx: &mut Context<Self>) {
+        let src_region_dir = dir.join("region");
+        let target_sel = if sel_only { Some(self.map.selection.clone()) } else { None };
+        let tx = self.map.result_tx.clone();
+        import_mca_dir(
+            src_region_dir,
+            None,
+            Point2i::new(ox, oz),
+            overwrite,
+            target_sel,
+            tx,
+        );
+        cx.notify();
     }
 
 
@@ -2518,8 +3186,14 @@ impl MainView {
         }
         let (r1, i1) = coords[0];
         let (r2, i2) = coords[1];
+        // upstream SwapConfirmationDialog names both chunks
+        let c1 = Point2i::from_long(r1).region_to_chunk().add_p(Point2i::from_chunk_index(i1 as i32));
+        let c2 = Point2i::from_long(r2).region_to_chunk().add_p(Point2i::from_chunk_index(i2 as i32));
         self.dialog = Some(Dialog::Confirm {
-            msg: "Swap selected chunks?".into(),
+            msg: format!(
+                "You are about to swap the chunks {}, {} and {}, {}.\nAre you sure?",
+                c1.x, c1.z, c2.x, c2.z
+            ),
             action: Box::new(move |v, _w, cx| {
                 let tx = v.map.result_tx.clone();
                 mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
@@ -2556,48 +3230,83 @@ impl MainView {
         cx.notify();
     }
 
+    /// upstream ChangeNBTDialog: comma-separated `Type = value` fields with
+    /// change/force and selection-only options.
     fn change_fields(&mut self, cx: &mut Context<Self>) {
-        // upstream dialog edits NBT fields on selected chunks (ChangeFieldsDialog);
-        // we accept "path = snbt_value" typed inline
-        self.dialog = Some(Dialog::TextInput {
-            title: "Change fields".into(),
-            hint: "path = value (e.g. Status = \"minecraft:full\")".into(),
+        self.dialog = Some(Dialog::ChangeFields {
             text: String::new(),
-            on_done: Box::new(|v, w, cx, text| {
-                v.apply_change_fields(text, w, cx);
-            }),
+            force: false,
+            sel_only: !self.map.selection.is_empty(),
         });
         cx.notify();
     }
 
-    fn apply_change_fields(&mut self, text: String, _w: &mut Window, cx: &mut Context<Self>) {
-        // parse "path = value" where value is SNBT literal
-        let Some((path, raw)) = text.split_once('=') else {
-            self.dialog = Some(Dialog::Error { msg: "expected: path = value".into() });
+    /// OK on the ChangeFields dialog -> ChangeFieldsConfirmationDialog ->
+    /// ChangeFieldsJob (mc_core::filter_ops::run_change_fields handles the
+    /// per-region poi/entities iteration itself).
+    fn run_change_fields_dialog(&mut self, text: String, force: bool, sel_only: bool, cx: &mut Context<Self>) {
+        if text.trim().is_empty() {
+            self.dialog = Some(Dialog::Error { msg: "empty field list".into() });
             cx.notify();
             return;
+        }
+        let fields = match mc_core::changer::parse_fields(&text) {
+            Ok(f) => f,
+            Err(e) => {
+                self.dialog = Some(Dialog::Error { msg: e });
+                cx.notify();
+                return;
+            }
         };
-        let path = path.trim().to_string();
-        let raw = raw.trim().to_string();
-        let sel = self.map.selection.clone();
+        let field_list = fields
+            .iter()
+            .map(|f| format!("{} = {}", f.field_type.name(), f.value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut sel = self.map.selection.clone();
+        if !sel_only || sel.is_empty() {
+            sel = mc_core::selection::Selection::new();
+        }
+        let sel_opt = if sel_only && !sel.is_empty() { Some(sel) } else { None };
         let tx = self.map.result_tx.clone();
-        let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
-        crate::ops::for_each_selected_region(
-            &sel, dirs, "Changing fields", tx,
-            move |_region, chunks, m, _path, _dirs| {
-                let val = mc_core::nbt::parse_snbt(&raw)
-                    .unwrap_or_else(|_| mc_core::nbt::Tag::String(raw.clone()));
-                let mut changed = false;
-                for i in 0..1024 {
-                    if !chunks.as_ref().map(|c| c.get(i)).unwrap_or(true) { continue; }
-                    let Some(c) = m.chunks[i].as_mut() else { continue };
-                    let Some(d) = c.data.as_mut() else { continue };
-                    mc_core::nbt::path_set(d, &path, val.clone());
-                    changed = true;
-                }
-                changed
-            },
-        );
+        // upstream ChangeFieldsConfirmationDialog (short header — the count is
+        // unknown until the job runs)
+        self.dialog = Some(Dialog::Confirm {
+            msg: format!(
+                "You are about to change data in an unknown number of chunks in this world.\n{field_list}\nAre you sure?"
+            ),
+            action: Box::new(move |v, _w, cx| {
+                let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
+                // upstream only clears the tile cache when a changed field
+                // affects rendering (FieldType.requiresClearCache)
+                let inv = if mc_core::changer::requires_clear_cache(&fields) {
+                    all_mca_regions(&dirs)
+                } else {
+                    Vec::new()
+                };
+                let tx = tx.clone();
+                mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+                    mc_core::jobs::PRIORITY_LOW, None,
+                    move || {
+                        let __p = mc_core::jobs::Progress::new("Changing NBT data", -1);
+                        match mc_core::filter_ops::run_change_fields(&fields, force, &dirs, sel_opt.as_ref()) {
+                            Ok(r) => job_info(format!(
+                                "changed data in {} chunks ({} files written, {} errors)",
+                                r.chunks_matched, r.files_written, r.errors
+                            )),
+                            Err(e) => job_info(format!("change fields failed: {e}")),
+                        }
+                        for region in inv {
+                            let _ = tx.send(crate::tilemap::TileResult::Image {
+                                region, image: None, zoom: 0, structures: None, cache_write: false,
+                            });
+                        }
+                        let _ = __p;
+                    }));
+                v.dialog = None;
+                cx.notify();
+            }),
+        });
         cx.notify();
     }
 
@@ -2646,54 +3355,116 @@ impl MainView {
             cx.notify();
             return;
         };
-        let mut expanded = std::collections::HashSet::new();
-        for k in data.keys() {
-            expanded.insert(k.clone());
-        }
+        // upstream NBTEditorDialog: region/poi/entities tabs, each backed by
+        // its own mca file of the same r.x.z name.
+        let mk_tab = |dir: Option<PathBuf>, root: Option<mc_core::nbt::Compound>| -> NbtTab {
+            match root {
+                Some(d) => {
+                    let mut expanded = std::collections::HashSet::new();
+                    for k in d.keys() {
+                        expanded.insert(k.clone());
+                    }
+                    NbtTab { root: Some(d), expanded, sel: 0, dirty: false, note: None }
+                }
+                None => match dir {
+                    None => NbtTab::missing("no region file"),
+                    Some(d) => {
+                        let p = d.join(mc_core::files::mca_file_name(region));
+                        let data = if p.exists() {
+                            mc_core::mca::McaFile::new(p.clone())
+                                .ok()
+                                .and_then(|m| m.load_single_chunk(chunk_abs, false).ok().flatten())
+                                .and_then(|c| c.data)
+                        } else {
+                            None
+                        };
+                        match data {
+                            Some(d) => {
+                                let mut expanded = std::collections::HashSet::new();
+                                for k in d.keys() {
+                                    expanded.insert(k.clone());
+                                }
+                                NbtTab { root: Some(d), expanded, sel: 0, dirty: false, note: None }
+                            }
+                            None if p.exists() => NbtTab::missing("no chunk data found"),
+                            _ => NbtTab::missing("region file does not exist"),
+                        }
+                    }
+                },
+            }
+        };
+        let wdirs = config::world().map(|w| w.dirs.clone()).unwrap_or_default();
+        let tabs = [
+            mk_tab(wdirs.region.clone(), Some(data)),
+            mk_tab(wdirs.poi.clone(), None),
+            mk_tab(wdirs.entities.clone(), None),
+        ];
         self.dialog = Some(Dialog::NbtEditor {
             region: region_l,
             chunk_abs,
             index,
-            root: data,
-            expanded,
-            sel: 0,
+            tab: 0,
+            tabs,
             editing: NbtEdit::None,
             buf: String::new(),
-            status: "↑↓ navigate  ←→ collapse/expand  enter edit  a add  r rename  del delete  ctrl-s save  esc close".into(),
-            dirty: false,
+            status: "1/2/3 tab  ↑↓ navigate  ←→ collapse/expand  enter edit  a add  r rename  del delete  ctrl-s save  esc close".into(),
         });
         cx.notify();
     }
 
-    /// save the edited chunk NBT back to disk through the process pool.
+    /// save every dirty tab back to its mca file through the process pool.
     fn nbt_editor_save(&mut self, cx: &mut Context<Self>) {
-        let Some(Dialog::NbtEditor { region, chunk_abs, index, root, expanded, sel, status, dirty, .. }) = self.dialog.take() else {
+        let Some(Dialog::NbtEditor { region, chunk_abs, index, tab, mut tabs, status, .. }) = self.dialog.take() else {
             return;
         };
+        // region/poi/entities dirs in tab order
+        let mut writes: Vec<(usize, mc_core::nbt::Compound)> = Vec::new();
+        for (i, t) in tabs.iter_mut().enumerate() {
+            if t.dirty {
+                if let Some(r) = t.root.take() {
+                    writes.push((i, r.clone()));
+                    t.root = Some(r);
+                }
+                t.dirty = false;
+            }
+        }
+        let saving = !writes.is_empty();
         self.dialog = Some(Dialog::NbtEditor {
             region,
             chunk_abs,
             index,
-            root: root.clone(),
-            expanded,
-            sel,
+            tab,
+            tabs,
             editing: NbtEdit::None,
             buf: String::new(),
-            status: if dirty { "saving...".into() } else { status },
-            dirty: false,
+            status: if saving { "saving...".into() } else { status },
         });
+        if writes.is_empty() {
+            cx.notify();
+            return;
+        }
         let tx = self.map.result_tx.clone();
         mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
             mc_core::jobs::PRIORITY_LOW, None,
             move || {
                 let rp = Point2i::from_long(region);
-                let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { return };
-                let path = dir.join(mc_core::files::mca_file_name(rp));
-                let Ok(mut m) = mc_core::mca::McaFile::new(path.clone()) else { return };
-                if m.load(false).is_err() { return; }
-                if let Some(c) = m.chunks[index].as_mut() {
-                    c.data = Some(root);
-                    let _ = m.save_with_temp_file(&path);
+                let __p = mc_core::jobs::Progress::new("Saving chunk", writes.len() as i64);
+                for (kind, root) in writes {
+                    let __g = __p.inc_guard();
+                    let dir = match kind {
+                        0 => crate::config::world().and_then(|w| w.dirs.region.clone()),
+                        1 => crate::config::world().and_then(|w| w.dirs.poi.clone()),
+                        _ => crate::config::world().and_then(|w| w.dirs.entities.clone()),
+                    };
+                    let Some(dir) = dir else { continue };
+                    let path = dir.join(mc_core::files::mca_file_name(rp));
+                    __p.set_current(path.display().to_string());
+                    let Ok(mut m) = mc_core::mca::McaFile::new(path.clone()) else { continue };
+                    if m.load(false).is_err() { continue; }
+                    if let Some(c) = m.chunks[index].as_mut() {
+                        c.data = Some(root);
+                        let _ = m.save_with_temp_file(&path);
+                    }
                 }
                 let _ = tx.send(crate::tilemap::TileResult::Image {
                     region: rp, image: None, zoom: 0, structures: None, cache_write: false,
@@ -2702,80 +3473,79 @@ impl MainView {
         cx.notify();
     }
 
+    /// upstream OverlayEditorDialog — the port is modal: rows are applied and
+    /// persisted on OK instead of live-editing the TileMap.
     fn edit_overlays(&mut self, cx: &mut Context<Self>) {
-        // serialize current overlays as editable lines: "Type min max [data]"
-        let cur: Vec<String> = self
+        let rows: Vec<OverlayRow> = self
             .map
             .overlays
             .iter()
             .flatten()
-            .map(|o| {
-                let mut l = format!(
-                    "{} {} {}",
-                    o.typ.display_name(),
-                    o.min.map(|v| v.to_string()).unwrap_or_default(),
-                    o.max.map(|v| v.to_string()).unwrap_or_default(),
-                );
-                if !o.raw_multi.is_empty() {
-                    l.push(' ');
-                    l.push_str(&o.raw_multi);
-                }
-                l
+            .map(|o| OverlayRow {
+                active: o.active,
+                typ: o.typ,
+                min: o.raw_min.clone(),
+                max: o.raw_max.clone(),
+                data: o.raw_multi.clone(),
+                min_hue: fmt_hue(o.min_hue),
+                max_hue: fmt_hue(o.max_hue),
             })
             .collect();
-        self.dialog = Some(Dialog::TextInput {
-            title: "Edit overlays".into(),
-            hint: "one per line, '|' separated: Type min max [data]  e.g. InhabitedTime 0 1000 | Blocks 0 500 minecraft:stone | Custom 0 10 region/sections.size".into(),
-            text: cur.join(" | "),
-            on_done: Box::new(|v, w, cx, text| {
-                v.apply_overlays(text, w, cx);
-            }),
-        });
+        self.dialog = Some(Dialog::OverlayEditor { rows, focus: None });
         cx.notify();
     }
 
-    fn apply_overlays(&mut self, text: String, _w: &mut Window, cx: &mut Context<Self>) {
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            self.map.set_overlays(Vec::new());
-            cx.notify();
-            return;
-        }
-        let mut list = Vec::new();
-        for line in text.split(['|', '\n']) {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            match mc_core::overlay::parse_overlay_line(line) {
-                Ok(o) => list.push(o),
-                Err(e) => {
-                    self.dialog = Some(Dialog::Error { msg: format!("{e} (in '{line}')") });
-                    cx.notify();
-                    return;
-                }
-            }
-        }
+    fn apply_overlay_editor(&mut self, rows: Vec<OverlayRow>, cx: &mut Context<Self>) {
+        let list: Vec<mc_core::overlay::Overlay> = rows.iter().map(overlay_from_row).collect();
+        // upstream persists the overlay list in OverlayConfig
+        let mut g = config::global();
+        g.overlays = list.iter().map(mc_core::overlay::serialize_overlay_line).collect();
+        config::set_global(g);
         self.map.set_overlays(list);
         // select the first valid overlay like upstream's initial selection flow:
         // cycling with N activates it
         self.map.set_overlay(None);
+        self.request_update();
         cx.notify();
     }
 
+    /// upstream FilterChunksDialog — query field prefilled with the last
+    /// query, options mirrored from the dialog's statics.
     fn filter_chunks(&mut self, cx: &mut Context<Self>) {
-        self.dialog = Some(Dialog::TextInput {
-            title: "Filter chunks".into(),
-            hint: "query e.g.: xPos >= 0 AND Palette contains \"minecraft:stone\"  |  fields: xPos zPos yPos DataVersion InhabitedTime LastUpdate Timestamp Status Palette Biome Compression Entities #Entities #ProtoEntities #TileEntities Structures Circle Border Selection PlayerLocation PlayerSpawn LightPopulated <nbt.path>".into(),
-            text: String::new(),
-            on_done: Box::new(|v, w, cx, text| {
-                v.apply_filter(text, w, cx);
-            }),
+        self.dialog = Some(Dialog::Filter {
+            query: config::global().filter_query,
+            action: FilterAction::Select,
+            apply: mc_core::filter_ops::ApplyType::Overwrite,
+            radius: String::new(),
+            sel_only: !self.map.selection.is_empty(),
+            focus_radius: false,
         });
         cx.notify();
     }
 
-    fn apply_filter(&mut self, query: String, _w: &mut Window, cx: &mut Context<Self>) {
+    /// OK on the filter dialog: select runs SelectFilterJob directly;
+    /// delete/export go through the upstream confirmation + dir pick first.
+    fn run_filter_dialog(
+        &mut self,
+        query: String,
+        action: FilterAction,
+        apply: mc_core::filter_ops::ApplyType,
+        radius: String,
+        sel_only: bool,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let radius = radius.trim().parse::<i32>().unwrap_or(0).max(0);
+        // upstream persists the last query per session; we write it to config
+        let mut g = config::global();
+        g.filter_query = query.clone();
+        config::set_global(g);
+        if query.trim().is_empty() {
+            // upstream: "filter is empty, won't delete everything"
+            self.dialog = Some(Dialog::Error { msg: "empty filter query".into() });
+            cx.notify();
+            return;
+        }
         let expr = match mc_core::filter::parse(&query) {
             Ok(e) => e,
             Err(e) => {
@@ -2784,85 +3554,119 @@ impl MainView {
                 return;
             }
         };
-        let tx = self.map.result_tx.clone();
         let sel = self.map.selection.clone();
-        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
-            mc_core::jobs::PRIORITY_LOW, None,
-            move || {
-                // evaluate over all regions of the current world (filtered to
-                // current selection if non-empty)
-                let mut result = mc_core::selection::Selection::new();
-                let regions: Vec<i64> = if sel.is_empty() {
-                    crate::config::world()
-                        .map(|w| files::scan_region_files(w.region_dir()).into_iter().collect())
-                        .unwrap_or_default()
-                } else {
-                    sel.selection.keys().copied().collect()
+        let sel_bound = if sel_only && !sel.is_empty() { Some(sel.clone()) } else { None };
+        let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
+        match action {
+            FilterAction::Select => {
+                let mut target = match apply {
+                    // upstream clears the selection first for OVERWRITE
+                    mc_core::filter_ops::ApplyType::Overwrite => mc_core::selection::Selection::new(),
+                    _ => sel.clone(),
                 };
-                let __p = mc_core::jobs::Progress::new("Filtering chunks", regions.len() as i64);
-                let dirs = crate::config::world().map(|w| w.dirs.clone());
-                let mut ctx = mc_core::filter::FilterCtx::new(
-                    dirs.as_ref().and_then(|d| d.region.clone()),
-                    dirs.as_ref().and_then(|d| d.entities.clone()),
-                );
-                for rl in regions {
-                    let __g = __p.inc_guard();
-                    let region = mc_core::point::Point2i::from_long(rl);
-                    __p.set_current(mc_core::files::mca_file_name(region));
-                    if __p.is_cancelled() { break; }
-                    // RegionMatcher: classify the whole region without loading
-                    match expr.matches_region(region, &mut ctx) {
-                        mc_core::filter::MatchType::None => continue,
-                        mc_core::filter::MatchType::Full => {
-                            // every chunk matches; apply the within-selection mask
-                            match sel.selection.get(&rl) {
-                                Some(Some(cs)) => {
-                                    let mut set = result.selection.entry(rl).or_insert_with(|| {
-                                        let mut e = mc_core::selection::ChunkSet::new();
-                                        e.clear_all();
-                                        Some(e)
+                // upstream's "apply to selection only" bounds the scan for
+                // every apply type; OVERWRITE only changes the target.
+                let bound = sel_bound;
+                mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+                    mc_core::jobs::PRIORITY_LOW, None,
+                    move || {
+                        let __p = mc_core::jobs::Progress::new("Filtering chunks", -1);
+                        let _ = __p;
+                        match mc_core::filter_ops::run_filter_select(
+                            &expr, &dirs, bound.as_ref(), apply, radius, &mut target,
+                        ) {
+                            Ok(r) => job_info(format!("{} chunks matched the filter", r.chunks_matched)),
+                            Err(e) => job_info(format!("filter failed: {e}")),
+                        }
+                        *crate::tilemap::FILTER_RESULT.lock().unwrap() = Some(target);
+                    }));
+            }
+            FilterAction::Delete => {
+                // upstream DeleteConfirmationDialog with a null tile map
+                self.dialog = Some(Dialog::Confirm {
+                    msg: "You are about to delete an unknown number of chunks from this world.\nAre you sure?".into(),
+                    action: Box::new(move |v, _w, cx| {
+                        let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
+                        let inv = all_mca_regions(&dirs);
+                        let tx = v.map.result_tx.clone();
+                        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+                            mc_core::jobs::PRIORITY_LOW, None,
+                            move || {
+                                let __p = mc_core::jobs::Progress::new("Deleting filtered chunks", -1);
+                                let _ = __p;
+                                match mc_core::filter_ops::run_filter_delete(&expr, &dirs, sel_bound.as_ref()) {
+                                    Ok(r) => job_info(format!(
+                                        "deleted {} chunks ({} files written)",
+                                        r.chunks_matched, r.files_written
+                                    )),
+                                    Err(e) => job_info(format!("delete failed: {e}")),
+                                }
+                                for region in inv {
+                                    let _ = tx.send(crate::tilemap::TileResult::Image {
+                                        region, image: None, zoom: 0, structures: None, cache_write: false,
                                     });
-                                    if let Some(set) = &mut set { set.or(cs); }
                                 }
-                                Some(None) => {
-                                    result.selection.insert(rl, None);
-                                }
-                                None => {
-                                    if sel.is_empty() {
-                                        result.selection.insert(rl, None);
-                                    }
-                                }
-                            }
-                            continue;
+                            }));
+                        // upstream clears the selection after a filtered delete
+                        if sel_only {
+                            v.map.clear_selection();
                         }
-                        mc_core::filter::MatchType::Partial => {}
-                    }
-                    let Some(dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { continue };
-                    let p = dir.join(mc_core::files::mca_file_name(region));
-                    if !p.exists() { continue; }
-                    let Ok(mut m) = mc_core::mca::McaFile::new(p) else { continue };
-                    if m.load(false).is_err() { continue; }
-                    ctx.insert_chunk_set(rl, m.offsets_chunk_set());
-                    for i in 0..1024 {
-                        let chunk = region.region_to_chunk().add_p(mc_core::point::Point2i::from_chunk_index(i as i32));
-                        let within = sel.is_empty() || sel.is_chunk_selected(chunk);
-                        if !within { continue; }
-                        let Some(c) = &m.chunks[i] else { continue };
-                        let Some(d) = &c.data else { continue };
-                        let dv = mc_core::nbt::data_version(Some(d));
-                        if expr.matches(c, dv, &mut ctx) {
-                            let chunk = region.region_to_chunk().add_p(mc_core::point::Point2i::from_chunk_index(i as i32));
-                            result.add_chunk(chunk);
+                        v.dialog = None;
+                        cx.notify();
+                    }),
+                });
+            }
+            FilterAction::Export => {
+                let rx = cx.prompt_for_paths(PathPromptOptions {
+                    files: false, directories: true, multiple: false,
+                    prompt: Some("Select world directory to export to".into()),
+                });
+                cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+                    if let Ok(Ok(Some(paths))) = rx.await {
+                        if let Some(dir) = paths.into_iter().next() {
+                            let _ = this.update(&mut *cx, |v, cx| {
+                                // upstream ExportConfirmationDialog (null tile map)
+                                v.dialog = Some(Dialog::Confirm {
+                                    msg: format!(
+                                        "You are about to export an unknown number of chunks from this world.\nto {}\nAre you sure?",
+                                        dir.display()
+                                    ),
+                                    action: Box::new(move |v, _w, cx| {
+                                        // upstream FileHelper.createWorldDirectories
+                                        let dest = mc_core::mca::WorldDirectories {
+                                            region: Some(dir.join("region")),
+                                            poi: Some(dir.join("poi")),
+                                            entities: Some(dir.join("entities")),
+                                        };
+                                        for d in [&dest.region, &dest.poi, &dest.entities].into_iter().flatten() {
+                                            let _ = std::fs::create_dir_all(d);
+                                        }
+                                        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+                                            mc_core::jobs::PRIORITY_LOW, None,
+                                            move || {
+                                                let __p = mc_core::jobs::Progress::new("Exporting filtered chunks", -1);
+                                                let _ = __p;
+                                                match mc_core::filter_ops::run_filter_export(
+                                                    &expr, &dirs, sel_bound.as_ref(), &dest,
+                                                ) {
+                                                    Ok(r) => job_info(format!(
+                                                        "exported {} chunks ({} files written)",
+                                                        r.chunks_matched, r.files_written
+                                                    )),
+                                                    Err(e) => job_info(format!("export failed: {e}")),
+                                                }
+                                            }));
+                                        v.dialog = None;
+                                        cx.notify();
+                                    }),
+                                });
+                                cx.notify();
+                            });
                         }
                     }
-                    let _ = tx.send(crate::tilemap::TileResult::Image {
-                        region, image: None, zoom: 0, structures: None, cache_write: false,
-                    });
-                }
-                // send the resulting selection back through a tile result? use a
-                // dedicated mechanism: store into a shared slot
-                *crate::tilemap::FILTER_RESULT.lock().unwrap() = Some(result);
-            }));
+                }).detach();
+            }
+        }
         cx.notify();
     }
 
@@ -2890,28 +3694,56 @@ impl MainView {
                 .child(inner)
         };
         let body: Div = match d {
-            Dialog::Goto { x, z, focus_x } => {
+            Dialog::Goto { x, z, focus_x, invalid } => {
                 let fx = *focus_x;
                 let x_c = x.clone();
                 let z_c = z.clone();
+                let inv = *invalid;
                 panel(
                     v_flex().gap_2()
                         .child(text_el("Goto", 16.))
                         .child(
                             h_flex().gap_2()
-                                .child(input_box("x", &x_c, fx))
-                                .child(input_box("z", &z_c, !fx)),
+                                .child(
+                                    input_box("x", &x_c, fx)
+                                        .on_click(cx.listener(|v, _, _w, cx| {
+                                            if let Some(Dialog::Goto { focus_x, .. }) = &mut v.dialog {
+                                                *focus_x = true;
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    input_box("z", &z_c, !fx)
+                                        .on_click(cx.listener(|v, _, _w, cx| {
+                                            if let Some(Dialog::Goto { focus_x, .. }) = &mut v.dialog {
+                                                *focus_x = false;
+                                            }
+                                            cx.notify();
+                                        })),
+                                ),
                         )
+                        .child(if inv {
+                            warn_el("invalid coordinates", 11.)
+                        } else {
+                            text_el(" ", 11.)
+                        })
                         .child(
                             h_flex().gap_2()
                                 .child(button("Go to", cx, |v, _w, cx| {
-                                    if let Some(Dialog::Goto { x, z, .. }) = &v.dialog {
+                                    let mut ok = false;
+                                    if let Some(Dialog::Goto { x, z, invalid, .. }) = &mut v.dialog {
                                         if let (Ok(xi), Ok(zi)) = (x.parse::<i32>(), z.parse::<i32>()) {
                                             v.map.go_to(xi, zi);
                                             v.request_update();
+                                            ok = true;
+                                        } else {
+                                            *invalid = true;
                                         }
                                     }
-                                    v.dialog = None;
+                                    if ok {
+                                        v.dialog = None;
+                                    }
                                     cx.notify();
                                 }))
                                 .child(button("Cancel", cx, |v, _w, cx| {
@@ -2923,10 +3755,12 @@ impl MainView {
             }
             Dialog::About => panel(
                 v_flex().gap_2()
-                    .child(text_el("MCA Selector", 16.))
-                    .child(text_el(concat!("v", env!("CARGO_PKG_VERSION"), " — a faithful Rust + GPUI port of MCA Selector."), 12.))
-                    .child(text_el("https://github.com/Querz/mcaselector", 12.))
-                    .child(text_el("Copyright (c) 2016-2026 Querz — GPLv3", 12.))
+                    .child(text_el("About MCA Selector", 16.))
+                    .child(text_el(concat!("Version: ", env!("CARGO_PKG_VERSION"), " (Rust + GPUI port)"), 12.))
+                    .child(text_el("License: MIT", 12.))
+                    .child(text_el("Copyright: © Querz", 12.))
+                    .child(text_el("Source: https://github.com/Querz/mcaselector", 12.))
+                    .child(text_el("NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.", 10.))
                     .child(button("Close", cx, |v, _w, cx| {
                         v.dialog = None;
                         cx.notify();
@@ -2936,10 +3770,18 @@ impl MainView {
                 v_flex().gap_2()
                     .child(text_el("Error", 16.))
                     .child(text_el(msg.clone(), 12.))
-                    .child(button("OK", cx, |v, _w, cx| {
-                        v.dialog = None;
-                        cx.notify();
-                    })),
+                    .child(
+                        h_flex().gap_2()
+                            .child(button("OK", cx, |v, _w, cx| {
+                                v.dialog = None;
+                                cx.notify();
+                            }))
+                            .child(button("Copy", cx, |v, _w, cx| {
+                                if let Some(Dialog::Error { msg }) = &v.dialog {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(msg.clone()));
+                                }
+                            })),
+                    ),
             ),
             Dialog::PasteConfirm { ox, oz, overwrite, sel_only, .. } => panel(
                 v_flex().gap_2()
@@ -3102,12 +3944,36 @@ impl MainView {
                 })))
             }
             Dialog::NbtEditor {
-                root, expanded, sel, editing, buf, status, chunk_abs, dirty, ..
+                tab, tabs, editing, buf, status, chunk_abs, ..
             } => {
-                let rows = nbt_editor::flatten(root, expanded);
+                const KINDS: [&str; 3] = ["region", "poi", "entities"];
+                let cur_tab = *tab;
+                let t = &tabs[cur_tab];
+                let mut tab_row = h_flex().gap_1();
+                for (i, name) in KINDS.iter().enumerate() {
+                    let dirty = tabs[i].dirty;
+                    tab_row = tab_row.child(radio_btn(
+                        SharedString::from(format!("nbt-tab-{name}")),
+                        SharedString::from(format!("{name}{}", if dirty { " *" } else { "" })),
+                        i == cur_tab,
+                        cx,
+                        move |v, _w, cx| {
+                            if let Some(Dialog::NbtEditor { tab, editing, buf, .. }) = &mut v.dialog {
+                                *tab = i;
+                                *editing = NbtEdit::None;
+                                buf.clear();
+                            }
+                            cx.notify();
+                        },
+                    ));
+                }
+                let t_sel = t.sel;
+                let rows = t.root.as_ref()
+                    .map(|r| nbt_editor::flatten(r, &t.expanded))
+                    .unwrap_or_default();
                 let n = rows.len();
                 let vis = 22usize;
-                let start = if *sel >= vis { sel + 1 - vis } else { 0 };
+                let start = if t_sel >= vis { t_sel + 1 - vis } else { 0 };
                 let end = (start + vis).min(n);
                 let mut list = v_flex()
                     .h(px(vis as f32 * 20.))
@@ -3115,7 +3981,7 @@ impl MainView {
                     .gap(px(1.));
                 for (i, r) in rows[start..end].iter().enumerate() {
                     let idx = start + i;
-                    let selected = idx == *sel;
+                    let selected = idx == t_sel;
                     let indent = r.depth as f32 * 14.0;
                     let mut row = div()
                         .id(("row", idx))
@@ -3127,8 +3993,8 @@ impl MainView {
                         .bg(if selected { rgb(0x3a5a8a) } else { rgba(0x00000000) })
                         .on_mouse_down(MouseButton::Left, cx.listener(move |v, _e: &MouseDownEvent, _w, cx| {
                             cx.stop_propagation();
-                            if let Some(Dialog::NbtEditor { sel, .. }) = &mut v.dialog {
-                                *sel = idx;
+                            if let Some(Dialog::NbtEditor { tab, tabs, .. }) = &mut v.dialog {
+                                tabs[*tab].sel = idx;
                             }
                             cx.notify();
                         }));
@@ -3182,10 +4048,22 @@ impl MainView {
                     .gap_2()
                     .text_color(rgb(0xdddddd))
                     .child(text_el(
-                        format!("NBT editor — chunk {}, {} {}", chunk_abs.x, chunk_abs.z, if *dirty { "(modified)" } else { "" }),
+                        format!("NBT editor — chunk {}, {} {}", chunk_abs.x, chunk_abs.z, if t.dirty { "(modified)" } else { "" }),
                         15.,
                     ))
-                    .child(list)
+                    .child(tab_row)
+                    .child(if t.root.is_some() {
+                        list.into_any_element()
+                    } else {
+                        // upstream placeholder when the file/chunk is missing
+                        v_flex()
+                            .h(px(22. * 20.))
+                            .child(text_el(
+                                t.note.clone().unwrap_or_else(|| "no chunk data found".into()),
+                                12.,
+                            ))
+                            .into_any_element()
+                    })
                     .child(edit_line)
                     .child(text_el(status.clone(), 10.))
                     .child(
@@ -3198,7 +4076,20 @@ impl MainView {
                     )
             }
             Dialog::Info { msg } => panel(
-                v_flex().child(text_el(msg.clone(), 14.)),
+                v_flex().gap_2()
+                    .child(text_el(msg.clone(), 14.))
+                    .child(
+                        h_flex().gap_2()
+                            .child(button("OK", cx, |v, _w, cx| {
+                                v.dialog = None;
+                                cx.notify();
+                            }))
+                            .child(button("Copy", cx, |v, _w, cx| {
+                                if let Some(Dialog::Info { msg }) = &v.dialog {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(msg.clone()));
+                                }
+                            })),
+                    ),
             ),
             Dialog::JobProgress => {
                 let pr = mc_core::jobs::current_progress();
@@ -3245,6 +4136,325 @@ impl MainView {
                             })),
                     ),
             ),
+            Dialog::Filter { query, action, apply, radius, sel_only, focus_radius } => {
+                use mc_core::filter_ops::ApplyType;
+                let q = query.clone();
+                let fr = *focus_radius;
+                let act = *action;
+                let ap = *apply;
+                let so = *sel_only;
+                // live-validate the query like upstream's OK-disable
+                let parse_err = if q.trim().is_empty() {
+                    Some("empty query".to_string())
+                } else {
+                    mc_core::filter::parse(&q).err()
+                };
+                let ok_enabled = parse_err.is_none();
+                let opts = if act == FilterAction::Select {
+                    h_flex().gap_1()
+                        .child(radio_btn("fa-overwrite", "Overwrite", ap == ApplyType::Overwrite, cx, |v, _w, cx| {
+                            if let Some(Dialog::Filter { apply, .. }) = &mut v.dialog { *apply = ApplyType::Overwrite; }
+                            cx.notify();
+                        }))
+                        .child(radio_btn("fa-add", "Add to selection", ap == ApplyType::Add, cx, |v, _w, cx| {
+                            if let Some(Dialog::Filter { apply, .. }) = &mut v.dialog { *apply = ApplyType::Add; }
+                            cx.notify();
+                        }))
+                        .child(radio_btn("fa-subtract", "Subtract from selection", ap == ApplyType::Subtract, cx, |v, _w, cx| {
+                            if let Some(Dialog::Filter { apply, .. }) = &mut v.dialog { *apply = ApplyType::Subtract; }
+                            cx.notify();
+                        }))
+                        .child(text_el("  radius", 11.))
+                        .child(
+                            input_box_w("filter-radius", radius, fr, 56.)
+                                .on_click(cx.listener(|v, _, _w, cx| {
+                                    if let Some(Dialog::Filter { focus_radius, .. }) = &mut v.dialog {
+                                        *focus_radius = true;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element()
+                } else {
+                    div().h(px(0.)).into_any_element()
+                };
+                panel(
+                    v_flex().gap_2()
+                        .child(text_el("Filter chunks", 16.))
+                        .child(
+                            input_box_w("filter-query", &q, !fr, 440.)
+                                .on_click(cx.listener(|v, _, _w, cx| {
+                                    if let Some(Dialog::Filter { focus_radius, .. }) = &mut v.dialog {
+                                        *focus_radius = false;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(text_el("fields: xPos zPos yPos DataVersion InhabitedTime LastUpdate Timestamp Status Palette Biome Compression Entities #Entities #ProtoEntities #TileEntities Structures Circle Border Selection PlayerLocation PlayerSpawn LightPopulated <nbt.path>", 9.))
+                        .child(
+                            h_flex().gap_1()
+                                .child(radio_btn("ft-select", "Select chunks", act == FilterAction::Select, cx, |v, _w, cx| {
+                                    if let Some(Dialog::Filter { action, .. }) = &mut v.dialog { *action = FilterAction::Select; }
+                                    cx.notify();
+                                }))
+                                .child(radio_btn("ft-export", "Export chunks", act == FilterAction::Export, cx, |v, _w, cx| {
+                                    if let Some(Dialog::Filter { action, .. }) = &mut v.dialog { *action = FilterAction::Export; }
+                                    cx.notify();
+                                }))
+                                .child(radio_btn("ft-delete", "Delete chunks", act == FilterAction::Delete, cx, |v, _w, cx| {
+                                    if let Some(Dialog::Filter { action, .. }) = &mut v.dialog { *action = FilterAction::Delete; }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(opts)
+                        .child(opt_toggle("filter-sel-only", "Apply to selection only", so, cx, |v, _w, cx| {
+                            if let Some(Dialog::Filter { sel_only, .. }) = &mut v.dialog { *sel_only = !*sel_only; }
+                            cx.notify();
+                        }))
+                        .child(match parse_err {
+                            Some(e) => warn_el(e, 10.),
+                            None => text_el(" ", 10.),
+                        })
+                        .child(
+                            h_flex().gap_2()
+                                .child(button("OK", cx, move |v, w, cx| {
+                                    // upstream disables OK on an invalid filter
+                                    if ok_enabled {
+                                        if let Some(Dialog::Filter { query, action, apply, radius, sel_only, .. }) = v.dialog.take() {
+                                            v.run_filter_dialog(query, action, apply, radius, sel_only, w, cx);
+                                        }
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(button("Cancel", cx, |v, _w, cx| {
+                                    v.dialog = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            }
+            Dialog::ChangeFields { text, force, sel_only } => {
+                let parse = mc_core::changer::parse_fields(text);
+                let status = match &parse {
+                    Ok(f) => format!("{} field(s) parsed", f.len()),
+                    Err(e) => e.clone(),
+                };
+                let ok_enabled = matches!(&parse, Ok(f) if !f.is_empty());
+                let names = mc_core::changer::FieldType::VALUES
+                    .iter()
+                    .map(|t| if t.requires_clear_cache() { format!("{}*", t.name()) } else { t.name().to_string() })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                panel(
+                    v_flex().gap_2()
+                        .child(text_el("Change NBT", 16.))
+                        .child(text_el("Type = value, comma separated  e.g. Status = minecraft:full, InhabitedTime = 0", 10.))
+                        .child(input_box_w("cf-text", text, true, 440.))
+                        .child(text_el(format!("fields: {names}"), 9.))
+                        .child(text_el("(* clears render cache)", 9.))
+                        .child(
+                            h_flex().gap_1()
+                                .child(radio_btn("cf-change", "Change", !*force, cx, |v, _w, cx| {
+                                    if let Some(Dialog::ChangeFields { force, .. }) = &mut v.dialog { *force = false; }
+                                    cx.notify();
+                                }))
+                                .child(radio_btn("cf-force", "Force", *force, cx, |v, _w, cx| {
+                                    if let Some(Dialog::ChangeFields { force, .. }) = &mut v.dialog { *force = true; }
+                                    cx.notify();
+                                }))
+                                .child(text_el("  force creates the tag if missing", 10.)),
+                        )
+                        .child(opt_toggle("cf-sel-only", "Apply to selection only", *sel_only, cx, |v, _w, cx| {
+                            if let Some(Dialog::ChangeFields { sel_only, .. }) = &mut v.dialog { *sel_only = !*sel_only; }
+                            cx.notify();
+                        }))
+                        .child(if parse.is_err() { warn_el(status, 10.) } else { text_el(status, 10.) })
+                        .child(
+                            h_flex().gap_2()
+                                .child(button("OK", cx, move |v, _w, cx| {
+                                    // upstream disables OK on invalid input
+                                    if ok_enabled {
+                                        if let Some(Dialog::ChangeFields { text, force, sel_only, .. }) = v.dialog.take() {
+                                            v.run_change_fields_dialog(text, force, sel_only, cx);
+                                        }
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(button("Cancel", cx, |v, _w, cx| {
+                                    v.dialog = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            }
+            Dialog::Import { dir, ox, oz, overwrite, sel_only, focus_x, invalid } => {
+                let fx = *focus_x;
+                let ox_c = ox.clone();
+                let oz_c = oz.clone();
+                panel(
+                    v_flex().gap_2()
+                        .child(text_el("Import chunks", 16.))
+                        .child(text_el("You are about to import an unknown number of chunks to this world.", 12.))
+                        .child(text_el(format!("from {}", dir.display()), 10.))
+                        .child(
+                            h_flex().gap_2()
+                                .child(text_el("offset x", 11.))
+                                .child(
+                                    input_box("import-ox", &ox_c, fx)
+                                        .on_click(cx.listener(|v, _, _w, cx| {
+                                            if let Some(Dialog::Import { focus_x, .. }) = &mut v.dialog { *focus_x = true; }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(text_el("z", 11.))
+                                .child(
+                                    input_box("import-oz", &oz_c, !fx)
+                                        .on_click(cx.listener(|v, _, _w, cx| {
+                                            if let Some(Dialog::Import { focus_x, .. }) = &mut v.dialog { *focus_x = false; }
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(opt_toggle("import-overwrite", "[o] overwrite existing chunks", *overwrite, cx, |v, _w, cx| {
+                            if let Some(Dialog::Import { overwrite, .. }) = &mut v.dialog { *overwrite = !*overwrite; }
+                            cx.notify();
+                        }))
+                        .child(opt_toggle("import-sel-only", "[s] apply to selection only", *sel_only, cx, |v, _w, cx| {
+                            if let Some(Dialog::Import { sel_only, .. }) = &mut v.dialog { *sel_only = !*sel_only; }
+                            cx.notify();
+                        }))
+                        .child(if *invalid {
+                            warn_el("invalid offset", 11.)
+                        } else {
+                            text_el("Are you sure?", 11.)
+                        })
+                        .child(
+                            h_flex().gap_2()
+                                .child(button("Import", cx, |v, _w, cx| {
+                                    let mut done = false;
+                                    if let Some(Dialog::Import { ox, oz, invalid, .. }) = &mut v.dialog {
+                                        if ox.trim().parse::<i32>().is_ok() && oz.trim().parse::<i32>().is_ok() {
+                                            done = true;
+                                        } else {
+                                            *invalid = true;
+                                        }
+                                    }
+                                    if done {
+                                        if let Some(Dialog::Import { dir, ox, oz, overwrite, sel_only, .. }) = v.dialog.take() {
+                                            v.do_import(dir, ox.trim().parse().unwrap_or(0), oz.trim().parse().unwrap_or(0), overwrite, sel_only, cx);
+                                        }
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(button("Cancel", cx, |v, _w, cx| {
+                                    v.dialog = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            }
+            Dialog::OverlayEditor { rows, focus } => {
+                let mut list = v_flex().gap_1();
+                for (i, r) in rows.iter().enumerate() {
+                    let focused = |f: OverlayField| *focus == Some((i, f));
+                    let active = r.active;
+                    let typ = r.typ;
+                    let rm = r.min.clone();
+                    let rx = r.max.clone();
+                    let rd = r.data.clone();
+                    let rminh = r.min_hue.clone();
+                    let rmaxh = r.max_hue.clone();
+                    list = list.child(
+                        h_flex().gap_1()
+                            .child(opt_toggle(
+                                SharedString::from(format!("ov-active-{i}")),
+                                "on", active, cx,
+                                move |v, _w, cx| {
+                                    if let Some(Dialog::OverlayEditor { rows, .. }) = &mut v.dialog {
+                                        if let Some(r) = rows.get_mut(i) { r.active = !r.active; }
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                            .child(radio_btn(
+                                SharedString::from(format!("ov-type-{i}")),
+                                SharedString::from(format!("{:<17}", typ.display_name())),
+                                false, cx,
+                                move |v, _w, cx| {
+                                    // upstream combo box; click cycles the type list
+                                    if let Some(Dialog::OverlayEditor { rows, .. }) = &mut v.dialog {
+                                        if let Some(r) = rows.get_mut(i) {
+                                            let vals = mc_core::overlay::OverlayType::VALUES;
+                                            let cur = vals.iter().position(|t| *t == r.typ).unwrap_or(0);
+                                            r.typ = vals[(cur + 1) % vals.len()];
+                                        }
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                            .child(ov_text_field(cx, i, OverlayField::Min, &rm, focused(OverlayField::Min), 74., format!("ov-min-{i}")))
+                            .child(ov_text_field(cx, i, OverlayField::Max, &rx, focused(OverlayField::Max), 74., format!("ov-max-{i}")))
+                            .child(ov_text_field(cx, i, OverlayField::Data, &rd, focused(OverlayField::Data), 170., format!("ov-data-{i}")))
+                            .child(ov_text_field(cx, i, OverlayField::MinHue, &rminh, focused(OverlayField::MinHue), 56., format!("ov-minh-{i}")))
+                            .child(ov_text_field(cx, i, OverlayField::MaxHue, &rmaxh, focused(OverlayField::MaxHue), 56., format!("ov-maxh-{i}")))
+                            .child(radio_btn(
+                                SharedString::from(format!("ov-flip-{i}")),
+                                "⇄", false, cx,
+                                move |v, _w, cx| {
+                                    // upstream flip icon swaps the hue range
+                                    if let Some(Dialog::OverlayEditor { rows, .. }) = &mut v.dialog {
+                                        if let Some(r) = rows.get_mut(i) {
+                                            std::mem::swap(&mut r.min_hue, &mut r.max_hue);
+                                        }
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                            .child(radio_btn(
+                                SharedString::from(format!("ov-del-{i}")),
+                                "x", false, cx,
+                                move |v, _w, cx| {
+                                    if let Some(Dialog::OverlayEditor { rows, focus, .. }) = &mut v.dialog {
+                                        if i < rows.len() { rows.remove(i); }
+                                        *focus = None;
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                    );
+                }
+                v_flex()
+                    .w(px(760.))
+                    .bg(rgb(0x2b2b2b))
+                    .border_1()
+                    .border_color(rgb(0x555555))
+                    .rounded_sm()
+                    .p_4()
+                    .gap_2()
+                    .text_color(rgb(0xdddddd))
+                    .child(text_el("Edit overlays", 16.))
+                    .child(text_el("on | type | min | max | data | minHue | maxHue | flip | delete  —  [tab] next field, [a] add row", 9.))
+                    .child(list)
+                    .child(
+                        h_flex().gap_2()
+                            .child(button("Add overlay", cx, |v, _w, cx| {
+                                if let Some(Dialog::OverlayEditor { rows, .. }) = &mut v.dialog {
+                                    rows.push(default_overlay_row());
+                                }
+                                cx.notify();
+                            }))
+                            .child(button("OK", cx, |v, _w, cx| {
+                                if let Some(Dialog::OverlayEditor { rows, .. }) = v.dialog.take() {
+                                    v.apply_overlay_editor(rows, cx);
+                                }
+                                cx.notify();
+                            }))
+                            .child(button("Cancel", cx, |v, _w, cx| {
+                                v.dialog = None;
+                                cx.notify();
+                            })),
+                    )
+            }
         };
         Some(
             overlay
@@ -3252,7 +4462,10 @@ impl MainView {
                     let _ = e;
                     match v.dialog {
                         Some(Dialog::Confirm { .. }) | Some(Dialog::Info { .. }) | Some(Dialog::Goto { .. })
-                            | Some(Dialog::JobProgress) | Some(Dialog::NbtEditor { .. }) | Some(Dialog::TextInput { .. }) => {}
+                            | Some(Dialog::JobProgress) | Some(Dialog::NbtEditor { .. }) | Some(Dialog::TextInput { .. })
+                            | Some(Dialog::Filter { .. }) | Some(Dialog::ChangeFields { .. })
+                            | Some(Dialog::Import { .. }) | Some(Dialog::OverlayEditor { .. })
+                            | Some(Dialog::PasteConfirm { .. }) => {}
                         _ => v.dialog = None,
                     }
                     cx.notify();
@@ -3267,10 +4480,81 @@ fn text_el(s: impl Into<SharedString>, size: f32) -> Div {
     div().text_size(px(size)).child(s.into())
 }
 
-fn input_box(id: &'static str, value: &str, focused: bool) -> Stateful<Div> {
+/// error/hint text rendered in red.
+fn warn_el(s: impl Into<SharedString>, size: f32) -> Div {
+    div().text_size(px(size)).text_color(rgb(0xff5555)).child(s.into())
+}
+
+/// checkbox-style toggle button (same style as toggle_render/toggle_global)
+/// with a free-form click action and dynamic label.
+fn opt_toggle(
+    id: impl Into<ElementId>,
+    label: impl Into<String>,
+    val: bool,
+    cx: &mut Context<MainView>,
+    on: impl Fn(&mut MainView, &mut Window, &mut Context<MainView>) + 'static,
+) -> Stateful<Div> {
+    let label = label.into();
     div()
         .id(id)
-        .w(px(200.))
+        .px_2().py_1()
+        .bg(if val { rgb(0x2a4a2a) } else { rgb(0x3c3f41) })
+        .border_1().border_color(rgb(0x555555))
+        .rounded_sm()
+        .cursor_pointer()
+        .text_size(px(12.))
+        .child(format!("{}: {}", label, if val { "on" } else { "off" }))
+        .on_click(cx.listener(move |v, _, w, cx| (on)(v, w, cx)))
+}
+
+/// radio-button style selector (highlighted when `selected`).
+fn radio_btn(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    cx: &mut Context<MainView>,
+    on: impl Fn(&mut MainView, &mut Window, &mut Context<MainView>) + 'static,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_2().py_1()
+        .bg(if selected { rgb(0x2a4a6a) } else { rgb(0x3c3f41) })
+        .border_1().border_color(rgb(0x555555))
+        .rounded_sm()
+        .cursor_pointer()
+        .text_size(px(12.))
+        .child(label.into())
+        .on_click(cx.listener(move |v, _, w, cx| (on)(v, w, cx)))
+}
+
+/// one text field of the overlay editor — a free fn so each call's `cx`
+/// borrow ends immediately (the closure form kept `*cx` borrowed).
+fn ov_text_field(
+    cx: &mut Context<MainView>,
+    i: usize,
+    f: OverlayField,
+    val: &str,
+    focused: bool,
+    w: f32,
+    fid: String,
+) -> Stateful<Div> {
+    input_box_w(SharedString::from(fid), val, focused, w)
+        .on_click(cx.listener(move |v, _, _w, cx| {
+            if let Some(Dialog::OverlayEditor { focus, .. }) = &mut v.dialog {
+                *focus = Some((i, f));
+            }
+            cx.notify();
+        }))
+}
+
+fn input_box(id: impl Into<ElementId>, value: &str, focused: bool) -> Stateful<Div> {
+    input_box_w(id, value, focused, 200.)
+}
+
+fn input_box_w(id: impl Into<ElementId>, value: &str, focused: bool, width: f32) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(width))
         .h(px(26.))
         .bg(rgb(0x1e1e1e))
         .border_1()
@@ -3308,6 +4592,145 @@ fn button(
 fn v_flex() -> Div { div().flex().flex_col() }
 fn h_flex() -> Div { div().flex() }
 
+/// all region locations present in any of the three world directories
+/// (region/poi/entities) — used to invalidate tiles after jobs that rewrite
+/// files outside a per-region callback.
+fn all_mca_regions(dirs: &mc_core::mca::WorldDirectories) -> Vec<Point2i> {
+    let mut locs = std::collections::BTreeSet::new();
+    for d in [&dirs.region, &dirs.poi, &dirs.entities].into_iter().flatten() {
+        locs.extend(files::scan_region_files(d));
+    }
+    locs.into_iter().map(Point2i::from_long).collect()
+}
+
+fn fmt_hue(h: f32) -> String {
+    let s = format!("{h:.4}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn default_overlay_row() -> OverlayRow {
+    OverlayRow {
+        active: true,
+        typ: mc_core::overlay::OverlayType::InhabitedTime,
+        min: String::new(),
+        max: String::new(),
+        data: String::new(),
+        min_hue: fmt_hue(0.666_666_7),
+        max_hue: fmt_hue(0.0),
+    }
+}
+
+fn overlay_field(row: &mut OverlayRow, f: OverlayField) -> &mut String {
+    match f {
+        OverlayField::Min => &mut row.min,
+        OverlayField::Max => &mut row.max,
+        OverlayField::Data => &mut row.data,
+        OverlayField::MinHue => &mut row.min_hue,
+        OverlayField::MaxHue => &mut row.max_hue,
+    }
+}
+
+/// build an Overlay from an editor row — invalid bounds are kept (upstream
+/// stores invalid overlays too; they just don't draw).
+fn overlay_from_row(r: &OverlayRow) -> mc_core::overlay::Overlay {
+    let mut o = mc_core::overlay::Overlay::new(r.typ);
+    o.set_min_str(r.min.trim());
+    o.set_max_str(r.max.trim());
+    o.set_multi_values_str(r.data.trim());
+    if let Ok(h) = r.min_hue.trim().parse::<f32>() {
+        o.min_hue = h;
+    }
+    if let Ok(h) = r.max_hue.trim().parse::<f32>() {
+        o.max_hue = h;
+    }
+    o.active = r.active;
+    o
+}
+
+/// upstream ImportJob: merge every mca file of `src_dir` into the open
+/// world's region dir, shifting chunk positions by `offset` (chunks).
+/// `src_sel` limits which source chunks are imported (paste imports pass the
+/// copied selection); `target_sel` masks the destination (selection only).
+/// Chunks crossing region borders are split by target region.
+fn import_mca_dir(
+    src_dir: PathBuf,
+    src_sel: Option<mc_core::selection::Selection>,
+    offset: Point2i,
+    overwrite: bool,
+    target_sel: Option<mc_core::selection::Selection>,
+    tx: std::sync::mpsc::Sender<crate::tilemap::TileResult>,
+) {
+    mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+        mc_core::jobs::PRIORITY_LOW, None,
+        move || {
+            let Ok(rd) = std::fs::read_dir(&src_dir) else { return };
+            let files: Vec<_> = rd.flatten().collect();
+            let __p = mc_core::jobs::Progress::new("Importing chunks", files.len() as i64);
+            for e in files {
+                let __g = __p.inc_guard();
+                if __p.is_cancelled() { break; }
+                let name = e.file_name().to_string_lossy().to_string();
+                __p.set_current(name.clone());
+                let Some(src_region) = mc_core::files::parse_mca_file_name(&name) else { continue };
+                let Some(dst_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { return };
+                let Ok(mut src) = mc_core::mca::McaFile::new(e.path()) else { continue };
+                if src.load(false).is_err() { continue; }
+                // chunks to import from this region (Selection::selected_chunks
+                // handles inverted selections; None = no selection -> whole file)
+                let sel_cs = match &src_sel {
+                    None => { let mut f = mc_core::selection::ChunkSet::new(); f.fill(); f }
+                    Some(s) => match s.selected_chunks(src_region) {
+                        Some(Some(cs)) => cs,
+                        Some(None) => { let mut f = mc_core::selection::ChunkSet::new(); f.fill(); f }
+                        None => continue,
+                    },
+                };
+                if sel_cs.is_empty() { continue; }
+                // split by target region (chunks may cross region borders)
+                let mut targets: std::collections::HashMap<mc_core::point::Point2i, Vec<(usize, mc_core::point::Point2i)>> = std::collections::HashMap::new();
+                for i in sel_cs.iter() {
+                    let c = src_region.region_to_chunk().add(i as i32 % 32, i as i32 / 32).add_p(offset);
+                    if let Some(ts) = &target_sel {
+                        if !ts.is_chunk_selected(c) { continue; }
+                    }
+                    targets.entry(c.chunk_to_region()).or_default().push((i, c));
+                }
+                for (tregion, chunks) in targets {
+                    let dst = dst_dir.join(mc_core::files::mca_file_name(tregion));
+                    let mut d = if dst.exists() {
+                        let Ok(mut m) = mc_core::mca::McaFile::new(dst.clone()) else { continue };
+                        if m.load(false).is_err() { continue; }
+                        m
+                    } else {
+                        mc_core::mca::McaFile::empty(tregion, dst.clone())
+                    };
+                    let trel = tregion.region_to_chunk();
+                    let mut changed = false;
+                    for (i, c) in chunks {
+                        if let Some(chunk) = &src.chunks[i] {
+                            let rel = c.sub(trel);
+                            if rel.x < 0 || rel.x > 31 || rel.z < 0 || rel.z > 31 { continue; }
+                            let di = (rel.z * 32 + rel.x) as usize;
+                            if d.chunks[di].is_some() && !overwrite { continue; }
+                            let mut cc = chunk.clone();
+                            cc.absolute_location = c;
+                            cc.timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|t| t.as_secs() as i32).unwrap_or(0);
+                            d.chunks[di] = Some(cc);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        let _ = d.save_with_temp_file(&dst);
+                        let _ = tx.send(crate::tilemap::TileResult::Image {
+                            region: tregion, image: None, zoom: 0, structures: None, cache_write: false,
+                        });
+                    }
+                }
+            }
+        }));
+}
 
 /// upstream TextHelper.abbreviateCoordinate: K/M/B suffix over 100k.
 fn abbrev_coord(n: i32) -> String {

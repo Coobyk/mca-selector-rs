@@ -277,6 +277,51 @@ impl Selection {
         }
     }
 
+    /// port of Selection.addRadius(radius, bounds): for every selected chunk
+    /// (or the edges of fully-selected regions), also mark all chunks within
+    /// a circular radius ((radius + 0.3)^2) that are selected in `bounds`.
+    pub fn add_radius(&mut self, radius: i32, bounds: Option<&Selection>) {
+        let entries: Vec<(i64, Option<ChunkSet>)> =
+            self.selection.iter().map(|(k, v)| (*k, v.clone())).collect();
+        for (key, cs) in entries {
+            let base = Point2i::from_long(key).region_to_chunk();
+            match cs {
+                None => {
+                    for x in 0..32 {
+                        self.add_radius_at(Point2i::new(x, 0).add_p(base), radius, bounds);
+                        self.add_radius_at(Point2i::new(x, 31).add_p(base), radius, bounds);
+                    }
+                    for z in 1..31 {
+                        self.add_radius_at(Point2i::new(0, z).add_p(base), radius, bounds);
+                        self.add_radius_at(Point2i::new(31, z).add_p(base), radius, bounds);
+                    }
+                }
+                Some(cs) => {
+                    for i in cs.iter() {
+                        let center = Point2i::from_chunk_index(i as i32).add_p(base);
+                        self.add_radius_at(center, radius, bounds);
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_radius_at(&mut self, center: Point2i, radius: i32, bounds: Option<&Selection>) {
+        let min = center.sub_v(radius, radius);
+        let max = center.add(radius, radius);
+        let r2 = (radius as f64 + 0.3) * (radius as f64 + 0.3);
+        for x in min.x..=max.x {
+            for z in min.z..=max.z {
+                let dx = (x - center.x) as f64;
+                let dz = (z - center.z) as f64;
+                let inside = bounds.map(|b| b.is_chunk_selected(Point2i::new(x, z))).unwrap_or(true);
+                if inside && dx * dx + dz * dz <= r2 {
+                    self.add_chunk(Point2i::new(x, z));
+                }
+            }
+        }
+    }
+
     pub fn invert_all(&mut self) {
         let keys: Vec<i64> = self.selection.keys().copied().collect();
         for k in keys {

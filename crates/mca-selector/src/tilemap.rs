@@ -105,7 +105,7 @@ const RENDER_CACHE_VERSION: i64 = 2;
 /// fingerprint of everything that changes a tile's pixels. keyed caches
 /// (disk PNGs, meta) are invalidated by comparing this.
 fn render_hash(cfg: &crate::config::WorldConfig) -> i64 {
-    ((cfg.render_height.clamp(-64, 319) + 64) as i64)
+    ((cfg.render_height.clamp(-64, 2047) + 64) as i64)
         | (cfg.render_layer_only as i64) << 10
         | (cfg.render_caves as i64) << 11
         | (cfg.shade as i64) << 12
@@ -244,9 +244,13 @@ impl TileMapState {
             show_chunk_grid: g.show_chunk_grid,
             show_region_grid: g.show_region_grid,
             show_coordinates: g.show_coordinates,
-            show_structure_icons: false,
+            show_structure_icons: g.show_structure_icons,
             show_nonexistent_regions: true,
-            coordinate_style: CoordinateStyle::Dynamic,
+            coordinate_style: match g.coordinate_style.to_ascii_uppercase().as_str() {
+                "EDGE" => CoordinateStyle::Edge,
+                "GRID" => CoordinateStyle::Grid,
+                _ => CoordinateStyle::Dynamic,
+            },
             hovered_block: None,
             pasted: None,
             disabled: true,
@@ -783,21 +787,24 @@ impl TileMapState {
             .iter()
             .position(|o| o.as_ref() == Some(cur))
             .unwrap_or(self.overlays.len() - 1);
+        // upstream wraps around the whole list until a valid overlay of the
+        // same type is found — the None terminator and entries before the
+        // current index are not a boundary; a full cycle ends the search.
+        let start = index;
         loop {
             index += 1;
             if index == self.overlays.len() {
                 index = 0;
             }
-            let p = &self.overlays[index];
-            if let Some(o) = p {
+            if let Some(o) = &self.overlays[index] {
                 if o.active && o.is_valid() && o.typ == cur_typ {
                     let o = o.clone();
                     self.set_overlay(Some(o));
                     break;
                 }
             }
-            if index == self.overlays.len() - 1 {
-                break; // wrapped past the None terminator without match
+            if index == start {
+                break;
             }
         }
     }
@@ -1084,22 +1091,41 @@ impl TileMapState {
         }
     }
 
-    pub fn discard_cached_image(&mut self, region: Point2i) {
-        if let Some(ws) = crate::config::world() {
-            for m in self.pool.values_mut() {
-                m.remove(&region.as_long());
+    /// drop in-memory tile state for `region` (pool entries, load flags,
+    /// overlays, structures) so the next update() re-requests it; the stale
+    /// image stays on the tile as a placeholder like upstream's loaded=false.
+    /// With `disk` also remove the cached pngs + meta (upstream clearTile).
+    pub fn invalidate_region(&mut self, region: Point2i, disk: bool) {
+        let key = region.as_long();
+        for m in self.pool.values_mut() {
+            m.remove(&key);
+        }
+        for o in self.pool_order.values_mut() {
+            o.retain(|r| *r != key);
+        }
+        self.loading.remove(&key);
+        if let Some(t) = self.tiles.get_mut(&key) {
+            t.loaded = false;
+            t.overlay_data = None;
+            t.overlay_loaded = false;
+            t.overlay_render_image = None;
+            if disk {
+                t.structures = None;
             }
-            for o in self.pool_order.values_mut() {
-                o.retain(|r| *r != region.as_long());
-            }
-            if let Some(t) = self.tiles.get_mut(&region.as_long()) {
-                t.structures_checked = false;
-            }
-            cache::delete_data(&ws.uuid, region);
-            for zl in [1, 2, 4, 8, 16, 32] {
-                let _ = std::fs::remove_file(files::png_cache_path(&ws.cache_dir, zl, region));
+            t.structures_checked = false;
+        }
+        if disk {
+            if let Some(ws) = crate::config::world() {
+                cache::delete_data(&ws.uuid, region);
+                for zl in [1, 2, 4, 8, 16, 32] {
+                    let _ = std::fs::remove_file(files::png_cache_path(&ws.cache_dir, zl, region));
+                }
             }
         }
+    }
+
+    pub fn discard_cached_image(&mut self, region: Point2i) {
+        self.invalidate_region(region, true);
     }
 
     pub fn mark_all_tiles_obsolete(&mut self) {

@@ -56,9 +56,16 @@ pub struct GlobalConfig {
     pub show_region_grid: bool,
     pub show_coordinates: bool,
     /// structure id -> draw icon (SelectStructures submenu toggles)
+    pub show_structure_icons: bool,
 
     pub coordinate_style: String,
     pub debug: bool,
+    /// upstream FilterChunksDialog keeps the last filter query for the session;
+    /// we persist it (GlobalConfig has no dedicated filter file).
+    pub filter_query: String,
+    /// configured overlays, serialized via mc_core::overlay::serialize_overlay_line
+    /// (upstream OverlayConfig).
+    pub overlays: Vec<String>,
     pub recent_worlds: BTreeMap<i64, RecentWorld>,
     pub structure_icons: BTreeMap<String, bool>,
 }
@@ -80,8 +87,11 @@ impl Default for GlobalConfig {
             show_chunk_grid: true,
             show_region_grid: true,
             show_coordinates: false,
+            show_structure_icons: false,
             coordinate_style: "DYNAMIC".into(),
             debug: false,
+            filter_query: String::new(),
+            overlays: Vec::new(),
             recent_worlds: BTreeMap::new(),
             structure_icons: BTreeMap::new(),
         }
