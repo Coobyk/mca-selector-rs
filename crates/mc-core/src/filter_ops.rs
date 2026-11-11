@@ -95,7 +95,7 @@ pub fn run_filter_select(
     // SelectFilterJob skips the load when the filter can't match).
     let regions: Vec<_> = batch::list_regions(wd, selection)
         .into_iter()
-        .filter(|(r, _)| applies_to_region(expr, *r, &mut fctx))
+        .filter(|r| applies_to_region(expr, *r, &mut fctx))
         .collect();
     let sum = batch::run_region_loop(wd, sel, regions, false, |files, ctx, _errs| {
         let r = ctx.region;
@@ -150,7 +150,7 @@ pub fn run_filter_delete(
     let sel = effective_sel(selection, &all);
     let regions: Vec<_> = batch::list_regions(wd, selection)
         .into_iter()
-        .filter(|(r, _)| applies_to_region(expr, *r, &mut fctx))
+        .filter(|r| applies_to_region(expr, *r, &mut fctx))
         .collect();
     let sum = batch::run_region_loop(wd, sel, regions, false, |files, ctx, errs| {
         let r = ctx.region;
@@ -222,11 +222,13 @@ pub fn run_change_fields(
                 entities: chunk_mut(&mut files.entities, i),
             };
             let cr = crate::changer::apply_change(&mut refs, fields, force);
-            res.chunks_matched += 1;
+            if cr.applied > 0 {
+                res.chunks_matched += 1;
+                for kind in [batch::McKind::Region, batch::McKind::Poi, batch::McKind::Entities] {
+                    files.touch(kind);
+                }
+            }
             errs.extend(cr.errors);
-        }
-        for kind in [batch::McKind::Region, batch::McKind::Poi, batch::McKind::Entities] {
-            files.touch(kind);
         }
         res.files_written += files.save_dirty(errs);
     });
@@ -250,8 +252,8 @@ pub fn run_filter_export(
     let sel = effective_sel(selection, &all);
     let regions: Vec<_> = batch::list_regions(wd, selection)
         .into_iter()
-        .filter(|(r, _)| applies_to_region(expr, *r, &mut fctx))
-        .filter(|(r, _)| {
+        .filter(|r| applies_to_region(expr, *r, &mut fctx))
+        .filter(|r| {
             // upstream: "exists, not overwriting" — the skip precedes the load
             ![&dest.region, &dest.poi, &dest.entities]
                 .into_iter()

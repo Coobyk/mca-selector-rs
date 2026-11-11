@@ -44,6 +44,11 @@ impl ChunkSet {
         self.words = [u64::MAX; 16];
         self.set_bits = 1024;
     }
+    pub fn full() -> Self {
+        let mut c = Self::new();
+        c.fill();
+        c
+    }
     pub fn flip(&self) -> ChunkSet {
         let mut c = self.clone();
         for w in &mut c.words {
@@ -449,14 +454,14 @@ impl Selection {
             match cs {
                 Some(c) => {
                     for i in c.iter() {
-                        let p = base.add(i as i32 % 32, i as i32 / 32);
+                        let p = base.add_p(Point2i::from_chunk_index(i as i32));
                         min = Some(min.map_or(p, |m: Point2i| Point2i::new(m.x.min(p.x), m.z.min(p.z))));
                         max = Some(max.map_or(p, |m: Point2i| Point2i::new(m.x.max(p.x), m.z.max(p.z))));
                     }
                 }
                 None => {
                     for i in 0..1024usize {
-                        let p = base.add((i % 32) as i32, (i / 32) as i32);
+                        let p = base.add_p(Point2i::from_chunk_index(i as i32));
                         min = Some(min.map_or(p, |m: Point2i| Point2i::new(m.x.min(p.x), m.z.min(p.z))));
                         max = Some(max.map_or(p, |m: Point2i| Point2i::new(m.x.max(p.x), m.z.max(p.z))));
                     }

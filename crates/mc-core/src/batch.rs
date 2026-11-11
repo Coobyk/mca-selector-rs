@@ -5,7 +5,7 @@ use crate::files::{mca_file_name, scan_region_files};
 use crate::jobs::{self, Job, Progress, PRIORITY_LOW};
 use crate::mca::{McaFile, WorldDirectories};
 use crate::point::Point2i;
-use crate::selection::{ChunkSet, Selection};
+use crate::selection::Selection;
 use std::path::PathBuf;
 
 /// which of a region's three mca files a body modified.
@@ -83,9 +83,6 @@ pub struct RegionJobCtx<'a> {
     pub region: Point2i,
     /// the selection being iterated; handles inverted masks internally.
     pub selection: &'a Selection,
-    /// the region's raw selection entry: None = whole region. For inverted
-    /// selections prefer `chunk_selected` — the mask is the *unselected* set.
-    pub chunks: Option<&'a ChunkSet>,
 }
 
 impl<'a> RegionJobCtx<'a> {
@@ -96,27 +93,22 @@ impl<'a> RegionJobCtx<'a> {
 
 pub struct RegionJobSummary {
     pub processed: usize,
-    pub changed: usize,
     pub errors: Vec<String>,
-    pub cancelled: bool,
 }
 
 /// Effective (region, entry) pairs for a selection: its own map entries
 /// normally, or every region file in `dirs` when inverted.
-pub fn effective_regions(
-    sel: &Selection,
-    dirs: &WorldDirectories,
-) -> Vec<(Point2i, Option<ChunkSet>)> {
+pub fn effective_regions(sel: &Selection, dirs: &WorldDirectories) -> Vec<Point2i> {
     if sel.inverted {
         dirs.region
             .iter()
             .flat_map(|d| scan_region_files(d))
-            .map(|k| (Point2i::from_long(k), sel.selection.get(&k).cloned().flatten()))
+            .map(Point2i::from_long)
             .collect()
     } else {
         sel.selection
             .iter()
-            .map(|(&k, m)| (Point2i::from_long(k), m.clone()))
+            .map(|(&k, _)| Point2i::from_long(k))
             .collect()
     }
 }
@@ -125,10 +117,7 @@ pub fn effective_regions(
 /// of the three dirs, prefiltered to regions with any selected chunk
 /// (`None` selection = all). The `ChunkSet` is the selection's raw map
 /// entry for that region (None entry = whole region).
-pub fn list_regions(
-    dirs: &WorldDirectories,
-    selection: Option<&Selection>,
-) -> Vec<(Point2i, Option<ChunkSet>)> {
+pub fn list_regions(dirs: &WorldDirectories, selection: Option<&Selection>) -> Vec<Point2i> {
     let mut locs = std::collections::BTreeSet::new();
     for dir in [&dirs.region, &dirs.poi, &dirs.entities]
         .into_iter()
@@ -143,14 +132,7 @@ pub fn list_regions(
             }
         }
     }
-    locs.into_iter()
-        .map(|k| {
-            (
-                Point2i::from_long(k),
-                selection.and_then(|s| s.selection.get(&k).cloned().flatten()),
-            )
-        })
-        .collect()
+    locs.into_iter().map(Point2i::from_long).collect()
 }
 
 /// One region iteration shared by [`run_region_loop`] and
@@ -160,7 +142,6 @@ fn run_one<F>(
     dirs: &WorldDirectories,
     sel: &Selection,
     region: Point2i,
-    chunks: Option<ChunkSet>,
     raw: bool,
     sum: &mut RegionJobSummary,
     body: &mut F,
@@ -175,15 +156,12 @@ where
     let ctx = RegionJobCtx {
         region,
         selection: sel,
-        chunks: chunks.as_ref(),
     };
     body(&mut files, &ctx, &mut sum.errors);
-    if files.dirty != 0 {
-        sum.changed += 1;
-    }
+    let dirty = files.dirty != 0;
     files.save_dirty(&mut sum.errors);
     sum.processed += 1;
-    true
+    dirty
 }
 
 /// Synchronous variant of [`spawn_region_job`]'s skeleton, for callers
@@ -193,7 +171,7 @@ where
 pub fn run_region_loop<F>(
     dirs: &WorldDirectories,
     sel: &Selection,
-    regions: Vec<(Point2i, Option<ChunkSet>)>,
+    regions: Vec<Point2i>,
     raw: bool,
     mut body: F,
 ) -> RegionJobSummary
@@ -202,12 +180,10 @@ where
 {
     let mut sum = RegionJobSummary {
         processed: 0,
-        changed: 0,
         errors: Vec::new(),
-        cancelled: false,
     };
-    for (region, chunks) in regions {
-        run_one(dirs, sel, region, chunks, raw, &mut sum, &mut body);
+    for region in regions {
+        run_one(dirs, sel, region, raw, &mut sum, &mut body);
     }
     sum
 }
@@ -219,7 +195,7 @@ pub fn spawn_region_job<F>(
     title: &'static str,
     dirs: WorldDirectories,
     sel: Selection,
-    regions: Vec<(Point2i, Option<ChunkSet>)>,
+    regions: Vec<Point2i>,
     raw: bool,
     on_region: Box<dyn Fn(Point2i) + Send>,
     on_done: Box<dyn Fn(RegionJobSummary) + Send>,
@@ -231,18 +207,15 @@ pub fn spawn_region_job<F>(
         let p = Progress::new(title, regions.len() as i64);
         let mut sum = RegionJobSummary {
             processed: 0,
-            changed: 0,
             errors: Vec::new(),
-            cancelled: false,
         };
-        for (region, chunks) in regions {
+        for region in regions {
             let _g = p.inc_guard();
             p.set_current(mca_file_name(region));
             if p.is_cancelled() {
-                sum.cancelled = true;
                 break;
             }
-            if run_one(&dirs, &sel, region, chunks, raw, &mut sum, &mut body) {
+            if run_one(&dirs, &sel, region, raw, &mut sum, &mut body) {
                 on_region(region);
             }
         }

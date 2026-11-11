@@ -363,20 +363,10 @@ impl Render for MainView {
                 // an inverted selection covers every region file in the
                 // world (region + poi + entities dirs).
                 let sel = v.map.selection.clone();
-                let keys: Vec<i64> = if sel.inverted {
-                    let mut k: std::collections::HashSet<i64> = std::collections::HashSet::new();
-                    if let Some(ws) = config::world() {
-                        k.extend(files::scan_region_files(ws.region_dir()));
-                        for d in [&ws.dirs.poi, &ws.dirs.entities].into_iter().flatten() {
-                            k.extend(files::scan_region_files(d));
-                        }
+                if let Some(ws) = config::world() {
+                    for r in mc_core::batch::list_regions(&ws.dirs, Some(&sel)) {
+                        v.map.invalidate_region(r, true);
                     }
-                    k.into_iter().collect()
-                } else {
-                    sel.selection.keys().copied().collect()
-                };
-                for k in keys {
-                    v.map.invalidate_region(Point2i::from_long(k), true);
                 }
                 v.request_update();
                 cx.notify();

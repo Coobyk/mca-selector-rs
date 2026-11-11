@@ -436,7 +436,7 @@ impl MainView {
             return;
         }
         let mut found: Option<(i64, usize)> = None;
-        for (&rl, cs) in &sel.selection {
+        for (rl, cs) in sel.regions() {
             if let Some(cs) = cs {
                 for i in cs.iter() {
                     found = Some((rl, i));
@@ -566,7 +566,7 @@ impl MainView {
             "Saving chunk",
             dirs,
             mc_core::selection::Selection::all(),
-            vec![(rp, None)],
+            vec![rp],
             false,
             Box::new(move |region| {
                 let _ = tx.send(crate::tilemap::TileResult::Invalidate { region });

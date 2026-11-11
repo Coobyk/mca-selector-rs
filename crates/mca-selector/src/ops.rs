@@ -31,6 +31,16 @@ fn invalidate_on_region(tx: &Sender<TileResult>) -> Box<dyn Fn(Point2i) + Send> 
     })
 }
 
+/// default on_done for spawn_region_job: surface collected errors as an
+/// Info dialog instead of dropping them.
+fn report_done(tx: Sender<TileResult>) -> Box<dyn Fn(batch::RegionJobSummary) + Send> {
+    Box::new(move |sum| {
+        if !sum.errors.is_empty() {
+            job_info(&tx, format!("Finished with {} error(s):\n{}", sum.errors.len(), sum.errors.join("\n")));
+        }
+    })
+}
+
 impl MainView {
     /// upstream saveScreenshot: render the currently visible region bounds
     /// into one PNG through the same export-image machinery as
@@ -134,9 +144,8 @@ impl MainView {
                     regions,
                     false,
                     invalidate_on_region(&tx),
-                    Box::new(|_| {}),
+                    report_done(tx.clone()),
                     |files, ctx, errs| {
-                        let _ = errs;
                         match ctx.selection.selected_chunks(ctx.region) {
                             // whole region selected: upstream deletes all
                             // three mca files outright.
@@ -149,7 +158,9 @@ impl MainView {
                                 .into_iter()
                                 .flatten()
                                 {
-                                    let _ = std::fs::remove_file(&m.file);
+                                    if let Err(e) = std::fs::remove_file(&m.file) {
+                                        errs.push(format!("{}: {e}", m.file.display()));
+                                    }
                                 }
                             }
                             Some(Some(cs)) => {
@@ -189,7 +200,7 @@ impl MainView {
         let msg = if sel.inverted {
             "You are about to defragment an unknown number of regions.".to_string()
         } else {
-            format!("You are about to defragment {} regions.", sel.selection.len())
+            format!("You are about to defragment {} regions.", sel.regions().count())
         };
         self.dialog = Some(Dialog::Confirm {
             msg: format!("{msg}\nAre you sure?"),
@@ -204,7 +215,7 @@ impl MainView {
                     regions,
                     false,
                     invalidate_on_region(&tx),
-                    Box::new(|_| {}),
+                    report_done(tx.clone()),
                     |files, _ctx, errs| {
                         // upstream Region.deFragment rewrites every loaded
                         // file (region/poi/entities).
@@ -270,6 +281,7 @@ impl MainView {
         let _ = std::fs::create_dir_all(&region_dir);
         let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
         let regions = batch::effective_regions(&sel, &dirs);
+        let tx = self.map.result_tx.clone();
         batch::spawn_region_job(
             "Exporting chunks",
             dirs,
@@ -277,7 +289,7 @@ impl MainView {
             regions,
             false,
             Box::new(|_| {}),
-            Box::new(|_| {}),
+            report_done(tx.clone()),
             move |files, ctx, errs| {
                 let dst = region_dir.join(mca_file_name(ctx.region));
                 match ctx.selection.selected_chunks(ctx.region) {
@@ -295,13 +307,7 @@ impl MainView {
                         }
                         let Some(m) = files.region.as_mut() else { return };
                         // keep only selected chunks
-                        let mut keep = ChunkSet::new();
-                        for i in 0..1024 {
-                            if !cs.get(i) {
-                                keep.set(i);
-                            }
-                        }
-                        m.delete_chunks(&keep);
+                        m.delete_chunks(&cs.flip());
                         if let Err(e) = m.save_with_temp_file(&dst) {
                             errs.push(format!("{}: {e}", dst.display()));
                         }
@@ -319,12 +325,12 @@ impl MainView {
         let clip = files::base_cache_dir().join("clipboard").join("region");
         let _ = std::fs::remove_dir_all(&clip);
         let _ = std::fs::create_dir_all(&clip);
-        let origin = sel.selection.keys().next().copied();
-        let Some(origin_l) = origin else { return };
+        let Some(origin_l) = sel.regions().next().map(|(k, _)| k) else { return };
         let origin = Point2i::from_long(origin_l);
         let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
         let regions = batch::effective_regions(&sel, &dirs);
         let clip_sel = sel.clone();
+        let tx = self.map.result_tx.clone();
         batch::spawn_region_job(
             "Copying chunks",
             dirs,
@@ -332,7 +338,10 @@ impl MainView {
             regions,
             false,
             Box::new(|_| {}),
-            Box::new(move |_| {
+            Box::new(move |sum| {
+                if !sum.errors.is_empty() {
+                    job_info(&tx, format!("Finished with {} error(s):\n{}", sum.errors.len(), sum.errors.join("\n")));
+                }
                 // record origin + selection for offset paste
                 let clip = files::base_cache_dir().join("clipboard").join("region");
                 let _ = std::fs::write(clip.join("../origin.txt"), format!("{},{}", origin.x, origin.z));
@@ -353,13 +362,7 @@ impl MainView {
                             return;
                         }
                         let Some(m) = files.region.as_mut() else { return };
-                        let mut keep = ChunkSet::new();
-                        for i in 0..1024 {
-                            if !cs.get(i) {
-                                keep.set(i);
-                            }
-                        }
-                        m.delete_chunks(&keep);
+                        m.delete_chunks(&cs.flip());
                         if let Err(e) = m.save_with_temp_file(&dst) {
                             errs.push(format!("{}: {e}", dst.display()));
                         }
@@ -421,7 +424,7 @@ impl MainView {
         let regions = batch::effective_regions(&sel, &dirs);
         let mut minx = i32::MAX; let mut minz = i32::MAX;
         let mut maxx = i32::MIN; let mut maxz = i32::MIN;
-        for (r, _) in &regions {
+        for r in &regions {
             minx = minx.min(r.x); minz = minz.min(r.z);
             maxx = maxx.max(r.x); maxz = maxz.max(r.z);
         }
@@ -481,6 +484,7 @@ impl MainView {
         // CORRUPTED is a UI-thread local — snapshot it now; the worker
         // thread would see the default zeros.
         let corrupted = crate::tilemap::CORRUPTED.with(|c| *c.borrow());
+        let tx = self.map.result_tx.clone();
         batch::spawn_region_job(
             "Exporting image",
             dirs,
@@ -488,7 +492,10 @@ impl MainView {
             regions,
             true,
             Box::new(|_| {}),
-            Box::new(move |_sum| {
+            Box::new(move |sum| {
+                if !sum.errors.is_empty() {
+                    job_info(&tx, format!("Finished with {} error(s):\n{}", sum.errors.len(), sum.errors.join("\n")));
+                }
                 let px = px.lock().unwrap();
                 let rgba = crate::tilemap::argb_to_rgba(&px);
                 let _ = image::save_buffer(&path, &rgba, w as u32, h as u32, image::ColorType::Rgba8);
@@ -537,19 +544,22 @@ impl MainView {
             regions,
             false,
             Box::new(|_| {}),
-            Box::new(move |_| {
+            Box::new(move |s| {
                 let sum = *sum.lock().unwrap();
-                job_info(&tx, format!("{title}: {sum}"));
+                let mut msg = format!("{title}: {sum}");
+                if !s.errors.is_empty() {
+                    msg += &format!("\n{} error(s):\n{}", s.errors.len(), s.errors.join("\n"));
+                }
+                job_info(&tx, msg);
             }),
-            move |files, ctx, errs| {
-                let _ = errs;
+            move |files, ctx, _errs| {
                 // upstream clamps the run at -1 on overflow; once the flag
                 // is set the remaining regions are skipped.
                 if *sum_body.lock().unwrap() < 0 {
                     return;
                 }
                 for i in 0..1024 {
-                    let loc = ctx.region.region_to_chunk().add(i as i32 % 32, i as i32 / 32);
+                    let loc = ctx.region.region_to_chunk().add_p(Point2i::from_chunk_index(i as i32));
                     if !ctx.chunk_selected(loc) {
                         continue;
                     }
@@ -630,13 +640,23 @@ impl MainView {
         // we swap the first two chunks in selection order)
         let sel = self.map.selection.clone();
         let mut coords: Vec<(i64, usize)> = Vec::new();
-        for (&r, c) in &sel.selection {
-            if let Some(cs) = c {
-                for i in cs.iter() { coords.push((r, i)); }
+        for (rl, mask) in sel.regions() {
+            match mask {
+                Some(cs) => {
+                    for i in cs.iter() {
+                        coords.push((rl, i));
+                        if coords.len() >= 2 { break; }
+                    }
+                }
+                None => {
+                    coords.push((rl, 0));
+                    coords.push((rl, 1));
+                    break;
+                }
             }
             if coords.len() >= 2 { break; }
         }
-        if coords.len() < 2 {
+        if coords.len() < 2 || sel.inverted {
             self.dialog = Some(Dialog::Error { msg: "select exactly two chunks".into() });
             cx.notify();
             return;
@@ -667,14 +687,17 @@ impl MainView {
                             m.load(false).ok()?;
                             Some((p, m))
                         };
-                        let (p1, mut m1) = match load(r1) { Some(v) => v, None => return };
-                        let (p2, mut m2) = match load(r2) { Some(v) => v, None => return };
+                        let mut fail = |m: &str| job_info(&tx, format!("swap failed: {m}"));
+                        let (p1, mut m1) = match load(r1) { Some(v) => v, None => return fail("could not load first region") };
+                        _p.inc();
+                        let (p2, mut m2) = match load(r2) { Some(v) => v, None => return fail("could not load second region") };
                         let c1 = m1.chunks[i1].take();
                         let c2 = m2.chunks[i2].take();
                         m2.chunks[i2] = c1;
                         m1.chunks[i1] = c2;
-                        let _ = m1.save_with_temp_file(&p1);
-                        let _ = m2.save_with_temp_file(&p2);
+                        _p.inc();
+                        if let Err(e) = m1.save_with_temp_file(&p1) { return fail(&e.to_string()); }
+                        if let Err(e) = m2.save_with_temp_file(&p2) { return fail(&e.to_string()); }
                         let _ = tx.send(TileResult::Invalidate {
                             region: Point2i::from_long(r1),
                         });
@@ -739,7 +762,7 @@ impl MainView {
                 // upstream only clears the tile cache when a changed field
                 // affects rendering (FieldType.requiresClearCache)
                 let inv = if mc_core::changer::requires_clear_cache(&fields) {
-                    all_mca_regions(&dirs)
+                    mc_core::batch::list_regions(&dirs, None)
                 } else {
                     Vec::new()
                 };
@@ -758,7 +781,6 @@ impl MainView {
                         for region in inv {
                             let _ = tx.send(TileResult::Invalidate { region });
                         }
-                        let _ = __p;
                     }));
                 v.dialog = None;
                 cx.notify();
@@ -830,7 +852,6 @@ impl MainView {
                     jobs::PRIORITY_LOW, None,
                     move || {
                         let __p = Progress::new("Filtering chunks", -1);
-                        let _ = __p;
                         match mc_core::filter_ops::run_filter_select(
                             &expr, &dirs, bound.as_ref(), apply, radius, &mut target,
                         ) {
@@ -846,13 +867,12 @@ impl MainView {
                     msg: "You are about to delete an unknown number of chunks from this world.\nAre you sure?".into(),
                     action: Box::new(move |v, _w, cx| {
                         let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
-                        let inv = all_mca_regions(&dirs);
+                        let inv = mc_core::batch::list_regions(&dirs, None);
                         let tx = v.map.result_tx.clone();
                         jobs::pools().add_process(Job::new(
                             jobs::PRIORITY_LOW, None,
                             move || {
                                 let __p = Progress::new("Deleting filtered chunks", -1);
-                                let _ = __p;
                                 match mc_core::filter_ops::run_filter_delete(&expr, &dirs, sel_bound.as_ref()) {
                                     Ok(r) => job_info(&tx, format!(
                                         "deleted {} chunks ({} files written)",
@@ -905,7 +925,6 @@ impl MainView {
                                             jobs::PRIORITY_LOW, None,
                                             move || {
                                                 let __p = Progress::new("Exporting filtered chunks", -1);
-                                                let _ = __p;
                                                 match mc_core::filter_ops::run_filter_export(
                                                     &expr, &dirs, sel_bound.as_ref(), &dest,
                                                 ) {
@@ -931,17 +950,6 @@ impl MainView {
     }
 }
 
-/// all region locations present in any of the three world directories
-/// (region/poi/entities) — used to invalidate tiles after jobs that rewrite
-/// files outside a per-region callback.
-fn all_mca_regions(dirs: &mc_core::mca::WorldDirectories) -> Vec<Point2i> {
-    let mut locs = std::collections::BTreeSet::new();
-    for d in [&dirs.region, &dirs.poi, &dirs.entities].into_iter().flatten() {
-        locs.extend(files::scan_region_files(d));
-    }
-    locs.into_iter().map(Point2i::from_long).collect()
-}
-
 /// upstream ImportJob: merge every mca file of `src_dir` into the open
 /// world's region dir, shifting chunk positions by `offset` (chunks).
 /// `src_sel` limits which source chunks are imported (paste imports pass the
@@ -958,8 +966,12 @@ fn import_mca_dir(
     jobs::pools().add_process(Job::new(
         jobs::PRIORITY_LOW, None,
         move || {
-            let Ok(rd) = std::fs::read_dir(&src_dir) else { return };
+            let rd = match std::fs::read_dir(&src_dir) {
+                Ok(r) => r,
+                Err(e) => { job_info(&tx, format!("Import failed: {src_dir:?}: {e}")); return; }
+            };
             let files: Vec<_> = rd.flatten().collect();
+            let mut errs: Vec<String> = Vec::new();
             let __p = Progress::new("Importing chunks", files.len() as i64);
             for e in files {
                 let __g = __p.inc_guard();
@@ -967,16 +979,19 @@ fn import_mca_dir(
                 let name = e.file_name().to_string_lossy().to_string();
                 __p.set_current(name.clone());
                 let Some(src_region) = mc_core::files::parse_mca_file_name(&name) else { continue };
-                let Some(dst_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else { return };
+                let Some(dst_dir) = crate::config::world().and_then(|w| w.dirs.region.clone()) else {
+                    errs.push("no world region dir".into());
+                    break;
+                };
                 let Ok(mut src) = mc_core::mca::McaFile::new(e.path()) else { continue };
-                if src.load(false).is_err() { continue; }
+                if let Err(e) = src.load(false) { errs.push(format!("{name}: {e}")); continue; }
                 // chunks to import from this region (Selection::selected_chunks
                 // handles inverted selections; None = no selection -> whole file)
                 let sel_cs = match &src_sel {
-                    None => { let mut f = ChunkSet::new(); f.fill(); f }
+                    None => { ChunkSet::full() }
                     Some(s) => match s.selected_chunks(src_region) {
                         Some(Some(cs)) => cs,
-                        Some(None) => { let mut f = ChunkSet::new(); f.fill(); f }
+                        Some(None) => { ChunkSet::full() }
                         None => continue,
                     },
                 };
@@ -984,7 +999,7 @@ fn import_mca_dir(
                 // split by target region (chunks may cross region borders)
                 let mut targets: std::collections::HashMap<Point2i, Vec<(usize, Point2i)>> = std::collections::HashMap::new();
                 for i in sel_cs.iter() {
-                    let c = src_region.region_to_chunk().add(i as i32 % 32, i as i32 / 32).add_p(offset);
+                    let c = src_region.region_to_chunk().add_p(Point2i::from_chunk_index(i as i32)).add_p(offset);
                     if let Some(ts) = &target_sel {
                         if !ts.is_chunk_selected(c) { continue; }
                     }
@@ -994,7 +1009,7 @@ fn import_mca_dir(
                     let dst = dst_dir.join(mca_file_name(tregion));
                     let mut d = if dst.exists() {
                         let Ok(mut m) = mc_core::mca::McaFile::new(dst.clone()) else { continue };
-                        if m.load(false).is_err() { continue; }
+                        if let Err(e) = m.load(false) { errs.push(format!("{}: {e}", dst.display())); continue; }
                         m
                     } else {
                         mc_core::mca::McaFile::empty(tregion, dst.clone())
@@ -1017,10 +1032,15 @@ fn import_mca_dir(
                         }
                     }
                     if changed {
-                        let _ = d.save_with_temp_file(&dst);
+                        if let Err(e) = d.save_with_temp_file(&dst) {
+                            errs.push(format!("{}: {e}", dst.display()));
+                        }
                         let _ = tx.send(TileResult::Invalidate { region: tregion });
                     }
                 }
+            }
+            if !errs.is_empty() {
+                job_info(&tx, format!("Import finished with {} error(s):\n{}", errs.len(), errs.join("\n")));
             }
         }));
 }

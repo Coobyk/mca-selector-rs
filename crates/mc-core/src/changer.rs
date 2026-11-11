@@ -1202,7 +1202,7 @@ fn apply_biome(root: &mut Compound, b: &BiomeIdent, force: bool) {
             } else {
                 // 21w06a: sectionRange.num() * 64
                 let Some(range) = l
-                    .get("Sections")
+                    .get(chunk::sections_key(dv))
                     .and_then(as_list)
                     .and_then(|s| find_section_range_from(l, s))
                 else {

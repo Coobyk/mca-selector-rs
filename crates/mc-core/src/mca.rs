@@ -817,7 +817,7 @@ fn write_chunk_data<W: std::io::Write>(
             .as_ref()
             .and_then(|d| nbt::int_from_opt(Some(d), "DataVersion"))
             .unwrap_or(0);
-        if dv < 2203 {
+        if dv < crate::chunk::DV_19W36A {
             anyhow::bail!("chunk at {loc} is oversized and can't be saved (DataVersion < 2203)");
         }
         w.write_all(&1i32.to_be_bytes())?;
@@ -838,4 +838,36 @@ pub struct WorldDirectories {
     pub region: Option<PathBuf>,
     pub poi: Option<PathBuf>,
     pub entities: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// regression: load_offsets must fill sectors[] and timestamps[] too —
+    /// when it only filled offsets[], defragment() read sectors==0 for every
+    /// chunk and deleted the region file it was asked to compact.
+    #[test]
+    fn load_offsets_fills_all_header_tables() {
+        let mut hdr = [0u8; HEADER_SIZE];
+        // chunk slot 5: offset=2 sectors, count=3 sectors
+        hdr[20] = 0;
+        hdr[21] = 0;
+        hdr[22] = 2;
+        hdr[23] = 3;
+        // timestamp slot 5 = 0x01020304
+        hdr[4096 + 20] = 1;
+        hdr[4096 + 21] = 2;
+        hdr[4096 + 22] = 3;
+        hdr[4096 + 23] = 4;
+        let path = std::env::temp_dir().join("r.9.9.mca");
+        std::fs::File::create(&path).unwrap().write_all(&hdr).unwrap();
+        let mut m = McaFile::new(path.clone()).unwrap();
+        m.load_offsets().unwrap();
+        assert_eq!(m.offsets[5], 2);
+        assert_eq!(m.sectors[5], 3);
+        assert_eq!(m.timestamps[5], 0x01020304);
+        std::fs::remove_file(&path).ok();
+    }
 }

@@ -192,7 +192,7 @@ impl MainView {
                     } else {
                         // non-inverted: only regions present in the selection
                         // map can draw — iterate it clipped to the viewport.
-                        for &key in sel.selection.keys() {
+                        for (key, _) in sel.regions() {
                             let r = Point2i::from_long(key);
                             if r.x >= vmin.x && r.x <= vmax.x && r.z >= vmin.z && r.z <= vmax.z {
                                 draw_sel(r.x, r.z, window);
@@ -642,24 +642,17 @@ fn build_paste_overlay(
                 .set(((pos.z - first.z) * 32 + (pos.x - first.x)) as usize);
         };
         if let Some(sel) = &p.selection {
-            for (&region_l, cs) in &sel.selection {
+            for (region_l, _) in sel.regions() {
                 let base = Point2i::from_long(region_l).region_to_chunk();
-                // effective set = cs or full region; complement when inverted
-                let eff: Option<ChunkSet> = match cs {
-                    Some(c) => Some(if sel.inverted { c.flip() } else { c.clone() }),
-                    None => {
-                        if sel.inverted { Some(ChunkSet::new()) } else { None }
-                    }
-                };
-                match eff {
-                    Some(c) => {
+                match sel.selected_chunks(Point2i::from_long(region_l)) {
+                    Some(Some(c)) => {
                         for i in c.iter() {
-                            put(base.add(i as i32 % 32, i as i32 / 32).add_p(p.offset));
+                            put(base.add_p(Point2i::from_chunk_index(i as i32)).add_p(p.offset));
                         }
                     }
-                    None => {
+                    Some(None) | None => {
                         for i in 0..1024i32 {
-                            put(base.add(i % 32, i / 32).add_p(p.offset));
+                            put(base.add_p(Point2i::from_chunk_index(i)).add_p(p.offset));
                         }
                     }
                 }
@@ -673,7 +666,7 @@ fn build_paste_overlay(
                     if let Some(r) = files::parse_mca_file_name(&name) {
                         let base = r.region_to_chunk();
                         for i in 0..1024i32 {
-                            put(base.add(i % 32, i / 32).add_p(p.offset));
+                            put(base.add_p(Point2i::from_chunk_index(i)).add_p(p.offset));
                         }
                     }
                 }
