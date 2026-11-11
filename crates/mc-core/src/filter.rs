@@ -2,9 +2,10 @@
 //! FilterChunks feature. Grammar: `field cmp value [AND|OR field cmp value]*`
 //! with parenthesized groups and `NOT`.
 
+use crate::chunk;
 use crate::mca::Chunk;
 use crate::nbt::{self, Compound, Tag};
-use crate::point::Point2i;
+use crate::valuetext;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Cmp {
@@ -356,49 +357,24 @@ fn num_cmp(cmp: Cmp, a: i64, b: i64) -> bool {
 
 fn set_cmp(cmp: Cmp, a: &[String], b: &[String]) -> bool {
     match cmp {
-        Cmp::Contains => b.iter().all(|x| a.iter().any(|y| y == x || names_eq(y, x))),
-        Cmp::ContainsNot => b.iter().all(|x| !a.iter().any(|y| y == x || names_eq(y, x))),
-        Cmp::Intersects => b.iter().any(|x| a.iter().any(|y| y == x || names_eq(y, x))),
-        Cmp::IntersectsNot => !b.iter().any(|x| a.iter().any(|y| y == x || names_eq(y, x))),
-        Cmp::Eq => b.iter().all(|x| a.iter().any(|y| names_eq(y, x))),
-        Cmp::Ne => !b.iter().all(|x| a.iter().any(|y| names_eq(y, x))),
+        Cmp::Contains => b.iter().all(|x| a.iter().any(|y| y == x || valuetext::names_eq(y, x))),
+        Cmp::ContainsNot => b.iter().all(|x| !a.iter().any(|y| y == x || valuetext::names_eq(y, x))),
+        Cmp::Intersects => b.iter().any(|x| a.iter().any(|y| y == x || valuetext::names_eq(y, x))),
+        Cmp::IntersectsNot => !b.iter().any(|x| a.iter().any(|y| y == x || valuetext::names_eq(y, x))),
+        Cmp::Eq => b.iter().all(|x| a.iter().any(|y| valuetext::names_eq(y, x))),
+        Cmp::Ne => !b.iter().all(|x| a.iter().any(|y| valuetext::names_eq(y, x))),
         _ => false,
     }
 }
 
-fn names_eq(a: &str, b: &str) -> bool {
-    a == b
-        || (!a.contains(':') && format!("minecraft:{a}") == b)
-        || (!b.contains(':') && a == format!("minecraft:{b}"))
-}
-
-fn level<'a>(root: &'a Compound) -> &'a Compound {
-    nbt::level_from_root(root).unwrap_or(root)
-}
-
-fn get_sections<'a>(data: &'a Compound) -> Option<&'a Vec<Tag>> {
-    nbt::section_tags(data)
-}
-
 fn palette_names(data: &Compound) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(secs) = get_sections(data) {
+    if let Some((secs, _)) = chunk::sections(data) {
         for s in secs {
             let Some(sc) = s.as_compound() else { continue };
-            let pal = ["Palette", "palette"]
-                .iter()
-                .find_map(|k| sc.get(*k).and_then(Tag::as_list))
-                .or_else(|| {
-                    sc.get("block_states")
-                        .and_then(Tag::as_compound)
-                        .and_then(|b| b.get("palette"))
-                        .and_then(Tag::as_list)
-                });
-            if let Some((_, l)) = pal {
+            if let Some(l) = chunk::block_palette(sc) {
                 for e in l {
-                    if let Some(name) = palette_name_tag(e) {
-                        out.push(name);
-                    }
+                    out.push(chunk::palette_entry_name(e).to_string());
                 }
             }
         }
@@ -406,33 +382,14 @@ fn palette_names(data: &Compound) -> Vec<String> {
     out
 }
 
-fn palette_name_tag(e: &Tag) -> Option<String> {
-    match e {
-        Tag::Compound(c) => c
-            .get("Name")
-            .or_else(|| c.get(""))
-            .or_else(|| c.get("id"))
-            .and_then(|t| t.as_string())
-            .map(|s| s.to_string()),
-        Tag::String(s) => Some(s.clone()),
-        _ => None,
-    }
-}
-
 fn biome_names(data: &Compound) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(secs) = get_sections(data) {
+    if let Some((secs, _)) = chunk::sections(data) {
         for s in secs {
             let Some(sc) = s.as_compound() else { continue };
-            let mut biomes = sc.get("biomes").and_then(Tag::as_compound);
-            if let Some(pal) = biomes
-                .and_then(|b| b.get("palette"))
-                .and_then(Tag::as_list)
-            {
-                for e in pal.1 {
-                    if let Some(n) = palette_name_tag(e) {
-                        out.push(n);
-                    }
+            if let Some(pal) = chunk::biome_palette(sc) {
+                for e in pal {
+                    out.push(chunk::palette_entry_name(e).to_string());
                 }
             }
         }
@@ -441,52 +398,10 @@ fn biome_names(data: &Compound) -> Vec<String> {
     out
 }
 
-/// first matching list's length across root and Level (upstream VersionHandler
-/// picks exactly one source; summing would double-count).
-fn count_list(data: &Compound, keys: &[&str]) -> i64 {
-    let level = nbt::level_from_root(data);
-    for k in keys {
-        for c in [Some(data), level] {
-            if let Some(Some((_, l))) = c.map(|cc| cc.get(*k).and_then(Tag::as_list)) {
-                return l.len() as i64;
-            }
-        }
-    }
-    0
-}
-
-fn structures(data: &Compound) -> Vec<String> {
-    let mut out = Vec::new();
-    for c in [Some(data), nbt::level_from_root(data)] {
-        let Some(cc) = c else { continue };
-        if let Some(st) = cc.get("structures").and_then(Tag::as_compound) {
-            if let Some(starts) = st.get("starts").and_then(Tag::as_compound) {
-                for (n, v) in starts {
-                    let valid = v
-                        .as_compound()
-                        .and_then(|s| s.get("id"))
-                        .and_then(|t| t.as_string())
-                        .map(|id| !id.is_empty() && id != "INVALID")
-                        .unwrap_or(false);
-                    if valid {
-                        out.push(n.clone());
-                    }
-                }
-            }
-            if let Some(refs) = st.get("References").and_then(Tag::as_compound) {
-                for (n, _) in refs {
-                    out.push(n.clone());
-                }
-            }
-        }
-    }
-    out
-}
-
 impl Filter {
     pub fn matches(&self, c: &Chunk, dv: i32, ctx: &mut FilterCtx) -> bool {
         let Some(data) = &c.data else { return false };
-        let l = level(data);
+        let l = chunk::data_container(data, dv).unwrap_or(data);
         match self {
             Filter::XPos(cmp, v) => {
                 let x = nbt::int_from(Some(l), "xPos", 0);
@@ -511,8 +426,8 @@ impl Filter {
             Filter::Status(cmp, v) => {
                 let s = nbt::string_or(Some(l), "Status", "");
                 match cmp {
-                    Cmp::Eq => names_eq(s, v),
-                    Cmp::Ne => !names_eq(s, v),
+                    Cmp::Eq => valuetext::names_eq(s, v),
+                    Cmp::Ne => !valuetext::names_eq(s, v),
                     _ => false,
                 }
             }
@@ -548,15 +463,15 @@ impl Filter {
                 num_cmp(*cmp, n, *v)
             }
             Filter::ProtoEntityAmount(cmp, v) => {
-                let n = count_list(data, &["entities", "Entities"]);
+                let n = chunk::list_size(data, chunk::ENTITY_LIST_KEYS);
                 num_cmp(*cmp, n, *v)
             }
             Filter::TileEntities(cmp, v) => {
-                let n = count_list(data, &["TileEntities", "block_entities", "tile_entities"]);
+                let n = chunk::list_size(data, chunk::TILE_ENTITY_LIST_KEYS);
                 num_cmp(*cmp, n, *v)
             }
             Filter::Structures(cmp, v) => {
-                let names = structures(data);
+                let names = chunk::structure_starts(data);
                 set_cmp(*cmp, &names, v)
             }
             Filter::Circle(cmp, circles) => {
@@ -649,23 +564,23 @@ fn entities_chunk<'m>(c: &Chunk, ctx: &'m mut FilterCtx) -> Option<(std::rc::Rc<
     Some((m, i))
 }
 
-/// entity ids: entities-dim chunk `Entities` list, else legacy Level.Entities.
+/// entity ids: entities-dim chunk entity list, else legacy Level.Entities.
 fn entity_ids(c: &Chunk, ctx: &mut FilterCtx) -> Vec<String> {
     if let Some((m, i)) = entities_chunk(c, ctx) {
         if let Some(d) = m.chunks[i].as_ref().and_then(|c| c.data.as_ref()) {
-            if let Some(ids) = list_names(d, &["Entities", "entities"], "id") {
+            if let Some(ids) = list_names(d, chunk::ENTITY_LIST_KEYS, "id") {
                 return ids;
             }
         }
     }
     // legacy: region Level.Entities
     let Some(data) = &c.data else { return Vec::new() };
-    if let Some(level) = data.get("Level").and_then(Tag::as_compound) {
-        if let Some(ids) = list_names(level, &["Entities"], "id") {
+    if let Some(level) = nbt::level_from_root(data) {
+        if let Some(ids) = list_names(level, chunk::ENTITY_LIST_KEYS, "id") {
             return ids;
         }
     }
-    list_names(data, &["Entities"], "id").unwrap_or_default()
+    list_names(data, chunk::ENTITY_LIST_KEYS, "id").unwrap_or_default()
 }
 
 fn list_names(data: &Compound, keys: &[&str], field: &str) -> Option<Vec<String>> {
@@ -734,16 +649,7 @@ fn load_player_chunks(
 
 fn read_player_dat(bytes: &[u8]) -> Option<Compound> {
     // player .dat files are gzip-compressed NBT
-    let raw = if bytes.starts_with(&[0x1f, 0x8b]) {
-        crate::mca::decompress(crate::mca::CompressionType::Gzip, bytes).ok()?
-    } else {
-        bytes.to_vec()
-    };
-    let mut r = crate::nbt::NbtReader::new(&raw[..]);
-    match r.read().ok()? {
-        Tag::Compound(c) => Some(c),
-        _ => None,
-    }
+    nbt::read_compressed(bytes)
 }
 
 fn dimension_matches(dim: Option<&Tag>, want: &str) -> bool {
@@ -757,7 +663,7 @@ fn dimension_matches(dim: Option<&Tag>, want: &str) -> bool {
                 "1" | "the_end" | "end" | "minecraft:the_end" => "minecraft:the_end",
                 other => other,
             };
-            s == w || s.strip_prefix("minecraft:") == Some(w.strip_prefix("minecraft:").unwrap_or(w))
+            valuetext::names_eq(s, w)
         }
         _ => want_num.is_none() && want.is_empty(),
     }
@@ -796,8 +702,6 @@ fn tag_str(t: &Tag) -> String {
 
 // ---------------------------------------------------------------------------
 // parser
-
-struct Tok(Vec<String>);
 
 fn tokenize(s: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -923,20 +827,12 @@ fn take(t: &[String], i: &mut usize) -> Option<String> {
     }
 }
 
-fn unquote(s: &str) -> String {
-    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
-        s[1..s.len() - 1].to_string()
-    } else {
-        s.to_string()
-    }
-}
-
 fn split_list(s: &str) -> Vec<String> {
-    s.split(',').map(unquote).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+    s.split(',').map(valuetext::unquote).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
 }
 
 fn num(s: &str) -> Result<i64, String> {
-    unquote(s).parse().map_err(|_| format!("expected number, got {s}"))
+    valuetext::unquote(s).parse().map_err(|_| format!("expected number, got {s}"))
 }
 
 fn make_filter(field: &str, cmp: Cmp, value: &str) -> Result<Filter, String> {
@@ -949,26 +845,26 @@ fn make_filter(field: &str, cmp: Cmp, value: &str) -> Result<Filter, String> {
         "inhabitedtime" => Filter::InhabitedTime(
             cmp,
             num(value).or_else(|_| {
-                crate::overlay::parse_duration(&unquote(value)).map(|d| d * 20)
+                valuetext::parse_duration_ticks(&valuetext::unquote(value))
             })?,
         ),
         "lastupdate" => Filter::LastUpdate(
             cmp,
             num(value).or_else(|_| {
-                crate::overlay::parse_duration(&unquote(value)).map(|d| d * 20)
+                valuetext::parse_duration_ticks(&valuetext::unquote(value))
             })?,
         ),
         "timestamp" => Filter::Timestamp(
             cmp,
             num(value).or_else(|_| {
-                crate::overlay::parse_timestamp(&unquote(value)).map(|t| t as i64)
+                valuetext::parse_timestamp(&valuetext::unquote(value)).map(|t| t as i64)
             })?,
         ),
-        "status" => Filter::Status(cmp, unquote(value)),
+        "status" => Filter::Status(cmp, valuetext::unquote(value)),
         "palette" => Filter::Palette(cmp, split_list(value)),
         "biome" | "biomes" => Filter::Biome(cmp, split_list(value)),
         "compression" => Filter::Compression(cmp, compression_value(value)?),
-        "lightpopulated" => Filter::LightPopulated(cmp, matches!(unquote(value).to_ascii_lowercase().as_str(), "true" | "1" | "yes")),
+        "lightpopulated" => Filter::LightPopulated(cmp, matches!(valuetext::unquote(value).to_ascii_lowercase().as_str(), "true" | "1" | "yes")),
         "entities" | "entity" => {
             // name list (EntityFilter): contains/intersects on entity ids
             Filter::EntityNames(cmp, entity_names(value)?)
@@ -984,7 +880,7 @@ fn make_filter(field: &str, cmp: Cmp, value: &str) -> Result<Filter, String> {
         }
         "border" => Filter::Border(cmp, num(value)?),
         "selection" => {
-            let p = std::path::PathBuf::from(unquote(value));
+            let p = std::path::PathBuf::from(valuetext::unquote(value));
             if !p.is_file() {
                 return Err(format!("selection file not found: {}", p.display()));
             }
@@ -995,7 +891,7 @@ fn make_filter(field: &str, cmp: Cmp, value: &str) -> Result<Filter, String> {
         "structures" | "structure" => Filter::Structures(cmp, split_list(value)),
         "circle" => {
             // Circle contains "x;z;r[,x2;z2;r2,...]"
-            let raw = unquote(value);
+            let raw = valuetext::unquote(value);
             let mut circles = Vec::new();
             for cdef in raw.split(',') {
                 let parts: Vec<&str> = cdef.trim().split(';').collect();
@@ -1014,12 +910,12 @@ fn make_filter(field: &str, cmp: Cmp, value: &str) -> Result<Filter, String> {
         }
         _ => {
             // Custom: arbitrary NBT path
-            let val = if let Ok(v) = unquote(value).parse::<i64>() {
+            let val = if let Ok(v) = valuetext::unquote(value).parse::<i64>() {
                 Tag::Long(v)
-            } else if let Ok(v) = unquote(value).parse::<f64>() {
+            } else if let Ok(v) = valuetext::unquote(value).parse::<f64>() {
                 Tag::Double(v)
             } else {
-                Tag::String(unquote(value))
+                Tag::String(valuetext::unquote(value))
             };
             Filter::Custom(field.to_string(), cmp, val)
         }
@@ -1028,7 +924,7 @@ fn make_filter(field: &str, cmp: Cmp, value: &str) -> Result<Filter, String> {
 
 /// CompressionFilter.setFilterValue: enum name (case-insensitive) or byte.
 fn compression_value(raw: &str) -> Result<i64, String> {
-    let r = unquote(raw).trim().to_string();
+    let r = valuetext::unquote(raw).trim().to_string();
     if let Some(c) = crate::mca::CompressionType::from_name(&r) {
         return Ok(c.to_byte() as i8 as i64);
     }
@@ -1038,19 +934,12 @@ fn compression_value(raw: &str) -> Result<i64, String> {
 
 /// EntityFilter.setFilterValue: comma-separated names; `foo:`/`foo` -> minecraft:foo
 fn entity_names(raw: &str) -> Result<Vec<String>, String> {
-    let unq = unquote(raw);
+    let unq = valuetext::unquote(raw);
     let names: Vec<String> = unq
         .replace(' ', "")
         .split(',')
         .filter(|s| !s.is_empty())
-        .map(|n| {
-            let n = n.trim_matches('\'').to_string();
-            if n.contains(':') {
-                n
-            } else {
-                format!("minecraft:{n}")
-            }
-        })
+        .map(|n| valuetext::normalize_name(n.trim_matches('\'')))
         .collect();
     if names.is_empty() {
         return Err("empty entity list".into());
@@ -1060,7 +949,7 @@ fn entity_names(raw: &str) -> Result<Vec<String>, String> {
 
 /// PlayerLocation/Spawn: "<dir>:<dimension>"
 fn player_filter(cmp: Cmp, raw: &str, spawn: bool) -> Result<Filter, String> {
-    let unq = unquote(raw);
+    let unq = valuetext::unquote(raw);
     let (dir, dim) = unq
         .rsplit_once(':')
         .ok_or_else(|| format!("expected \"<playerdata dir>:<dimension>\", got \"{unq}\""))?;

@@ -2,6 +2,7 @@
 //! Dispatch via floorEntry, like upstream's VersionHandler.
 
 use crate::bitset::BitSet;
+use crate::chunk::{self, PackedData, PackedSrc};
 use crate::colors::{self, ColorConfig};
 use crate::nbt::{self, Compound, Tag};
 
@@ -95,27 +96,7 @@ pub enum ColorMap {
 }
 
 impl ColorMap {
-    /// Modern path: palette-entry name + properties, biome name or legacy id.
-    pub fn get_rgb(
-        &self,
-        name: &str,
-        props: Option<&Compound>,
-        biome: BiomeKey,
-    ) -> u32 {
-        match self {
-            ColorMap::Null => 0,
-            ColorMap::Legacy(_) => 0xFF00_0000,
-            ColorMap::Config(c) => {
-                let biome_name = match biome {
-                    BiomeKey::Name(s) => s,
-                    BiomeKey::Idx(id) => biome_id_to_name(id),
-                };
-                c.get_color(name, biome_name, props).color | 0xFF00_0000
-            }
-        }
-    }
-
-    /// get_rgb with the block-state bitset pre-resolved by the caller
+    /// Modern path: palette-entry name + pre-resolved block-state bitset,
     /// (renderers resolve it once per palette entry).
     pub fn get_rgb_state(&self, name: &str, state: Option<&BitSet>, biome: BiomeKey) -> u32 {
         match self {
@@ -152,56 +133,33 @@ impl ColorMap {
         }
     }
 
-    pub fn is_foliage(&self, name: &str) -> bool {
-        colors::color_properties().foliage.contains(name)
-    }
-    pub fn is_transparent(&self, name: &str) -> bool {
-        colors::color_properties().transparent.contains(name)
-    }
-    pub fn is_water(&self, name: &str) -> bool {
-        colors::color_properties().water.contains(name)
-    }
-    pub fn is_waterlogged(&self, props: Option<&Compound>) -> bool {
-        props
-            .and_then(|p| p.get("waterlogged"))
-            .and_then(|t| t.as_string())
-            .map(|s| s == "true")
-            .unwrap_or(false)
-    }
 }
 
 /// floorEntry dispatch for the color mapping (VersionHandler.getImpl).
 pub fn color_mapping(data_version: i32) -> ColorMap {
     const TABLE: &[(i32, fn() -> &'static ColorConfig)] = &[
-        (1451, colors::cfg_17w47a),
-        (1901, colors::cfg_18w43a),
-        (2200, colors::cfg_19w34a),
-        (2504, colors::cfg_20w06a),
-        (2681, colors::cfg_20w45a),
-        (2834, colors::cfg_21w37a),
-        (3080, colors::cfg_22w11a),
-        (3207, colors::cfg_23w12a),
-        (3940, colors::cfg_24w18a),
-        (4536, colors::cfg_25w32a),
-        (4764, colors::cfg_26_1_s1),
-        (4883, colors::cfg_26_2_s1),
-        (4998, colors::cfg_26_3_s1),
+        (chunk::DV_17W47A, colors::cfg_17w47a),
+        (chunk::DV_18W43A, colors::cfg_18w43a),
+        (chunk::DV_19W34A, colors::cfg_19w34a),
+        (chunk::DV_20W06A, colors::cfg_20w06a),
+        (chunk::DV_20W45A, colors::cfg_20w45a),
+        (chunk::DV_21W37A, colors::cfg_21w37a),
+        (chunk::DV_22W11A, colors::cfg_22w11a),
+        (chunk::DV_23W12A, colors::cfg_23w12a),
+        (chunk::DV_24W18A, colors::cfg_24w18a),
+        (chunk::DV_25W32A, colors::cfg_25w32a),
+        (chunk::DV_26_1_S1, colors::cfg_26_1_s1),
+        (chunk::DV_26_2_S1, colors::cfg_26_2_s1),
+        (chunk::DV_26_3_S1, colors::cfg_26_3_s1),
     ];
-    if data_version < 100 {
+    if data_version < chunk::DV_15W32A {
         return ColorMap::Null;
     }
-    if data_version < 1451 {
+    if data_version < chunk::DV_17W47A {
         return ColorMap::Legacy(legacy_colors());
     }
-    let mut i = 0;
-    for (k, _) in TABLE {
-        if *k <= data_version {
-            i += 1;
-        } else {
-            break;
-        }
-    }
-    ColorMap::Config(TABLE[i - 1].1())
+    let (_, f) = chunk::dv_floor_key(TABLE, data_version).unwrap();
+    ColorMap::Config(f())
 }
 
 // ---------------------------------------------------------------------------
@@ -224,56 +182,24 @@ pub enum ChunkFormat {
 
 pub fn chunk_format(data_version: i32) -> ChunkFormat {
     const TABLE: &[(i32, ChunkFormat)] = &[
-        (100, ChunkFormat::Legacy15w32a),
-        (1451, ChunkFormat::P17w47a),
-        (1466, ChunkFormat::P18w06a),
-        (2203, ChunkFormat::P19w36a),
-        (2529, ChunkFormat::P20w17a),
-        (2694, ChunkFormat::P21w06a),
-        (2709, ChunkFormat::P21w15a),
-        (2834, ChunkFormat::P21w37a),
-        (2844, ChunkFormat::P21w43a),
-        (5009, ChunkFormat::P26_3s7),
+        (chunk::DV_15W32A, ChunkFormat::Legacy15w32a),
+        (chunk::DV_17W47A, ChunkFormat::P17w47a),
+        (chunk::DV_18W06A, ChunkFormat::P18w06a),
+        (chunk::DV_19W36A, ChunkFormat::P19w36a),
+        (chunk::DV_20W17A, ChunkFormat::P20w17a),
+        (chunk::DV_21W06A, ChunkFormat::P21w06a),
+        (chunk::DV_21W15A, ChunkFormat::P21w15a),
+        (chunk::DV_21W37A, ChunkFormat::P21w37a),
+        (chunk::DV_21W43A, ChunkFormat::P21w43a),
+        (chunk::DV_26_3_S7, ChunkFormat::P26_3s7),
     ];
-    let mut fmt = ChunkFormat::Null;
-    for (k, f) in TABLE {
-        if *k <= data_version {
-            fmt = *f;
-        } else {
-            break;
-        }
-    }
-    fmt
+    chunk::dv_floor_key(TABLE, data_version)
+        .map(|(_, f)| *f)
+        .unwrap_or(ChunkFormat::Null)
 }
 
 // ---------------------------------------------------------------------------
 // helpers
-
-#[inline]
-pub(crate) fn packed_get(data: Option<&[u8]>, index: usize, bits: usize, indexes_per_long: usize) -> u64 {
-    let Some(d) = data else { return 0 };
-    let li = index / indexes_per_long;
-    let start_bit = (index % indexes_per_long) * bits;
-    let v = nbt::raw_i64_or(d, li, 0) as u64;
-    (v >> start_bit) & ((1u64 << bits) - 1)
-}
-
-pub(crate) fn palette_name<'a>(entry: Option<&'a Tag>, format: ChunkFormat) -> &'a str {
-    match entry {
-        Some(Tag::Compound(c)) => {
-            if format == ChunkFormat::P26_3s7 {
-                c.get("")
-                    .or_else(|| c.get("id"))
-                    .and_then(|t| t.as_string())
-                    .unwrap_or("")
-            } else {
-                nbt::string_or(Some(c), "Name", "")
-            }
-        }
-        Some(Tag::String(s)) => s.as_str(),
-        _ => "",
-    }
-}
 
 fn palette_props<'a>(entry: Option<&'a Tag>) -> Option<&'a Compound> {
     match entry {
@@ -284,14 +210,11 @@ fn palette_props<'a>(entry: Option<&'a Tag>) -> Option<&'a Compound> {
 
 // --- resolved palette entries ------------------------------------------------
 //
-// The old inner loop re-did all of this per block visit: Compound lookups for
-// "Name"/"Properties" (IndexMap string hashing), HashSet<String> lookups for
-// transparent/water/foliage and a waterlogged string compare, plus a BitSet
-// allocation inside get_state for every column. All of it depends only on the
-// palette entry. The name/props flags are resolved once per palette slot when
-// a section is built; the color-mapping part (state bitset + rgb) is resolved
-// lazily on first hit via PalEntry.cell, and whole sections are built lazily
-// via SectionSlot.built.
+// The per-block lookups (name/properties hashing, transparent/water/foliage
+// sets, waterlogged, state bitset) depend only on the palette entry. Name/props
+// flags are resolved once per palette slot when a section is built; the
+// color-mapping part (state bitset + rgb) is resolved lazily on first hit via
+// PalEntry.cell, and whole sections are built lazily via SectionSlot.built.
 
 const F_TRANSPARENT: u8 = 0b0001;
 const F_WATER: u8 = 0b0010;
@@ -406,10 +329,9 @@ fn resolve_color(cm: &ColorMap, name: &str, props: Option<&Compound>) -> CellVal
     }
 }
 
-/// What the old code produced for a missing/empty palette entry: name ""
-/// (not transparent, not water, not foliage; the cell resolves to
-/// MISSING_COLOR -> opaque white for Config mappings, 0 for Null,
-/// 0xFF000000 for Legacy).
+/// The entry for a missing/empty palette slot: name "" (not transparent,
+/// not water, not foliage; the cell resolves to MISSING_COLOR -> opaque
+/// white for Config mappings, 0 for Null, 0xFF000000 for Legacy).
 fn oob_entry() -> PalEntry<'static> {
     PalEntry {
         name: "",
@@ -422,21 +344,16 @@ fn oob_entry() -> PalEntry<'static> {
 struct IndexedSection<'a> {
     /// resolved block palette; entry i is block palette index i.
     entries: Vec<PalEntry<'a>>,
-    /// raw packed block data (BE longs); absent/short => uniform section,
-    /// every block reads entries[0]. Longs are read on demand — the column
-    /// scan only touches a handful of words per column.
-    data: Option<&'a [u8]>,
-    bits: usize,
-    indexes_per_long: usize,
+    /// packed block data; absent/short (bits == 0) => uniform section,
+    /// every block reads entries[0].
+    block: PackedData<'a>,
     /// resolved biome names for the 4x4x4 cells ([yq*16+zq*4+xq]) — built on
     /// the first tinted hit; an empty resolved table means the packed
     /// encoding is pathological and get_biome_packed must be used.
     biome_names: std::cell::OnceCell<Vec<&'a str>>,
     // raw biome palette kept for the pathological-bipl fallback path only.
     biome_palette: &'a [Tag],
-    biome_data: Option<&'a [u8]>,
-    biome_bits: usize,
-    biome_indexes_per_long: usize,
+    biome: PackedData<'a>,
     start_height: i32,
     section_height: i32,
     /// provable "every block maps to a transparent entry" => sections can be
@@ -489,14 +406,12 @@ fn biome_at<'a>(
     y_min: i32,
 ) -> BiomeKey<'a> {
     if modern {
-        let names = s
-            .biome_names
-            .get_or_init(|| build_biome_names(s, format));
+        let names = s.biome_names.get_or_init(|| build_biome_names(s));
         if !names.is_empty() {
             let bi = ((cy as usize >> 2) & 0xF) * 16 + ((cz >> 2) & 0xF) * 4 + ((cx >> 2) & 0xF);
             BiomeKey::Name(names.get(bi).copied().unwrap_or(""))
         } else {
-            BiomeKey::Name(get_biome_packed(s, cx, cy as usize, cz, format))
+            BiomeKey::Name(get_biome_packed(s, cx, cy as usize, cz))
         }
     } else {
         BiomeKey::Idx(biome_int(
@@ -510,53 +425,45 @@ fn biome_at<'a>(
     }
 }
 
-/// fallback for pathological biome packings (biome_indexes_per_long == 0);
-/// identical to the old per-call implementation.
-fn get_biome_packed<'a>(s: &IndexedSection<'a>, x: usize, y: usize, z: usize, format: ChunkFormat) -> &'a str {
-    if s.biome_palette.is_empty() {
-        return "";
-    }
-    if s.biome_bits == 0 || s.biome_data.is_none() {
-        return palette_name(s.biome_palette.first(), format);
+/// fallback for pathological biome packings (bits >= 64).
+fn get_biome_packed<'a>(s: &IndexedSection<'a>, x: usize, y: usize, z: usize) -> &'a str {
+    if s.biome_palette.is_empty() || s.biome.bits == 0 {
+        return s
+            .biome_palette
+            .first()
+            .map(chunk::palette_entry_name)
+            .unwrap_or("");
     }
     let index = (y >> 2 & 0xF) * 16 + (z >> 2 & 0xF) * 4 + (x >> 2 & 0xF);
-    let pal_idx = packed_get(s.biome_data, index, s.biome_bits, s.biome_indexes_per_long) as usize;
-    palette_name(s.biome_palette.get(pal_idx), format)
+    let pal_idx = s.biome.get(index) as usize;
+    s.biome_palette
+        .get(pal_idx)
+        .map(chunk::palette_entry_name)
+        .unwrap_or("")
 }
 
 /// Resolves the 64 biome cells once, on the first tinted hit. Returns an
-/// empty Vec for pathological packings (bb >= 64) — biome_at then uses
-/// get_biome_packed per call, matching the old eager code including its
-/// panic behaviour on corrupt data.
-fn build_biome_names<'a>(s: &IndexedSection<'a>, format: ChunkFormat) -> Vec<&'a str> {
-    if s.biome_bits >= 64 {
+/// empty Vec for pathological packings (bits >= 64) — biome_at then uses
+/// get_biome_packed per call.
+fn build_biome_names<'a>(s: &IndexedSection<'a>) -> Vec<&'a str> {
+    if s.biome.bits >= 64 {
         return Vec::new();
+    }
+    fn name<'a>(e: Option<&'a Tag>) -> &'a str {
+        e.map(chunk::palette_entry_name).unwrap_or("")
     }
     let mut v = Vec::with_capacity(64);
     if s.biome_palette.is_empty() {
         v.resize(64, "");
-    } else if s.biome_bits == 0 || s.biome_data.is_none() {
-        v.resize(64, palette_name(s.biome_palette.first(), format));
+    } else if s.biome.bits == 0 {
+        v.resize(64, name(s.biome_palette.first()));
     } else {
         for i in 0..64 {
-            let pi = packed_get(s.biome_data, i, s.biome_bits, s.biome_indexes_per_long) as usize;
-            v.push(palette_name(s.biome_palette.get(pi), format));
+            let pi = s.biome.get(i) as usize;
+            v.push(name(s.biome_palette.get(pi)));
         }
     }
     v
-}
-
-/// Read one BE u64 out of raw packed long[] data; 0 when out of range —
-/// the same result the old decoded-Vec `longs.get(li).unwrap_or(0)` gave
-/// (chunks_exact(8) never emitted a partial tail long either).
-#[inline]
-fn packed_u64(data: Option<&[u8]>, li: usize) -> u64 {
-    match data {
-        Some(d) if li < d.len() >> 3 => {
-            u64::from_be_bytes(d[li * 8..li * 8 + 8].try_into().unwrap())
-        }
-        _ => 0,
-    }
 }
 
 /// rgb of a resolved entry; the color is resolved on first hit and biome
@@ -635,25 +542,9 @@ fn biome_int(biomes: Option<&[u8]>, x: usize, y: i32, z: usize, format: ChunkFor
     }
 }
 
-fn sections_and_level<'a>(
-    root: &'a Compound,
-    format: ChunkFormat,
-) -> (Option<&'a Compound>, Option<(u8, &'a Vec<Tag>)>, i32) {
-    match format {
-        ChunkFormat::P21w37a | ChunkFormat::P21w43a | ChunkFormat::P26_3s7 => {
-            let y_min = nbt::int_from(Some(root), "yPos", -4);
-            (Some(root), nbt::sections_from(Some(root), "sections"), y_min)
-        }
-        _ => {
-            let level = nbt::level_from_root(root);
-            let secs = nbt::sections_from(level, "Sections");
-            let y_min = nbt::int_from(level.or(Some(root)), "yPos", -4);
-            (level, secs, y_min)
-        }
-    }
-}
-
-/// modern chunk NBT layout (sections/biomes at root, not under Level).
+/// section internals are the 21w37a+ layout (per-section block_states/
+/// biomes compounds). NOTE: the section *list* stays under Level until
+/// 21w43a — locating it is chunk::sections' job.
 pub fn is_modern(format: ChunkFormat) -> bool {
     matches!(
         format,
@@ -661,8 +552,17 @@ pub fn is_modern(format: ChunkFormat) -> bool {
     )
 }
 
+/// spanning packed block-state layout (before the 20w17a non-spanning
+/// layout); Legacy15w32a never reaches the packed paths.
+fn is_spanning(format: ChunkFormat) -> bool {
+    matches!(
+        format,
+        ChunkFormat::P17w47a | ChunkFormat::P18w06a | ChunkFormat::P19w36a
+    )
+}
+
 fn index_sections<'a>(
-    sections: Option<(u8, &'a Vec<Tag>)>,
+    sections: Option<&'a Vec<Tag>>,
     format: ChunkFormat,
     height: i32,
     y_min: i32,
@@ -675,7 +575,7 @@ fn index_sections<'a>(
     };
     let s_max = (hi - lo).max(0) as usize;
     let mut indexed: Vec<Option<SectionSlot>> = std::iter::repeat_with(|| None).take(s_max).collect();
-    let Some((_, list)) = sections else { return indexed };
+    let Some(list) = sections else { return indexed };
     for t in list {
         let Some(s) = t.as_compound() else { continue };
         let y = s
@@ -719,14 +619,17 @@ fn build_section<'a>(
     start_height: i32,
     section_height: i32,
 ) -> IndexedSection<'a> {
-    let (palette, data): (&'a [Tag], Option<&'a [u8]>) = if modern {
+    fn raw<'a>(t: Option<&'a Tag>) -> PackedSrc<'a> {
+        t.and_then(|t| t.as_bytes()).map(PackedSrc::Raw).unwrap_or_default()
+    }
+    let (palette, block_src): (&'a [Tag], PackedSrc<'a>) = if modern {
         let bs = s.get("block_states").and_then(Tag::as_compound);
         (
             bs.and_then(|b| b.get("palette"))
                 .and_then(Tag::as_list)
                 .map(|(_, l)| l.as_slice())
                 .unwrap_or_default(),
-            bs.and_then(|b| b.get("data")).and_then(|t| t.as_bytes()),
+            raw(bs.and_then(|b| b.get("data"))),
         )
     } else {
         (
@@ -734,34 +637,33 @@ fn build_section<'a>(
                 .and_then(Tag::as_list)
                 .map(|(_, l)| l.as_slice())
                 .unwrap_or_default(),
-            s.get("BlockStates").and_then(|t| t.as_bytes()),
+            raw(s.get("BlockStates")),
         )
     };
-    let bits = data.map(|d| d.len() >> 9).unwrap_or(0);
-    let ipl = if bits == 0 { 1 } else { (64.0 / bits as f64) as usize };
-    let (biome_palette, biome_data): (&'a [Tag], Option<&'a [u8]>) = if modern {
+    let block = PackedData::with_bits(block_src, block_src.n_longs() >> 6, is_spanning(format));
+    let (biome_palette, biome_src): (&'a [Tag], PackedSrc<'a>) = if modern {
         let bc = s.get("biomes").and_then(Tag::as_compound);
         (
             bc.and_then(|b| b.get("palette"))
                 .and_then(Tag::as_list)
                 .map(|(_, l)| l.as_slice())
                 .unwrap_or_default(),
-            bc.and_then(|b| b.get("data")).and_then(|t| t.as_bytes()),
+            raw(bc.and_then(|b| b.get("data"))),
         )
     } else {
-        (&[], None)
+        (&[], PackedSrc::default())
     };
-    let bb = biome_data.map(|d| d.len() >> 3).unwrap_or(0);
-    let bipl = if bb == 0 { 1 } else { (64.0 / bb as f64) as usize };
+    // biome packed bits = number of longs (upstream biomeBits).
+    let biome = PackedData::with_bits(biome_src, biome_src.n_longs(), false);
 
     let entries: Vec<PalEntry> = palette
         .iter()
-        .map(|t| resolve_entry(palette_name(Some(t), format), palette_props(Some(t))))
+        .map(|t| resolve_entry(chunk::palette_entry_name(t), palette_props(Some(t))))
         .collect();
     // every palette index the packed data can produce must be in range for a
     // whole-section skip to be sound (oob entries resolve as opaque).
-    let no_oob =
-        bits == 0 || (bits < 64 && entries.len() >= (1usize << bits));
+    let bits = block.bits;
+    let no_oob = bits == 0 || (bits < 64 && entries.len() >= (1usize << bits));
     let all_transparent = no_oob
         && !entries.is_empty()
         && entries.iter().all(|e| e.flags & F_TRANSPARENT != 0);
@@ -772,14 +674,10 @@ fn build_section<'a>(
             .all(|e| e.flags & (F_TRANSPARENT | F_FOLIAGE) != 0);
     IndexedSection {
         entries,
-        data,
-        bits,
-        indexes_per_long: ipl,
+        block,
         biome_names: std::cell::OnceCell::new(),
         biome_palette,
-        biome_data,
-        biome_bits: bb,
-        biome_indexes_per_long: bipl,
+        biome,
         start_height,
         section_height,
         all_transparent,
@@ -813,17 +711,18 @@ pub fn draw_chunk(
         ChunkFormat::Legacy15w32a => return draw_chunk_legacy(root, cm, x, z, scale, out),
         _ => {}
     }
-    let (level, sections, y_min) = sections_and_level(root, format);
+    let Some((list, container)) = chunk::sections(root) else { return };
+    let y_min = nbt::int_from(Some(container), "yPos", -4);
     let modern = is_modern(format);
     let height = out.height;
-    let indexed = index_sections(sections, format, height, y_min);
+    let indexed = index_sections(Some(list), format, height, y_min);
     if indexed.is_empty() {
         return;
     }
     let chunk_biomes = if modern {
         None
     } else {
-        level.and_then(|l| l.get("Biomes")).and_then(|t| t.as_bytes())
+        container.get("Biomes").and_then(|t| t.as_bytes())
     };
     let scale_bits = scale.ilog2() as i32;
     let abs_h = if modern {
@@ -841,7 +740,6 @@ pub fn draw_chunk(
         'zloop: for cz in (0..16usize).step_by(scale as usize) {
             let pixel_index = (z + (cz >> scale_bits)) * row + (x + (cx >> scale_bits));
             let mut water_depth = false;
-            let col = cz * 16 + cx;
             // top-down section sequence; a rev+flatten iterator rebuilds the
             // same order per column without a per-chunk Vec allocation.
             for slot in indexed[..=start].iter().rev().flatten() {
@@ -849,31 +747,19 @@ pub fn draw_chunk(
                 if s.all_transparent {
                     continue;
                 }
-                // packed-data cursor: block index = y*256 + z*16 + x, so
-                // stepping y by -1 always subtracts exactly 256 — the long
-                // index / bit offset can be updated incrementally without a
-                // division per block.
-                let uniform = s.bits == 0;
-                let ipl = s.indexes_per_long;
-                let top_index = s.start_height as usize * 256 + col;
-                let mut li = top_index / ipl;
-                let mut rem = top_index % ipl;
-                let step_li = 256 / ipl;
-                let step_rem = 256 % ipl;
-                let mask = (1u64 << s.bits) - 1;
+                // packed-data cursor: stepping y by -1 subtracts exactly 256
+                // indexes — the cursor tracks the long/bit offset
+                // incrementally (chunk::PackedCursor).
+                let uniform = s.block.bits == 0;
+                let top_index = chunk::location_to_index(cx, s.start_height as usize, cz);
+                let mut cur = s.block.cursor(top_index, 256);
                 for cy in (0..=s.start_height).rev() {
                     let e = if uniform {
                         s.entries.first().unwrap_or(&oob)
                     } else {
-                        let v = packed_u64(s.data, li);
-                        let pi = ((v >> (rem * s.bits)) & mask) as usize;
+                        let pi = cur.get() as usize;
                         if cy > 0 {
-                            if rem < step_rem {
-                                rem += ipl;
-                                li -= 1;
-                            }
-                            rem -= step_rem;
-                            li -= step_li;
+                            cur.prev();
                         }
                         s.entries.get(pi).unwrap_or(&oob)
                     };
@@ -961,10 +847,10 @@ pub fn draw_layer(
     if format == ChunkFormat::Null || format == ChunkFormat::Legacy15w32a {
         return;
     }
-    let (level, sections, y_min) = sections_and_level(root, format);
+    let Some((list, container)) = chunk::sections(root) else { return };
+    let y_min = nbt::int_from(Some(container), "yPos", -4);
     let modern = is_modern(format);
     let target_y = if modern { height >> 4 } else { height.clamp(0, 255) >> 4 };
-    let Some((_, list)) = sections else { return };
     let mut target: Option<&Compound> = None;
     for t in list {
         let Some(s) = t.as_compound() else { continue };
@@ -978,7 +864,7 @@ pub fn draw_layer(
     let chunk_biomes = if modern {
         None
     } else {
-        level.and_then(|l| l.get("Biomes")).and_then(|t| t.as_bytes())
+        container.get("Biomes").and_then(|t| t.as_bytes())
     };
     let scale_bits = scale.ilog2() as i32;
     let abs_h = if modern {
@@ -989,15 +875,13 @@ pub fn draw_layer(
     let cy = (abs_h & 0xF) as usize;
     let oob = oob_entry();
     let mut memo = RgbMemo::default();
-    let mask = (1u64 << s.bits) - 1;
     for cx in (0..16usize).step_by(scale as usize) {
         for cz in (0..16usize).step_by(scale as usize) {
-            let index = cy * 256 + cz * 16 + cx;
-            let e = if s.bits == 0 {
+            let index = chunk::location_to_index(cx, cy, cz);
+            let e = if s.block.bits == 0 {
                 s.entries.first().unwrap_or(&oob)
             } else {
-                let v = packed_u64(s.data, index / s.indexes_per_long);
-                let pi = ((v >> ((index % s.indexes_per_long) * s.bits)) & mask) as usize;
+                let pi = s.block.get(index) as usize;
                 s.entries.get(pi).unwrap_or(&oob)
             };
             if e.flags & F_TRANSPARENT != 0 {
@@ -1026,13 +910,17 @@ pub fn draw_caves(
     if format == ChunkFormat::Null || format == ChunkFormat::Legacy15w32a {
         return;
     }
-    let (level, sections, y_min) = sections_and_level(root, format);
+    let (sections_opt, container) = match chunk::sections(root) {
+        Some((l, c)) => (Some(l), c),
+        None => (None, root),
+    };
+    let y_min = nbt::int_from(Some(container), "yPos", -4);
     let modern = is_modern(format);
-    let indexed = index_sections(sections, format, height, y_min);
+    let indexed = index_sections(sections_opt, format, height, y_min);
     let chunk_biomes = if modern {
         None
     } else {
-        level.and_then(|l| l.get("Biomes")).and_then(|t| t.as_bytes())
+        container.get("Biomes").and_then(|t| t.as_bytes())
     };
     let scale_bits = scale.ilog2() as i32;
     let abs_h = if modern {
@@ -1049,34 +937,22 @@ pub fn draw_caves(
                 (z + (cz >> scale_bits)) * (512 >> scale_bits) + (x + (cx >> scale_bits));
             let mut ignored = 0;
             let mut done_skipping = false;
-            let col = cz * 16 + cx;
             // same flattened top-down order for every column, no Vec needed.
             for slot in indexed[..=start].iter().rev().flatten() {
                 let s = slot.get();
                 if s.caves_inert {
                     continue;
                 }
-                let uniform = s.bits == 0;
-                let ipl = s.indexes_per_long;
-                let top_index = s.start_height as usize * 256 + col;
-                let mut li = top_index / ipl;
-                let mut rem = top_index % ipl;
-                let step_li = 256 / ipl;
-                let step_rem = 256 % ipl;
-                let mask = (1u64 << s.bits) - 1;
+                let uniform = s.block.bits == 0;
+                let top_index = chunk::location_to_index(cx, s.start_height as usize, cz);
+                let mut cur = s.block.cursor(top_index, 256);
                 for cy in (0..=s.start_height).rev() {
                     let e = if uniform {
                         s.entries.first().unwrap_or(&oob)
                     } else {
-                        let v = packed_u64(s.data, li);
-                        let pi = ((v >> (rem * s.bits)) & mask) as usize;
+                        let pi = cur.get() as usize;
                         if cy > 0 {
-                            if rem < step_rem {
-                                rem += ipl;
-                                li -= 1;
-                            }
-                            rem -= step_rem;
-                            li -= step_li;
+                            cur.prev();
                         }
                         s.entries.get(pi).unwrap_or(&oob)
                     };
@@ -1113,10 +989,7 @@ fn draw_chunk_legacy(
     scale: i32,
     out: &mut RenderOut,
 ) {
-    let Some(level) = nbt::level_from_root(root) else { return };
-    let Some((_, sections)) = nbt::sections_from(Some(level), "Sections") else {
-        return;
-    };
+    let Some((sections, level)) = chunk::sections(root) else { return };
     let height = out.height.clamp(0, 255);
     let y_max = 1 + (height >> 4);
     let mut indexed: Vec<Option<(&[u8], &[u8])>> = vec![None; y_max as usize];
@@ -1148,7 +1021,7 @@ fn draw_chunk_legacy(
                 };
                 let start = if (height >> 4) == i { height & 0xF } else { 15 };
                 for cy in (0..=start).rev() {
-                    let index = (cy as usize) * 256 + cz * 16 + cx;
+                    let index = chunk::location_to_index(cx, cy as usize, cz);
                     let block = blocks.get(index).copied().unwrap_or(0) as i32;
                     let data = ((if index & 1 == 0 {
                         block_data.get(index >> 1).copied().unwrap_or(0)

@@ -6,7 +6,6 @@ actions!(
         QuitAction,
         OpenWorldAction,
         OpenDimensionAction,
-        OpenRecentAction,
         SettingsAction,
         RenderSettingsAction,
         ReloadAction,

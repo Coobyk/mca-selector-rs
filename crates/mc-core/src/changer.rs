@@ -19,25 +19,12 @@
 //! - `LightPopulated` replicates upstream's `putLong` quirk for the legacy
 //!   `LightPopulated` / `isLightOn` tags.
 
+use crate::chunk::{self, PackedData, PackedSrc};
+pub use crate::chunk::ChunkRefs;
 use crate::mca::{Chunk, CompressionType};
 use crate::nbt::{self, Compound, Tag};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
-
-// data-version boundaries for version dispatch (upstream MCVersionImplementation)
-const DV_17W47A: i32 = 1451; // palette-based sections (Level.Sections: Palette/BlockStates)
-const DV_18W06A: i32 = 1466; // Level.Status, int biomes, Heightmaps compound
-const DV_19W02A: i32 = 1921; // isLightOn byte replaces LightPopulated
-const DV_19W36A: i32 = 2203; // 3d int biomes (Level.Biomes int[1024])
-const DV_20W17A: i32 = 2529; // non-spanning packed block-state layout
-const DV_20W45A: i32 = 2681; // entities moved to entities/*.mca
-const DV_21W06A: i32 = 2694; // sectionRange-based heightmaps
-const DV_21W37A: i32 = 2834; // per-section biomes/block_states compounds (still under Level)
-const DV_21W43A: i32 = 2844; // Level flattened into root
-const DV_23W12A: i32 = 3458; // namespaced Status values
-const DV_1_21_5: i32 = 4317; // ForceBlend -> set DataVersion 4189
-const DV_25W09A: i32 = 4324; // back to blending_data
-const DV_26_3_S7: i32 = 5009; // string palettes / "id" key
 
 const T_STRING: u8 = 8;
 const T_COMPOUND: u8 = 10;
@@ -181,7 +168,7 @@ impl BlockReplace {
     fn get_state(&self, dv: i32) -> Compound {
         let mut s = self.state.clone();
         if matches!(self.kind, ReplaceKind::Name | ReplaceKind::NameTile) {
-            let key = if dv >= DV_26_3_S7 { "id" } else { "Name" };
+            let key = if dv >= chunk::DV_26_3_S7 { "id" } else { "Name" };
             let n = nbt::string_or(Some(&self.state), "Name", "").to_string();
             s.insert(key.into(), Tag::String(n));
         }
@@ -683,14 +670,6 @@ fn parse_custom(s: &str) -> Result<FieldValue, String> {
 
 // -------------------------------------------------------------- public API
 
-/// the region/poi/entities triple of one chunk column (upstream ChunkData).
-#[derive(Default)]
-pub struct ChunkRefs<'a> {
-    pub region: Option<&'a mut Chunk>,
-    pub poi: Option<&'a mut Chunk>,
-    pub entities: Option<&'a mut Chunk>,
-}
-
 #[derive(Default, Debug)]
 pub struct ChangeResult {
     /// fields that ran without error
@@ -863,7 +842,7 @@ fn get_data_version_tag(root: &Compound) -> Option<&Tag> {
 
 /// Helper.setDataVersion
 fn set_data_version(root: &mut Compound, dv: i32) {
-    if dv < 111 {
+    if dv < chunk::DV_LEVEL_DATAVERSION {
         if let Some(l) = level_mut(root) {
             l.insert("DataVersion".into(), Tag::Int(dv));
         }
@@ -871,58 +850,34 @@ fn set_data_version(root: &mut Compound, dv: i32) {
     root.insert("DataVersion".into(), Tag::Int(dv));
 }
 
-fn compound_at<'a>(root: &'a Compound, dv: i32) -> Option<&'a Compound> {
-    if dv >= DV_21W43A {
-        Some(root)
-    } else {
-        level(root)
-    }
-}
-
-fn compound_at_mut<'a>(root: &'a mut Compound, dv: i32) -> Option<&'a mut Compound> {
-    if dv >= DV_21W43A {
-        Some(root)
-    } else {
-        level_mut(root)
-    }
-}
-
 /// simple scalar field living on Level (legacy) or root (flat).
 fn scalar_field(root: &mut Compound, dv: i32, key: &str, tag: Tag, force: bool) {
-    if !force && compound_at(root, dv).and_then(|c| c.get(key)).is_none() {
+    if !force && chunk::data_container(root, dv).and_then(|c| c.get(key)).is_none() {
         return;
     }
-    if let Some(c) = compound_at_mut(root, dv) {
+    if let Some(c) = chunk::data_container_mut(root, dv) {
         c.insert(key.into(), tag);
     }
 }
 
 fn get_status(root: &Compound, dv: i32) -> Option<String> {
-    if dv < DV_18W06A {
+    if dv < chunk::DV_18W06A {
         return None;
     }
-    compound_at(root, dv)
+    chunk::data_container(root, dv)
         .and_then(|c| c.get("Status"))
         .and_then(|t| t.as_string())
         .map(str::to_string)
 }
 
 fn set_status(root: &mut Compound, dv: i32, bare: &str, namespaced: &str) {
-    let v = if dv >= DV_23W12A {
+    let v = if dv >= chunk::DV_NAMESPACED_STATUS {
         namespaced.to_string()
     } else {
         bare.to_string()
     };
-    if let Some(c) = compound_at_mut(root, dv) {
+    if let Some(c) = chunk::data_container_mut(root, dv) {
         c.insert("Status".into(), Tag::String(v));
-    }
-}
-
-fn sections_key(dv: i32) -> &'static str {
-    if dv >= DV_21W43A {
-        "sections"
-    } else {
-        "Sections"
     }
 }
 
@@ -954,14 +909,6 @@ fn as_byte_array(t: &Tag) -> Option<&Vec<u8>> {
     }
 }
 
-fn sections<'a>(root: &'a Compound, dv: i32) -> Option<&'a Vec<Tag>> {
-    as_list(compound_at(root, dv)?.get(sections_key(dv))?)
-}
-
-fn sections_mut<'a>(root: &'a mut Compound, dv: i32) -> Option<&'a mut Vec<Tag>> {
-    as_list_mut(compound_at_mut(root, dv)?.get_mut(sections_key(dv))?)
-}
-
 fn section_y(s: &Compound) -> i64 {
     nbt::int_from(Some(s), "Y", 0) as i64
 }
@@ -980,14 +927,14 @@ fn fix_status(root: &mut Compound) {
     if status != "empty" && status != "minecraft:empty" {
         return;
     }
-    if sections(root, dv).map(|s| !s.is_empty()).unwrap_or(false) {
+    if chunk::sections_dv(root, dv).map(|s| !s.is_empty()).unwrap_or(false) {
         set_status(root, dv, "full", "minecraft:full");
     }
 }
 
 fn light_populated(root: &mut Compound, v: i8, force: bool) {
     let dv = nbt::data_version(Some(root));
-    if dv < DV_18W06A {
+    if dv < chunk::DV_18W06A {
         // legacy Level.LightPopulated; upstream writes it with putLong (bug)
         let exists = level(root).and_then(|l| l.get("LightPopulated")).is_some();
         if !force && !exists {
@@ -996,9 +943,9 @@ fn light_populated(root: &mut Compound, v: i8, force: bool) {
         if let Some(l) = level_mut(root) {
             l.insert("LightPopulated".into(), Tag::Long(v as i64));
         }
-    } else if dv < DV_19W02A {
+    } else if dv < chunk::DV_19W02A {
         // ChunkFilter_18w45a: no-op
-    } else if dv < DV_21W43A {
+    } else if dv < chunk::DV_21W43A {
         let exists = level(root).and_then(|l| l.get("isLightOn")).is_some();
         if !force && !exists {
             return;
@@ -1016,20 +963,20 @@ fn light_populated(root: &mut Compound, v: i8, force: bool) {
 
 fn remove_lighting(root: &mut Compound) {
     let dv = nbt::data_version(Some(root));
-    if dv < DV_18W06A {
+    if dv < chunk::DV_18W06A {
         if let Some(l) = level_mut(root) {
             l.swap_remove("LightPopulated");
         }
-    } else if dv < DV_19W02A {
+    } else if dv < chunk::DV_19W02A {
         // only section arrays are removed on this branch
-    } else if dv < DV_21W43A {
+    } else if dv < chunk::DV_21W43A {
         if let Some(l) = level_mut(root) {
             l.insert("isLightOn".into(), Tag::Byte(0));
         }
     } else {
         root.insert("isLightOn".into(), Tag::Byte(0));
     }
-    if let Some(secs) = sections_mut(root, dv) {
+    if let Some(secs) = chunk::sections_dv_mut(root, dv) {
         for s in secs.iter_mut().filter_map(|t| t.as_compound_mut()) {
             s.swap_remove("BlockLight");
             s.swap_remove("SkyLight");
@@ -1039,15 +986,15 @@ fn remove_lighting(root: &mut Compound) {
 
 fn force_blend(root: &mut Compound) {
     let dv = nbt::data_version(Some(root));
-    if dv < DV_21W43A {
+    if dv < chunk::DV_21W43A {
         return;
     }
-    if (DV_1_21_5..DV_25W09A).contains(&dv) {
+    if (chunk::DV_1_21_5..chunk::DV_25W09A).contains(&dv) {
         // 25w02a..25w09a: reset DataVersion to 1.21.4 instead
-        set_data_version(root, 4189);
+        set_data_version(root, chunk::DV_FORCE_BLEND_TARGET);
         return;
     }
-    let Some(secs) = sections(root, dv) else {
+    let Some(secs) = chunk::sections_dv(root, dv) else {
         return;
     };
     let mut min = i64::MAX;
@@ -1073,8 +1020,8 @@ fn force_blend(root: &mut Compound) {
 
 fn delete_structure(root: &mut Compound, names: &[String]) {
     let dv = nbt::data_version(Some(root));
-    if let Some(c) = compound_at_mut(root, dv) {
-        let skey = if dv >= DV_21W43A {
+    if let Some(c) = chunk::data_container_mut(root, dv) {
+        let skey = if dv >= chunk::DV_21W43A {
             "structures"
         } else {
             "Structures"
@@ -1131,14 +1078,14 @@ fn delete_entities(refs: &mut ChunkRefs, ranges: Option<&[(i32, i32)]>) {
         .and_then(|c| c.data.as_ref())
         .map(|d| nbt::data_version(Some(d)))
         .unwrap_or(0);
-    if dv < DV_20W45A {
+    if dv < chunk::DV_20W45A {
         // Level.Entities on the region chunk
         if let Some(d) = refs.region.as_mut().and_then(|c| c.data.as_mut()) {
             if let Some(list) = level_list_mut(d, "Entities") {
                 delete_from_list(list, ranges);
             }
         }
-    } else if dv < DV_21W43A {
+    } else if dv < chunk::DV_21W43A {
         if let Some(d) = refs.entities.as_mut().and_then(|c| c.data.as_mut()) {
             if let Some(list) = level_list_mut(d, "Entities") {
                 delete_from_list(list, ranges);
@@ -1167,9 +1114,9 @@ fn delete_entities(refs: &mut ChunkRefs, ranges: Option<&[(i32, i32)]>) {
 
 fn delete_sections(root: &mut Compound, ranges: &[(i32, i32)]) {
     let dv = nbt::data_version(Some(root));
-    if dv < DV_21W37A {
+    if dv < chunk::DV_21W37A {
         // remove whole sections from Level.Sections
-        if let Some(secs) = sections_mut(root, dv) {
+        if let Some(secs) = chunk::sections_dv_mut(root, dv) {
             secs.retain(|t| {
                 !t.as_compound()
                     .map(|s| in_ranges(section_y(s), ranges))
@@ -1179,12 +1126,12 @@ fn delete_sections(root: &mut Compound, ranges: &[(i32, i32)]) {
         return;
     }
     // 2834+: only "empty" the selected sections, gated on Status
-    let status = compound_at(root, dv)
+    let status = chunk::data_container(root, dv)
         .and_then(|c| c.get("Status"))
         .and_then(|t| t.as_string())
         .unwrap_or("")
         .to_string();
-    let target = if dv >= DV_23W12A {
+    let target = if dv >= chunk::DV_NAMESPACED_STATUS {
         match status.as_str() {
             "minecraft:light" | "minecraft:spawn" | "minecraft:heightmaps"
             | "minecraft:full" => "minecraft:features",
@@ -1196,10 +1143,10 @@ fn delete_sections(root: &mut Compound, ranges: &[(i32, i32)]) {
             _ => return,
         }
     };
-    if let Some(c) = compound_at_mut(root, dv) {
+    if let Some(c) = chunk::data_container_mut(root, dv) {
         c.insert("Status".into(), Tag::String(target.into()));
     }
-    if let Some(secs) = sections_mut(root, dv) {
+    if let Some(secs) = chunk::sections_dv_mut(root, dv) {
         for s in secs.iter_mut().filter_map(|t| t.as_compound_mut()) {
             if !in_ranges(section_y(s), ranges) {
                 continue;
@@ -1220,7 +1167,7 @@ fn delete_sections(root: &mut Compound, ranges: &[(i32, i32)]) {
 
 fn apply_biome(root: &mut Compound, b: &BiomeIdent, force: bool) {
     let dv = nbt::data_version(Some(root));
-    if dv < DV_18W06A {
+    if dv < chunk::DV_18W06A {
         // Level.Biomes byte[256]
         let Some(id) = b.id else { return };
         let exists = level(root).and_then(|l| l.get("Biomes")).is_some();
@@ -1235,7 +1182,7 @@ fn apply_biome(root: &mut Compound, b: &BiomeIdent, force: bool) {
         } else if force {
             l.insert("Biomes".into(), Tag::ByteArray(vec![id as u8; 256]));
         }
-    } else if dv < DV_21W37A {
+    } else if dv < chunk::DV_21W37A {
         // Level.Biomes int[]
         let Some(id) = b.id else { return };
         let exists = level(root).and_then(|l| l.get("Biomes")).is_some();
@@ -1248,9 +1195,9 @@ fn apply_biome(root: &mut Compound, b: &BiomeIdent, force: bool) {
                 *v = id;
             }
         } else if force {
-            let n = if dv < DV_19W36A {
+            let n = if dv < chunk::DV_19W36A {
                 256
-            } else if dv < DV_21W06A {
+            } else if dv < chunk::DV_21W06A {
                 1024
             } else {
                 // 21w06a: sectionRange.num() * 64
@@ -1268,7 +1215,7 @@ fn apply_biome(root: &mut Compound, b: &BiomeIdent, force: bool) {
     } else {
         // per-section biomes compounds
         let Some(name) = b.name.clone() else { return };
-        if let Some(secs) = sections_mut(root, dv) {
+        if let Some(secs) = chunk::sections_dv_mut(root, dv) {
             for s in secs.iter_mut().filter_map(|t| t.as_compound_mut()) {
                 if !force && !s.contains_key("biomes") {
                     continue;
@@ -1339,28 +1286,27 @@ fn load_hm(src: &str) -> HmCfg {
 }
 
 fn hm_cfg(dv: i32) -> &'static HmCfg {
-    static C: OnceLock<HashMap<i32, HmCfg>> = OnceLock::new();
+    static C: OnceLock<Vec<(i32, HmCfg)>> = OnceLock::new();
     let m = C.get_or_init(|| {
         let files: &[(i32, &str)] = &[
-            (1484, include_str!("../resources/mapping/java_1_13/heightmaps_18w19a.json")),
-            (1901, include_str!("../resources/mapping/java_1_14/heightmaps_18w43a.json")),
-            (2200, include_str!("../resources/mapping/java_1_15/heightmaps_19w34a.json")),
-            (2504, include_str!("../resources/mapping/java_1_16/heightmaps_20w06a.json")),
-            (2681, include_str!("../resources/mapping/java_1_17/heightmaps_20w45a.json")),
-            (2834, include_str!("../resources/mapping/java_1_18/heightmaps_21w37a.json")),
-            (3080, include_str!("../resources/mapping/java_1_19/heightmaps_22w11a.json")),
-            (3207, include_str!("../resources/mapping/java_1_20/heightmaps_23w12a.json")),
-            (3940, include_str!("../resources/mapping/java_1_21/heightmaps_24w18a.json")),
-            (4536, include_str!("../resources/mapping/java_1_21/heightmaps_25w32a.json")),
-            (4764, include_str!("../resources/mapping/java_26/heightmaps_26.1-snapshot-1.json")),
-            (4883, include_str!("../resources/mapping/java_26/heightmaps_26.2-snapshot-1.json")),
-            (4998, include_str!("../resources/mapping/java_26/heightmaps_26.3-snapshot-1.json")),
-            (5003, include_str!("../resources/mapping/java_26/heightmaps_26.3-snapshot-4.json")),
+            (chunk::DV_18W19A, include_str!("../resources/mapping/java_1_13/heightmaps_18w19a.json")),
+            (chunk::DV_18W43A, include_str!("../resources/mapping/java_1_14/heightmaps_18w43a.json")),
+            (chunk::DV_19W34A, include_str!("../resources/mapping/java_1_15/heightmaps_19w34a.json")),
+            (chunk::DV_20W06A, include_str!("../resources/mapping/java_1_16/heightmaps_20w06a.json")),
+            (chunk::DV_20W45A, include_str!("../resources/mapping/java_1_17/heightmaps_20w45a.json")),
+            (chunk::DV_21W37A, include_str!("../resources/mapping/java_1_18/heightmaps_21w37a.json")),
+            (chunk::DV_22W11A, include_str!("../resources/mapping/java_1_19/heightmaps_22w11a.json")),
+            (chunk::DV_23W12A, include_str!("../resources/mapping/java_1_20/heightmaps_23w12a.json")),
+            (chunk::DV_24W18A, include_str!("../resources/mapping/java_1_21/heightmaps_24w18a.json")),
+            (chunk::DV_25W32A, include_str!("../resources/mapping/java_1_21/heightmaps_25w32a.json")),
+            (chunk::DV_26_1_S1, include_str!("../resources/mapping/java_26/heightmaps_26.1-snapshot-1.json")),
+            (chunk::DV_26_2_S1, include_str!("../resources/mapping/java_26/heightmaps_26.2-snapshot-1.json")),
+            (chunk::DV_26_3_S1, include_str!("../resources/mapping/java_26/heightmaps_26.3-snapshot-1.json")),
+            (chunk::DV_26_3_S4, include_str!("../resources/mapping/java_26/heightmaps_26.3-snapshot-4.json")),
         ];
         files.iter().map(|(k, s)| (*k, load_hm(s))).collect()
     });
-    let key = m.keys().filter(|&&k| k <= dv).max().copied().unwrap_or(1484);
-    &m[&key]
+    chunk::dv_floor_key(m, dv).map(|(_, c)| c).unwrap_or(&m[0].1)
 }
 
 fn hm_18w06a() -> &'static (HashSet<String>, HashSet<String>) {
@@ -1472,87 +1418,15 @@ fn apply_height_map_bits(raw: &[i16; 256], bits: usize) -> Vec<i64> {
 }
 
 // packed-block helpers -----------------------------------------------------
-
-/// spanning layout (<2529): bitpos = index*bits may cross a long boundary.
-fn get_pi_span(i: usize, arr: &[i64]) -> i64 {
-    let bits = arr.len() >> 6;
-    if bits == 0 {
-        return 0;
-    }
-    let bit = i * bits;
-    let long_i = bit / 64;
-    let start = bit % 64;
-    if start + bits > 64 {
-        let prev = ((arr[long_i] as u64) >> start) as i64;
-        let next =
-            (arr[long_i + 1] as u64 & ((1u64 << (start + bits - 64)) - 1)) as i64;
-        (next << (64 - start)) | prev
-    } else {
-        ((arr[long_i] as u64 >> start) & ((1u64 << bits) - 1)) as i64
-    }
-}
-
-fn set_pi_span(i: usize, v: i64, arr: &mut [i64]) {
-    let bits = arr.len() >> 6;
-    if bits == 0 {
-        return;
-    }
-    let bit = i * bits;
-    let long_i = bit / 64;
-    let start = bit % 64;
-    if start + bits > 64 {
-        let mask = (1u64 << bits) - 1;
-        let val = v as u64 & mask;
-        arr[long_i] = ((arr[long_i] as u64 & !(((1u64 << (64 - start)) - 1) << start))
-            | (val << start)) as i64;
-        let hbits = start + bits - 64;
-        arr[long_i + 1] = ((arr[long_i + 1] as u64 & !((1u64 << hbits) - 1))
-            | (val >> (64 - start))) as i64;
-    } else {
-        let mask = ((1u64 << bits) - 1) << start;
-        arr[long_i] =
-            ((arr[long_i] as u64 & !mask) | (((v as u64) << start) & mask)) as i64;
-    }
-}
-
-/// non-spanning layout (>=2529)
-fn get_pi_packed(i: usize, arr: &[i64]) -> i64 {
-    let bits = arr.len() >> 6;
-    if bits == 0 {
-        return 0;
-    }
-    let ipl = 64 / bits;
-    let li = i / ipl;
-    let start = (i % ipl) * bits;
-    ((arr[li] as u64 >> start) & ((1u64 << bits) - 1)) as i64
-}
-
-fn set_pi_packed(i: usize, v: i64, arr: &mut [i64]) {
-    let bits = arr.len() >> 6;
-    if bits == 0 {
-        return;
-    }
-    let ipl = 64 / bits;
-    let li = i / ipl;
-    let start = (i % ipl) * bits;
-    let mask = ((1u64 << bits) - 1) << start;
-    arr[li] = ((arr[li] as u64 & !mask) | (((v as u64) << start) & mask)) as i64;
-}
+// both bit layouts live in chunk::PackedData / chunk::packed_set; these are
+// the i64 conveniences this module's loops use.
 
 fn get_pi(i: usize, arr: &[i64], dv: i32) -> i64 {
-    if dv >= DV_20W17A {
-        get_pi_packed(i, arr)
-    } else {
-        get_pi_span(i, arr)
-    }
+    PackedData::block_states(PackedSrc::Longs(arr), dv).get(i) as i64
 }
 
 fn set_pi(i: usize, v: i64, arr: &mut [i64], dv: i32) {
-    if dv >= DV_20W17A {
-        set_pi_packed(i, v, arr)
-    } else {
-        set_pi_span(i, v, arr)
-    }
+    chunk::packed_set(i, v as u64, arr, dv)
 }
 
 fn adjust_bits(
@@ -1567,7 +1441,7 @@ fn adjust_bits(
         32 - (palette_len - 1).leading_zeros() as usize
     };
     new_bits = new_bits.max(4);
-    let new_len = if dv >= DV_20W17A {
+    let new_len = if dv >= chunk::DV_20W17A {
         (4096f64 / (64f64 / new_bits as f64).floor()).ceil() as usize
     } else {
         new_bits * 64
@@ -1587,27 +1461,10 @@ fn adjust_bits(
     new_arr
 }
 
-fn block_id_of(tag: &Tag) -> String {
-    match tag {
-        Tag::String(s) => s.clone(),
-        Tag::Compound(c) => {
-            if let Some(s) = c.get("").and_then(|t| t.as_string()) {
-                return s.to_string();
-            }
-            nbt::string_or(Some(c), "id", "").to_string()
-        }
-        _ => String::new(),
-    }
-}
-
-fn palette_name(tag: &Tag) -> String {
-    match tag {
-        Tag::Compound(c) => {
-            let n = nbt::string_from(Some(c), "Name");
-            n.map(str::to_string).unwrap_or_else(|| block_id_of(tag))
-        }
-        _ => String::new(),
-    }
+/// shared palette-entry name (chunk::palette_entry_name covers ""/"id"/"Name"
+/// and bare-string entries).
+fn pal_name(tag: &Tag) -> &str {
+    chunk::palette_entry_name(tag)
 }
 
 /// scan sections top-down and fill a 256-entry height column array.
@@ -1626,7 +1483,7 @@ fn compute_raw_heights(
                     let Some(entry) = palette.get(pi as usize) else {
                         continue;
                     };
-                    if matcher(&palette_name(entry)) {
+                    if matcher(pal_name(entry)) {
                         heightmap[cz * 16 + cx] =
                             (*rel_i as i32 * 16 + cy as i32 + 1) as i16;
                         continue 'col;
@@ -1644,9 +1501,9 @@ fn heightmap_pass(
     dv: i32,
     matcher: &dyn Fn(&str) -> bool,
 ) -> Option<Vec<i64>> {
-    if dv >= DV_21W06A {
-        let secs = sections(root, dv)?;
-        let scope = if dv >= DV_21W43A {
+    if dv >= chunk::DV_21W06A {
+        let secs = chunk::sections_dv(root, dv)?;
+        let scope = if dv >= chunk::DV_21W43A {
             root
         } else {
             level(root)?
@@ -1666,13 +1523,13 @@ fn heightmap_pass(
             if rel < 0 || rel as usize >= num {
                 continue;
             }
-            let (palette, states) = if (DV_21W37A..DV_21W43A).contains(&dv) {
+            let (palette, states) = if (chunk::DV_21W37A..chunk::DV_21W43A).contains(&dv) {
                 // upstream 21w37a heightmap quirk: flat palette/block_states
                 (
                     s.get("palette").and_then(as_list).cloned(),
                     s.get("block_states").and_then(as_long_array).cloned(),
                 )
-            } else if dv >= DV_21W43A {
+            } else if dv >= chunk::DV_21W43A {
                 let bs = s.get("block_states").and_then(|t| t.as_compound());
                 (
                     bs.and_then(|c| c.get("palette")).and_then(as_list).cloned(),
@@ -1696,7 +1553,7 @@ fn heightmap_pass(
         return Some(apply_height_map_bits(&raw, bits));
     }
     // 1466..2693: fixed 16-section arrays at absolute Y
-    let secs = sections(root, dv)?;
+    let secs = chunk::sections_dv(root, dv)?;
     let mut pals: [Option<(Vec<Tag>, Vec<i64>)>; 16] = Default::default();
     for t in secs {
         let Some(s) = t.as_compound() else { continue };
@@ -1721,7 +1578,7 @@ fn heightmap_pass(
                     let Some(entry) = palette.get(pi as usize) else {
                         continue;
                     };
-                    if matcher(&palette_name(entry)) {
+                    if matcher(pal_name(entry)) {
                         heightmap[cz * 16 + cx] = (i * 16 + cy + 1) as i16;
                         continue 'col;
                     }
@@ -1729,7 +1586,7 @@ fn heightmap_pass(
             }
         }
     }
-    Some(if dv >= DV_20W17A {
+    Some(if dv >= chunk::DV_20W17A {
         apply_height_map37(&heightmap)
     } else {
         apply_height_map36(&heightmap)
@@ -1753,12 +1610,9 @@ fn set_heightmap(root: &mut Compound, name: &str, data: Vec<i64>) {
 /// and DeleteSections).
 fn fix_heightmaps(root: &mut Compound) {
     let dv = nbt::data_version(Some(root));
-    if dv < DV_17W47A {
+    if dv < chunk::DV_17W47A {
         // legacy byte-block path -> Level.HeightMap int[256]
-        let Some(secs) = level(root)
-            .and_then(|l| l.get("Sections"))
-            .and_then(as_list)
-        else {
+        let Some(secs) = chunk::sections_dv(root, dv) else {
             return;
         };
         let ids = legacy_ids();
@@ -1793,7 +1647,7 @@ fn fix_heightmaps(root: &mut Compound) {
         }
         return;
     }
-    if dv < DV_18W06A {
+    if dv < chunk::DV_18W06A {
         // 1451-1465: palette path writing int HeightMap
         let names = legacy_names();
         let m = |n: &str| {
@@ -1810,7 +1664,7 @@ fn fix_heightmaps(root: &mut Compound) {
         }
         return;
     }
-    if dv < 1484 {
+    if dv < chunk::DV_18W19A {
         // 18w06a: LIGHT + RAIN maps
         let (light, rain) = hm_18w06a();
         if let Some(d) = heightmap_pass(root, dv, &|n: &str| light.contains(n)) {
@@ -1822,14 +1676,14 @@ fn fix_heightmaps(root: &mut Compound) {
         return;
     }
     let cfg = hm_cfg(dv);
-    if dv < 1503 {
+    if dv < chunk::DV_1_13_PRE3 {
         // 18w19a..1_13_PRE2: worldSurface -> LIGHT_BLOCKING
         if let Some(d) =
             heightmap_pass(root, dv, &|n: &str| cfg.light_blocking.contains(n))
         {
             set_heightmap(root, "LIGHT_BLOCKING", d);
         }
-    } else if dv < 1908 {
+    } else if dv < chunk::DV_18W45A {
         // 1_13_PRE3..18w43a: both LIGHT_BLOCKING and WORLD_SURFACE
         if let Some(d) =
             heightmap_pass(root, dv, &|n: &str| cfg.world_surface.contains(n))
@@ -1868,7 +1722,7 @@ fn heightmap_raw_pass(
     dv: i32,
     matcher: &dyn Fn(&str) -> bool,
 ) -> Option<Vec<i16>> {
-    let secs = sections(root, dv)?;
+    let secs = chunk::sections_dv(root, dv)?;
     let mut pals: Vec<(usize, Vec<Tag>, Vec<i64>)> = Vec::new();
     for t in secs {
         let Some(s) = t.as_compound() else { continue };
@@ -1888,13 +1742,6 @@ fn heightmap_raw_pass(
 
 // --------------------------------------------------------- replace blocks
 
-fn index_to_location(i: usize) -> (i32, i32, i32) {
-    let x = (i & 0xF) as i32;
-    let z = ((i >> 4) & 0xF) as i32;
-    let y = (i >> 8) as i32;
-    (x, y, z)
-}
-
 /// find palette index of `state` (deep-equal), else append.
 fn palette_index_of(palette: &mut Vec<Tag>, state: &Tag) -> usize {
     for (i, p) in palette.iter().enumerate() {
@@ -1907,26 +1754,14 @@ fn palette_index_of(palette: &mut Vec<Tag>, state: &Tag) -> usize {
 }
 
 fn palette_contains_air(palette: &[Tag]) -> bool {
-    palette.iter().any(|t| {
-        let n = match t {
-            Tag::Compound(c) => {
-                nbt::string_from(Some(c), "Name")
-                    .map(str::to_string)
-                    .unwrap_or_else(|| block_id_of(t))
-            }
-            Tag::String(s) => s.clone(),
-            _ => String::new(),
-        };
-        matches!(
-            n.as_str(),
-            "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-        )
-    })
+    palette
+        .iter()
+        .any(|t| chunk::is_air_name(chunk::palette_entry_name(t)))
 }
 
 fn air_entry(dv: i32) -> Tag {
     let mut c = Compound::default();
-    if dv >= DV_26_3_S7 {
+    if dv >= chunk::DV_26_3_S7 {
         c.insert("".into(), Tag::String("minecraft:air".into()));
     } else {
         c.insert("Name".into(), Tag::String("minecraft:air".into()));
@@ -1962,7 +1797,7 @@ fn read_block_states<'a>(
     section: &'a Compound,
     dv: i32,
 ) -> Option<(&'a Vec<Tag>, Option<Vec<i64>>)> {
-    if dv >= DV_21W37A {
+    if dv >= chunk::DV_21W37A {
         let bs = section.get("block_states")?.as_compound()?;
         let p = bs.get("palette").and_then(as_list)?;
         let d = bs.get("data").and_then(as_long_array).cloned();
@@ -1975,7 +1810,7 @@ fn read_block_states<'a>(
 }
 
 fn palette_mut<'a>(section: &'a mut Compound, dv: i32) -> Option<&'a mut Vec<Tag>> {
-    if dv >= DV_21W37A {
+    if dv >= chunk::DV_21W37A {
         let bs = section.get_mut("block_states")?.as_compound_mut()?;
         as_list_mut(bs.get_mut("palette")?)
     } else {
@@ -1984,7 +1819,7 @@ fn palette_mut<'a>(section: &'a mut Compound, dv: i32) -> Option<&'a mut Vec<Tag
 }
 
 fn write_block_states(section: &mut Compound, dv: i32, states: Vec<i64>) {
-    if dv >= DV_21W37A {
+    if dv >= chunk::DV_21W37A {
         if let Some(bs) = section
             .get_mut("block_states")
             .and_then(|t| t.as_compound_mut())
@@ -1998,7 +1833,7 @@ fn write_block_states(section: &mut Compound, dv: i32, states: Vec<i64>) {
 
 fn complete_section(s: &mut Compound, y: i32, dv: i32) {
     s.insert("Y".into(), Tag::Byte(y as i8));
-    if dv >= DV_21W37A {
+    if dv >= chunk::DV_21W37A {
         if !s.contains_key("block_states") {
             s.insert("block_states".into(), Tag::Compound(Compound::default()));
         }
@@ -2034,11 +1869,11 @@ fn complete_section(s: &mut Compound, y: i32, dv: i32) {
 
 fn replace_blocks(root: &mut Compound, replace: &[(String, BlockReplace)]) {
     let dv = nbt::data_version(Some(root));
-    if dv < DV_17W47A {
+    if dv < chunk::DV_17W47A {
         replace_blocks_legacy(root, replace);
         return;
     }
-    let Some(scope_dv) = (if dv >= DV_21W43A {
+    let Some(scope_dv) = (if dv >= chunk::DV_21W43A {
         Some(root as &Compound)
     } else {
         level(root)
@@ -2050,7 +1885,7 @@ fn replace_blocks(root: &mut Compound, replace: &[(String, BlockReplace)]) {
     let Some((cx, cz)) = pos else { return };
     let base_x = cx * 16;
     let base_z = cz * 16;
-    let skey = sections_key(dv);
+    let skey = chunk::sections_key(dv);
     let Some(secs_ref) = scope_dv.get(skey).and_then(as_list) else {
         return;
     };
@@ -2059,7 +1894,7 @@ fn replace_blocks(root: &mut Compound, replace: &[(String, BlockReplace)]) {
     };
 
     // ---- mutable phase on the section list
-    let tiles_key = if dv >= DV_21W43A {
+    let tiles_key = if dv >= chunk::DV_21W43A {
         "block_entities"
     } else {
         "TileEntities"
@@ -2069,7 +1904,7 @@ fn replace_blocks(root: &mut Compound, replace: &[(String, BlockReplace)]) {
     let mut tile_ops: Vec<(i32, i32, i32, Option<Compound>)> = Vec::new();
 
     {
-        let Some(c) = compound_at_mut(root, dv) else {
+        let Some(c) = chunk::data_container_mut(root, dv) else {
             return;
         };
         let Some(secs) = as_list_mut(c.get_mut(skey).unwrap()) else {
@@ -2093,7 +1928,7 @@ fn replace_blocks(root: &mut Compound, replace: &[(String, BlockReplace)]) {
                         map.insert(y, s);
                     }
                     Some(s) => {
-                        let missing = if dv >= DV_21W37A {
+                        let missing = if dv >= chunk::DV_21W37A {
                             !s.contains_key("block_states")
                         } else {
                             !s.contains_key("Palette")
@@ -2135,9 +1970,9 @@ fn replace_blocks(root: &mut Compound, replace: &[(String, BlockReplace)]) {
                 let Some(entry) = palette0.get(pi as usize) else {
                     continue;
                 };
-                let name = palette_name(entry);
+                let name = pal_name(entry);
                 for (ri, (from, r)) in replace.iter().enumerate() {
-                    if &name == from {
+                    if name == from.as_str() {
                         edits.push((i, ri, Tag::Compound(r.get_state(dv))));
                         break;
                     }
@@ -2161,7 +1996,7 @@ fn replace_blocks(root: &mut Compound, replace: &[(String, BlockReplace)]) {
                 }
             }
             for (i, ri, _) in &edits {
-                let (x, yy, z) = index_to_location(*i);
+                let (x, yy, z) = chunk::index_to_location(*i);
                 let loc = (base_x + x, y * 16 + yy, base_z + z);
                 tile_ops.push((loc.0, loc.1, loc.2, replace[*ri].1.tile.clone()));
             }
@@ -2179,7 +2014,7 @@ fn replace_blocks(root: &mut Compound, replace: &[(String, BlockReplace)]) {
     if tile_ops.is_empty() {
         return;
     }
-    let Some(c) = compound_at_mut(root, dv) else {
+    let Some(c) = chunk::data_container_mut(root, dv) else {
         return;
     };
     if !matches!(c.get(tiles_key), Some(Tag::List(..))) {

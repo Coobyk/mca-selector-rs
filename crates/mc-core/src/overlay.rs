@@ -3,8 +3,9 @@
 //! Each overlay parses one int per chunk and maps it onto an HSB hue gradient
 //! (minHue blue .. maxHue red), producing a 32x32 ARGB image per region.
 
+use crate::chunk::{self, PackedData, PackedSrc};
 use crate::nbt::{self, Compound, Tag};
-use crate::version;
+use crate::valuetext;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum OverlayType {
@@ -110,8 +111,6 @@ impl Overlay {
         matches!((self.min, self.max), (Some(a), Some(b)) if a < b)
     }
 
-    
-
     /// setMin/setMax: plain int, or duration ("1d2h") for InhabitedTime/LastUpdate
     /// (seconds*20), or timestamp ("yyyy-MM-dd HH:mm:ss") for Timestamp.
     pub fn set_min_str(&mut self, raw: &str) -> bool {
@@ -136,14 +135,14 @@ impl Overlay {
         }
         match self.typ {
             OverlayType::InhabitedTime | OverlayType::LastUpdate => {
-                let d = parse_duration(raw).ok()?;
-                let max = i64::from(i32::MAX) / 20;
+                let d = valuetext::parse_duration(raw).ok()?;
+                let max = i64::from(i32::MAX) / valuetext::TICKS_PER_SECOND;
                 if !(0..=max).contains(&d) {
                     return None;
                 }
-                Some((d * 20) as i32)
+                Some((d * valuetext::TICKS_PER_SECOND) as i32)
             }
-            OverlayType::Timestamp => parse_timestamp(raw).ok(),
+            OverlayType::Timestamp => valuetext::parse_timestamp(raw).ok(),
             _ => None,
         }
     }
@@ -168,7 +167,7 @@ impl Overlay {
         self.path.clear();
         self.path_size = false;
         self.path_root.clear();
-        let elements: Vec<String> = split_escaped(raw, '/', '\\');
+        let elements: Vec<String> = valuetext::split_escaped(raw, '/', '\\');
         self.multi_values = elements.clone();
         if elements.len() < 2 {
             self.multi_values.clear();
@@ -182,7 +181,7 @@ impl Overlay {
             }
         }
         let last = &elements[elements.len() - 1];
-        let last_parts = split_escaped(last, '.', '\\');
+        let last_parts = valuetext::split_escaped(last, '.', '\\');
         if last_parts.len() > 1 && last_parts.last().map(|s| s.as_str()) == Some("size") {
             self.path_size = true;
             let prefix = &last[..last.len() - 5];
@@ -225,9 +224,9 @@ impl Overlay {
             OverlayType::LastUpdate => {
                 nbt::long_from_opt(Some(data), "LastUpdate").unwrap_or(0) as i32
             }
-            OverlayType::EntityAmount => list_size(data, &["entities", "Entities"]),
+            OverlayType::EntityAmount => chunk::list_size(data, chunk::ENTITY_LIST_KEYS) as i32,
             OverlayType::TileEntityAmount => {
-                list_size(data, &["block_entities", "tile_entities", "TileEntities"])
+                chunk::list_size(data, chunk::TILE_ENTITY_LIST_KEYS) as i32
             }
             OverlayType::DataVersion => dv,
             OverlayType::AverageHeight => average_height(data, dv),
@@ -312,97 +311,54 @@ pub fn region_overlay_data(
     out
 }
 
-fn list_size(data: &Compound, keys: &[&str]) -> i32 {
-    let level = data.get("Level").and_then(Tag::as_compound);
-    for k in keys {
-        for root in [Some(data), level] {
-            if let Some(l) = root.and_then(|r| r.get(*k)).and_then(Tag::as_list) {
-                return l.1.len() as i32;
-            }
-        }
-    }
-    0
-}
-
-
-
-struct Sec {
+struct Sec<'a> {
     y: i32,
-    palette: Vec<String>,
-    data: Vec<u8>,
-    bits: usize,
-    ipl: usize,
+    palette: Vec<&'a str>,
+    data: PackedData<'a>,
 }
 
-fn sections_of(data: &Compound, format: version::ChunkFormat) -> Vec<Sec> {
-    let modern = version::is_modern(format);
-    let root = if modern {
-        Some(data)
-    } else {
-        nbt::level_from_root(data)
+fn sections_of<'a>(data: &'a Compound, dv: i32) -> Vec<Sec<'a>> {
+    let Some((list, _)) = chunk::sections(data) else {
+        return Vec::new();
     };
-    let key = if modern { "sections" } else { "Sections" };
-    let Some((_, list)) = nbt::sections_from(root, key) else { return Vec::new() };
     let mut out = Vec::new();
     for t in list {
         let Some(s) = t.as_compound() else { continue };
-        let (palette_raw, data_raw) = if modern {
-            let bs = s.get("block_states").and_then(Tag::as_compound);
-            (
-                bs.and_then(|b| b.get("palette")).and_then(Tag::as_list),
-                bs.and_then(|b| b.get("data")).and_then(Tag::as_bytes),
-            )
-        } else {
-            (
-                s.get("Palette").and_then(Tag::as_list),
-                s.get("BlockStates").and_then(Tag::as_bytes),
-            )
+        let Some(plist) = chunk::block_palette(s) else { continue };
+        let Some(d) = s
+            .get("block_states")
+            .and_then(Tag::as_compound)
+            .and_then(|b| b.get("data"))
+            .or_else(|| s.get("BlockStates"))
+            .and_then(Tag::as_bytes)
+        else {
+            continue;
         };
-        let Some((_, plist)) = palette_raw else { continue };
-        let Some(d) = data_raw else { continue };
-        let palette: Vec<String> = plist
-            .iter()
-            .map(|e| version::palette_name(Some(e), format).to_string())
-            .collect();
-        let bits = d.len() >> 9;
-        let ipl = if bits == 0 { 1 } else { 64 / bits };
+        let palette: Vec<&str> = plist.iter().map(chunk::palette_entry_name).collect();
         out.push(Sec {
             y: s.get("Y").and_then(Tag::as_i64).map(|v| v as i32).unwrap_or(-1),
             palette,
-            data: d.to_vec(),
-            bits,
-            ipl,
+            data: PackedData::block_states(PackedSrc::Raw(d), dv),
         });
     }
     out
 }
 
-fn block_at<'a>(s: &'a Sec, index: usize) -> &'a str {
+fn block_at<'a>(s: &'a Sec<'a>, index: usize) -> &'a str {
     if s.palette.is_empty() {
         return "";
     }
-    if s.bits == 0 || s.data.is_empty() {
-        return s.palette.first().map(|p| p.as_str()).unwrap_or("");
+    if s.data.bits == 0 {
+        return s.palette.first().copied().unwrap_or("");
     }
-    let pal_idx = version::packed_get(Some(&s.data), index, s.bits, s.ipl) as usize;
-    s.palette.get(pal_idx).map(|p| p.as_str()).unwrap_or("")
-}
-
-fn name_is_empty(name: &str) -> bool {
-    // upstream isEmpty: air/cave_air/barrier/structure_void (no Properties —
-    // palette_name already strips them, so we conservatively treat plain-name
-    // matches as empty)
-    matches!(
-        name,
-        "minecraft:air" | "minecraft:cave_air" | "minecraft:barrier" | "minecraft:structure_void"
-    )
+    let pal_idx = s.data.get(index) as usize;
+    s.palette.get(pal_idx).copied().unwrap_or("")
 }
 
 /// ChunkFilter.Blocks.getAverageHeight: top-down scan per column, sum of
 /// (sectionY*16 + cy) at first non-empty block / 256.
 fn average_height(data: &Compound, dv: i32) -> i32 {
-    let format = version::chunk_format(dv);
-    let mut secs = sections_of(data, format);
+    let mut secs = sections_of(data, dv);
     secs.sort_by(|a, b| b.y.cmp(&a.y));
     if secs.is_empty() {
         return 0;
@@ -412,8 +368,8 @@ fn average_height(data: &Compound, dv: i32) -> i32 {
         'z: for cz in 0..16 {
             for s in &secs {
                 for cy in (0..16).rev() {
-                    let index = cy * 256 + cz * 16 + cx;
-                    if !name_is_empty(block_at(s, index)) {
+                    let index = chunk::location_to_index(cx, cy, cz);
+                    if !chunk::is_air_name(block_at(s, index)) {
                         total += s.y as i64 * 16 + cy as i64;
                         continue 'z;
                     }
@@ -428,13 +384,12 @@ fn average_height(data: &Compound, dv: i32) -> i32 {
 fn block_amount(data: &Compound, blocks: &[String]) -> i32 {
     // works for any dv via raw NBT (name compare on palette entries)
     let dv = nbt::data_version(Some(data));
-    let format = version::chunk_format(dv);
-    let secs = sections_of(data, format);
+    let secs = sections_of(data, dv);
     let mut result = 0i64;
     for s in &secs {
         let mut hit = vec![false; s.palette.len()];
         for (i, p) in s.palette.iter().enumerate() {
-            if blocks.iter().any(|b| names_eq(p, b)) {
+            if blocks.iter().any(|b| valuetext::names_eq(p, b)) {
                 hit[i] = true;
             }
         }
@@ -442,14 +397,14 @@ fn block_amount(data: &Compound, blocks: &[String]) -> i32 {
             continue;
         }
         for k in 0..4096 {
-            if s.bits == 0 || s.data.is_empty() {
+            if s.data.bits == 0 {
                 // single-palette section: all blocks are palette[0]
                 if !s.palette.is_empty() && hit[0] {
                     result += 1;
                 }
                 break;
             }
-            let pal_idx = version::packed_get(Some(&s.data), k, s.bits, s.ipl) as usize;
+            let pal_idx = s.data.get(k) as usize;
             if hit.get(pal_idx).copied().unwrap_or(false) {
                 result += 1;
             }
@@ -458,150 +413,26 @@ fn block_amount(data: &Compound, blocks: &[String]) -> i32 {
     result as i32
 }
 
-fn names_eq(a: &str, b: &str) -> bool {
-    let a = a.strip_prefix("minecraft:").unwrap_or(a);
-    let b = b.strip_prefix("minecraft:").unwrap_or(b);
-    a == b
-}
-
 /// BlockRegistry.parseBlockNames: comma/space/semicolon separated names.
 fn parse_block_names(raw: &str) -> Vec<String> {
     raw.split(|c: char| c == ',' || c == ';' || c == ' ' || c == '\n' || c == '\t')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .map(|s| {
-            if s.contains(':') {
-                s.to_string()
-            } else {
-                format!("minecraft:{s}")
-            }
-        })
+        .map(valuetext::normalize_name)
         .collect()
-}
-
-/// TextHelper.splitWithEscaping
-fn split_escaped(s: &str, sep: char, esc: char) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == esc {
-            if let Some(n) = chars.next() {
-                cur.push(n);
-            }
-        } else if c == sep {
-            out.push(std::mem::take(&mut cur));
-        } else {
-            cur.push(c);
-        }
-    }
-    out.push(cur);
-    out
-}
-
-/// TextHelper.parseDuration — returns seconds. e.g. "1d", "2h30m".
-pub(crate) fn parse_duration(d: &str) -> Result<i64, String> {
-    const UNITS: &[(&[&str], i64)] = &[
-        (&["years", "year", "y"], 31536000),
-        (&["months", "month"], 2592000),
-        (&["days", "day", "d"], 86400),
-        (&["hours", "hour", "h"], 3600),
-        (&["minutes", "minute", "mins", "min"], 60),
-        (&["seconds", "second", "secs", "sec", "s"], 1),
-    ];
-    let mut rest = d.trim().to_string();
-    let mut total = 0i64;
-    let mut matched_any = false;
-    while !rest.is_empty() {
-        let rest2 = rest.trim_start().to_string();
-        rest = rest2;
-        if rest.is_empty() {
-            break;
-        }
-        // read leading number
-        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            return Err(format!("invalid element in duration string: {rest}"));
-        }
-        let num: i64 = digits.parse().map_err(|_| rest.clone())?;
-        let after: String = rest.chars().skip(digits.len()).collect();
-        let unit_str: String = after
-            .chars()
-            .take_while(|c| c.is_alphabetic())
-            .collect();
-        if unit_str.is_empty() {
-            return Err(format!("invalid element in duration string: {rest}"));
-        }
-        let mut matched = false;
-        for (names, mult) in UNITS {
-            if names.iter().any(|n| *n == unit_str) {
-                total += num * mult;
-                matched = true;
-                matched_any = true;
-                break;
-            }
-        }
-        if !matched {
-            return Err(format!("invalid element in duration string: {rest}"));
-        }
-        rest = after.chars().skip(unit_str.len()).collect();
-    }
-    if !matched_any {
-        return Err(format!("could not parse anything from duration string: {d}"));
-    }
-    Ok(total)
-}
-
-/// TextHelper.parseTimestamp — "yyyy-MM-dd[ HH[:mm[:ss]]]" → epoch seconds.
-pub(crate) fn parse_timestamp(t: &str) -> Result<i32, String> {
-    let t = t.trim();
-    let (date, time) = match t.split_once(' ') {
-        Some((d, tm)) => (d, tm),
-        None => (t, "00:00:00"),
-    };
-    let dp: Vec<&str> = date.split('-').collect();
-    if dp.len() != 3 {
-        return Err("could not parse date time".into());
-    }
-    let y: i64 = dp[0].parse().map_err(|_| "bad year".to_string())?;
-    let mo: i64 = dp[1].parse().map_err(|_| "bad month".to_string())?;
-    let da: i64 = dp[2].parse().map_err(|_| "bad day".to_string())?;
-    let tp: Vec<&str> = time.split(':').collect();
-    let h: i64 = tp.first().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let mi: i64 = tp.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let se: i64 = tp.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    // days since epoch (civil algorithm)
-    let days = days_from_civil(y, mo, da);
-    if days < 0 {
-        return Err("could not parse date time".into());
-    }
-    Ok((days * 86400 + h * 3600 + mi * 60 + se) as i32)
-}
-
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
 }
 
 /// java.awt.Color.HSBtoRGB — returns 0xFFRRGGBB.
 pub fn hsb_to_rgb(hue: f32, saturation: f32, brightness: f32) -> u32 {
-    let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
-    if saturation == 0.0 {
-        r = (brightness * 255.0 + 0.5) as u32;
-        g = r;
-        b = r;
+    let (rr, gg, bb) = if saturation == 0.0 {
+        (brightness, brightness, brightness)
     } else {
         let h = (hue - hue.floor()) * 6.0;
         let f = h - h.floor();
         let p = brightness * (1.0 - saturation);
         let q = brightness * (1.0 - saturation * f);
         let t = brightness * (1.0 - saturation * (1.0 - f));
-        let (rr, gg, bb) = match h as i32 {
+        match h as i32 {
             0 => (brightness, t, p),
             1 => (q, brightness, p),
             2 => (p, brightness, t),
@@ -609,11 +440,11 @@ pub fn hsb_to_rgb(hue: f32, saturation: f32, brightness: f32) -> u32 {
             4 => (t, p, brightness),
             5 => (brightness, p, q),
             _ => (0.0, 0.0, 0.0),
-        };
-        r = (rr * 255.0 + 0.5) as u32;
-        g = (gg * 255.0 + 0.5) as u32;
-        b = (bb * 255.0 + 0.5) as u32;
-    }
+        }
+    };
+    let r = (rr * 255.0 + 0.5) as u32;
+    let g = (gg * 255.0 + 0.5) as u32;
+    let b = (bb * 255.0 + 0.5) as u32;
     0xFF00_0000 | (r << 16) | (g << 8) | b
 }
 
@@ -730,6 +561,7 @@ pub fn parse_config_line(line: &str) -> Result<Overlay, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::valuetext::{parse_duration, parse_timestamp};
 
     #[test]
     fn color_grade_clamps_and_interpolates() {

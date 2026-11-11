@@ -26,7 +26,7 @@ pub fn png_file_name(r: Point2i) -> String {
 }
 
 /// Java UUID.nameUUIDFromBytes (MD5, version 3, IETF variant).
-pub fn name_uuid(bytes: &[u8]) -> String {
+fn name_uuid(bytes: &[u8]) -> String {
     use md5::{Digest, Md5};
     let mut d = Md5::digest(bytes).to_vec();
     d[6] = (d[6] & 0x0F) | 0x30;
@@ -92,7 +92,7 @@ pub fn png_cache_path(world_cache: &Path, zoom: i32, r: Point2i) -> PathBuf {
     world_cache.join(format!("{}/{}", zoom, png_file_name(r)))
 }
 
-pub fn has_mca_files(dir: &Path) -> bool {
+fn has_mca_files(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten().any(|e| {

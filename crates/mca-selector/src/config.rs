@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 pub const MAX_SCALE: f32 = 63.9999;
 pub const MIN_SCALE: f32 = 0.05;
-pub const MIN_ZOOM_LEVEL: i32 = 1;
 pub const MAX_ZOOM_LEVEL: i32 = 32;
 pub const IMAGE_POOL_SIZE: f32 = 2.5;
 pub const MAX_RECENT_FILES: usize = 16;
@@ -38,8 +37,6 @@ impl Color {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecentWorld {
     pub world: PathBuf,
-    #[serde(default)]
-    pub dimensions: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -127,7 +124,7 @@ impl GlobalConfig {
             let _ = std::fs::write(Self::path(), j);
         }
     }
-    pub fn add_recent_world(&mut self, world: PathBuf, dims: Vec<PathBuf>) {
+    pub fn add_recent_world(&mut self, world: PathBuf) {
         if let Some((k, _)) = self
             .recent_worlds
             .iter()
@@ -140,7 +137,7 @@ impl GlobalConfig {
             self.recent_worlds.remove(&first);
         }
         self.recent_worlds
-            .insert(now_ms(), RecentWorld { world, dimensions: dims });
+            .insert(now_ms(), RecentWorld { world });
     }
 }
 

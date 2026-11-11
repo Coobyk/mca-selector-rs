@@ -8,7 +8,6 @@ use std::thread;
 
 pub const PRIORITY_LOW: i64 = 20_000_000;
 pub const PRIORITY_MEDIUM: i64 = 10_000_000;
-pub const PRIORITY_HIGH: i64 = 0;
 
 static JOB_ID: AtomicI64 = AtomicI64::new(0);
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
@@ -17,7 +16,8 @@ pub fn active_jobs() -> usize {
     ACTIVE.load(Ordering::Relaxed)
 }
 
-/// A job carries its work plus a dynamic priority supplier.
+/// A job carries its work plus an optional dynamic priority supplier
+/// (tile-map jobs re-rank by queue pressure; everything else passes `None`).
 pub struct Job {
     id: i64,
     base: i64,
@@ -210,7 +210,10 @@ fn spawn_worker(q: &Arc<Queue>, name: &str, lane: Lane) {
 }
 
 impl Pools {
-    pub fn add_job(&self, job: Job) {
+    /// Enqueue a job. Upstream had two pools (ProcessDataWriterPool for batch
+    /// ops, a process pool for the rest); here both collapse onto the one
+    /// two-lane queue described at [`Inner`].
+    pub fn add_process(&self, job: Job) {
         // snapshot priority and classify *before* taking the lock: the prio
         // thunk is arbitrary user code and must not run under the queue lock.
         // (also before ACTIVE++ so a panicking thunk can't leak the count)
@@ -232,12 +235,6 @@ impl Pools {
         // most one job, and the FastOnly worker relays a slow-lane wakeup.
         self.process.cv.notify_one();
     }
-    /// upstream ProcessDataWriterPool.
-    pub fn add_process(&self, job: Job) {
-        self.add_job(job);
-    }
-
-    
 
     pub fn clear_queues(&self) {
         let n = {

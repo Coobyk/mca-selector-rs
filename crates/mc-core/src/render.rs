@@ -158,9 +158,36 @@ fn draw_bands(
     }
 }
 
+/// DataVersion -> (chunk_format, color_mapping) memoization — chunks in a
+/// region almost always share a DataVersion, so this avoids re-walking the
+/// dispatch tables and OnceLocks per chunk.
+struct Dispatch {
+    last_dv: Option<i32>,
+    format: version::ChunkFormat,
+    cm: version::ColorMap,
+}
+
+impl Dispatch {
+    fn new() -> Self {
+        Dispatch {
+            last_dv: None,
+            format: version::ChunkFormat::Null,
+            cm: version::ColorMap::Null,
+        }
+    }
+
+    fn get(&mut self, data_version: i32) -> (version::ChunkFormat, &version::ColorMap) {
+        if self.last_dv != Some(data_version) {
+            self.last_dv = Some(data_version);
+            self.format = version::chunk_format(data_version);
+            self.cm = version::color_mapping(data_version);
+        }
+        (self.format, &self.cm)
+    }
+}
+
 /// One band = one chunk row; renders its 32 chunks sequentially into the
-/// band slices. The DataVersion dispatch cache is kept per band — chunks in
-/// a region almost always share a DataVersion.
+/// band slices.
 #[allow(clippy::too_many_arguments)]
 fn draw_band(
     mca: &McaFile,
@@ -175,23 +202,16 @@ fn draw_band(
     mut water_px_band: Option<&mut [u32]>,
     mut water_h_band: Option<&mut [i16]>,
 ) {
-    let mut last_dv: Option<i32> = None;
-    let mut format = version::ChunkFormat::Null;
-    let mut cm = version::ColorMap::Null;
+    let mut dispatch = Dispatch::new();
     for crx in 0..SIZE_IN_CHUNKS {
         let index = crz * SIZE_IN_CHUNKS + crx;
         let Some(chunk) = &mca.chunks[index] else { continue };
         let Some(data) = &chunk.data else { continue };
-        let data_version = nbt::data_version(Some(data));
-        if last_dv != Some(data_version) {
-            last_dv = Some(data_version);
-            format = version::chunk_format(data_version);
-            cm = version::color_mapping(data_version);
-        }
+        let (format, cm) = dispatch.get(nbt::data_version(Some(data)));
         let x = crx * chunk_size;
         draw_one(
             data,
-            &cm,
+            cm,
             format,
             x,
             0,
@@ -226,28 +246,18 @@ fn draw_sequential(
     water_pixels: &mut Vec<u32>,
     water_heights: &mut Vec<i16>,
 ) {
-    // chunks in a region almost always share a DataVersion — cache the
-    // last dispatch (chunk_format + color_mapping) instead of re-walking
-    // the tables and OnceLocks per chunk.
-    let mut last_dv: Option<i32> = None;
-    let mut format = version::ChunkFormat::Null;
-    let mut cm = version::ColorMap::Null;
+    let mut dispatch = Dispatch::new();
     for cx in 0..SIZE_IN_CHUNKS {
         for cz in 0..SIZE_IN_CHUNKS {
             let index = cz * SIZE_IN_CHUNKS + cx;
             let Some(chunk) = &mca.chunks[index] else { continue };
             let Some(data) = &chunk.data else { continue };
-            let data_version = nbt::data_version(Some(data));
-            if last_dv != Some(data_version) {
-                last_dv = Some(data_version);
-                format = version::chunk_format(data_version);
-                cm = version::color_mapping(data_version);
-            }
+            let (format, cm) = dispatch.get(nbt::data_version(Some(data)));
             let x = cx * chunk_size;
             let z = cz * chunk_size;
             draw_one(
                 data,
-                &cm,
+                cm,
                 format,
                 x,
                 z,
@@ -429,7 +439,7 @@ pub fn scale_down(img: &[u32], from_size: usize, to_size: usize) -> Vec<u32> {
     let factor = from_size / to_size;
     let mut out = vec![0u32; to_size * to_size];
     if factor == 0 {
-        // upscale: every pixel samples img[0] (same as the old x*0 indexing)
+        // upscale: every pixel samples img[0]
         out.fill(img[0]);
         return out;
     }
@@ -481,56 +491,5 @@ mod tests {
                 .fold(0u64, |a, &p| a.wrapping_mul(31).wrapping_add(p as u64));
             eprintln!("iter {i}: {el:?} ({} px, checksum {checksum:016x})", img.len());
         }
-    }
-}
-
-
-
-#[cfg(test)]
-mod tests3 {
-    use super::*;
-    use crate::mca::McaFile;
-    use std::collections::HashMap;
-    #[test]
-    #[ignore]
-    fn mansion_probe() {
-        let path = std::path::PathBuf::from(std::env::var("MCA_REGION_PATH").expect("MCA_REGION_PATH"));
-        let mut m = McaFile::new(path).expect("region");
-        m.load(true).expect("load");
-        let corrupted = [0u32; 256];
-        let img = generate_image(&m, 1, &RenderSettings::default(), &corrupted).expect("img");
-        // mansion ~ chunk(-46,-49) -> local (18,15); sample 260..340 x 220..290
-        let mut hist: HashMap<u32, usize> = HashMap::new();
-        for y in 220..290usize {
-            for x in 260..340usize {
-                *hist.entry(img[y * 512 + x]).or_default() += 1;
-            }
-        }
-        let mut v: Vec<_> = hist.into_iter().collect();
-        v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-        for (c, n) in v.iter().take(12) {
-            eprintln!("color {c:08x} x{n}");
-        }
-        let checksum = img.iter().fold(0u64, |a, &p| a.wrapping_mul(31).wrapping_add(p as u64));
-        eprintln!("checksum {checksum:016x}");
-        // dump mansion area at several zoom levels
-        for zl in [1i32, 2, 4, 8, 16] {
-            let zi = generate_image(&m, zl, &RenderSettings::default(), &corrupted).expect("img");
-            let sz = 512 / zl as usize;
-            let mut rgba = Vec::with_capacity(sz * sz * 4);
-            for &p in zi.iter() {
-                rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8]);
-            }
-            image::save_buffer(format!("/tmp/zl{zl}.png"), &rgba, sz as u32, sz as u32, image::ColorType::Rgba8).unwrap();
-        }
-        let (x0, y0, w, h) = (200usize, 180usize, 250usize, 160usize);
-        let mut rgba = Vec::with_capacity(w * h * 4);
-        for y in y0..y0 + h {
-            for x in x0..x0 + w {
-                let p = img[y * 512 + x];
-                rgba.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8]);
-            }
-        }
-        image::save_buffer("/tmp/mansion.png", &rgba, w as u32, h as u32, image::ColorType::Rgba8).unwrap();
     }
 }

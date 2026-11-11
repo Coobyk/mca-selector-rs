@@ -7,7 +7,7 @@
 
 use indexmap::IndexMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 pub const TAG_END: u8 = 0;
 pub const TAG_BYTE: u8 = 1;
@@ -205,34 +205,11 @@ pub fn string_or<'a>(c: Option<&'a Compound>, key: &str, def: &'a str) -> &'a st
     string_from(c, key).unwrap_or(def)
 }
 
-/// sections list: returns None when missing or when it is a LongArray
-/// (Helper.getSectionsFromCompound).
-pub fn sections_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<(u8, &'a Vec<Tag>)> {
-    match c.and_then(|c| c.get(key)) {
-        Some(Tag::List(t, l)) => Some((*t, l)),
-        _ => None,
-    }
-}
-
 pub fn byte_array_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<&'a [u8]> {
     c.and_then(|c| c.get(key)).and_then(|t| t.as_bytes())
 }
 
-
-
 /// Level wrapper for pre-1.18 chunks (Helper.levelFromRoot).
-/// format-agnostic section-list locator: `Sections`/`sections` at root or
-/// under `Level`, in that priority order (all call sites need "any sections").
-pub fn section_tags<'a>(root: &'a Compound) -> Option<&'a Vec<Tag>> {
-    let level = level_from_root(root).unwrap_or(root);
-    for (c, k) in [(level, "Sections"), (root, "sections"), (level, "sections")] {
-        if let Some((_, l)) = c.get(k).and_then(Tag::as_list) {
-            return Some(l);
-        }
-    }
-    None
-}
-
 pub fn level_from_root<'a>(root: &'a Compound) -> Option<&'a Compound> {
     root.get("Level").and_then(Tag::as_compound)
 }
@@ -250,8 +227,6 @@ pub fn data_version(root: Option<&Compound>) -> i32 {
 
 /// Read a BE i64 out of a raw byte slice (raw long[] data).
 #[inline]
-
-#[inline]
 pub fn raw_i64_or(data: &[u8], idx: usize, def: i64) -> i64 {
     let o = idx * 8;
     if o + 8 <= data.len() {
@@ -260,7 +235,6 @@ pub fn raw_i64_or(data: &[u8], idx: usize, def: i64) -> i64 {
         def
     }
 }
-#[inline]
 
 #[inline]
 pub fn raw_i32_or(data: &[u8], idx: usize, def: i32) -> i32 {
@@ -276,173 +250,15 @@ pub fn raw_i32_or(data: &[u8], idx: usize, def: i32) -> i32 {
 // Binary IO (big endian, Java DataInputStream semantics incl. modified UTF-8
 // for name strings — MC never produces the long-form anyway)
 
-pub struct NbtReader<R: Read> {
-    r: R,
-    pub raw_arrays: bool,
-}
-
-impl<R: Read> NbtReader<R> {
-    pub fn new(r: R) -> Self {
-        NbtReader { r, raw_arrays: false }
-    }
-
-    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        self.r.read_exact(buf)
-    }
-    fn u8(&mut self) -> io::Result<u8> {
-        let mut b = [0u8; 1];
-        self.read_exact(&mut b)?;
-        Ok(b[0])
-    }
-    fn i8(&mut self) -> io::Result<i8> {
-        Ok(self.u8()? as i8)
-    }
-    fn u16(&mut self) -> io::Result<u16> {
-        let mut b = [0u8; 2];
-        self.read_exact(&mut b)?;
-        Ok(u16::from_be_bytes(b))
-    }
-    fn i16(&mut self) -> io::Result<i16> {
-        Ok(self.u16()? as i16)
-    }
-    fn i32(&mut self) -> io::Result<i32> {
-        let mut b = [0u8; 4];
-        self.read_exact(&mut b)?;
-        Ok(i32::from_be_bytes(b))
-    }
-    fn i64(&mut self) -> io::Result<i64> {
-        let mut b = [0u8; 8];
-        self.read_exact(&mut b)?;
-        Ok(i64::from_be_bytes(b))
-    }
-    fn f32(&mut self) -> io::Result<f32> {
-        Ok(f32::from_bits(self.i32()? as u32))
-    }
-    fn f64(&mut self) -> io::Result<f64> {
-        Ok(f64::from_bits(self.i64()? as u64))
-    }
-    fn bytes(&mut self, n: usize) -> io::Result<Vec<u8>> {
-        // read_to_end fills the Vec's spare capacity directly — skips the
-        // vec![0;n] memset the old version paid before overwriting it.
-        let mut v = Vec::with_capacity(n);
-        let got = (&mut self.r).take(n as u64).read_to_end(&mut v)?;
-        if got < n {
-            return Err(eof());
-        }
-        Ok(v)
-    }
-    fn string(&mut self) -> io::Result<String> {
-        let len = self.u16()? as usize;
-        let raw = self.bytes(len)?;
-        // String::from_utf8 reuses `raw`'s buffer on success (the common
-        // case) — one allocation instead of copy-into-new-String.
-        match String::from_utf8(raw) {
-            Ok(s) => Ok(s),
-            Err(e) => Ok(String::from_utf8_lossy(&e.into_bytes()).into_owned()),
-        }
-    }
-
-    
-
-    /// Reads the root tag; upstream NBTReader.read returns the root tag itself.
-    pub fn read(&mut self) -> io::Result<Tag> {
-        let ty = self.u8()?;
-        if ty != TAG_COMPOUND {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected compound root, got {ty}"),
-            ));
-        }
-        let _name = self.string()?;
-        self.payload(TAG_COMPOUND)
-    }
-
-    pub fn payload(&mut self, ty: u8) -> io::Result<Tag> {
-        Ok(match ty {
-            TAG_BYTE => Tag::Byte(self.i8()?),
-            TAG_SHORT => Tag::Short(self.i16()?),
-            TAG_INT => Tag::Int(self.i32()?),
-            TAG_LONG => Tag::Long(self.i64()?),
-            TAG_FLOAT => Tag::Float(self.f32()?),
-            TAG_DOUBLE => Tag::Double(self.f64()?),
-            TAG_BYTE_ARRAY => {
-                let n = self.i32()? as usize;
-                Tag::ByteArray(self.bytes(n)?)
-            }
-            TAG_STRING => Tag::String(self.string()?),
-            TAG_LIST => {
-                let et = self.u8()?;
-                let n = self.i32()?;
-                let n = if n < 0 { 0 } else { n as usize };
-                let mut items = Vec::with_capacity(n);
-                for _ in 0..n {
-                    items.push(self.payload(et)?);
-                }
-                Tag::List(et, items)
-            }
-            TAG_COMPOUND => {
-                let mut map =
-                    Compound::with_capacity_and_hasher(8, FxBuildHasher::default());
-                loop {
-                    let t = self.u8()?;
-                    if t == TAG_END {
-                        break;
-                    }
-                    let name = self.string()?;
-                    let v = self.payload(t)?;
-                    map.insert(name, v);
-                }
-                Tag::Compound(map)
-            }
-            TAG_INT_ARRAY => {
-                let n = self.i32()? as usize;
-                if self.raw_arrays {
-                    Tag::ByteArray(self.bytes(n * 4)?)
-                } else {
-                    // one bulk read + word-wise BE decode instead of n reads
-                    let raw = self.bytes(n * 4)?;
-                    let mut v = Vec::with_capacity(n);
-                    for c in raw.chunks_exact(4) {
-                        v.push(i32::from_be_bytes(c.try_into().unwrap()));
-                    }
-                    Tag::IntArray(v)
-                }
-            }
-            TAG_LONG_ARRAY => {
-                let n = self.i32()? as usize;
-                if self.raw_arrays {
-                    Tag::ByteArray(self.bytes(n * 8)?)
-                } else {
-                    let raw = self.bytes(n * 8)?;
-                    let mut v = Vec::with_capacity(n);
-                    for c in raw.chunks_exact(8) {
-                        v.push(i64::from_be_bytes(c.try_into().unwrap()));
-                    }
-                    Tag::LongArray(v)
-                }
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid tag type {ty}"),
-                ))
-            }
-        })
-    }
-}
-
 #[inline]
 fn eof() -> io::Error {
     // same error Read::read_exact produces on a short input
     io::Error::new(io::ErrorKind::UnexpectedEof, "failed to fill whole buffer")
 }
 
-/// Slice-cursor NBT reader: identical output to [`NbtReader`] but driven off
-/// a `&[u8]` instead of `Read`. Scalars are a pointer bump + `from_be_bytes`
-/// (no per-read `read_exact` call), and array/string payloads borrow the
-/// input then `to_vec` — skipping the zero-init + overwrite the generic
-/// reader performs. Used on the hot region-load path; the parsed `Tag` tree
-/// is byte-for-byte identical to `NbtReader`'s.
+/// Slice-cursor NBT reader: scalars are a pointer bump + `from_be_bytes`,
+/// array/string payloads borrow the input then `to_vec`. Used on the hot
+/// region-load path and for standalone .dat files.
 pub(crate) struct SliceReader<'a> {
     s: &'a [u8],
     pub raw_arrays: bool,
@@ -493,12 +309,11 @@ impl<'a> SliceReader<'a> {
     }
     fn string(&mut self) -> io::Result<String> {
         let len = self.u16()? as usize;
-        // from_utf8_lossy borrows on success — into_owned() is the single
-        // copy, same as String::from_utf8 + fallback in the generic reader.
+        // from_utf8_lossy borrows on success — into_owned() is the only copy
         Ok(String::from_utf8_lossy(self.take(len)?).into_owned())
     }
 
-    /// Reads the root tag — same as `NbtReader::read`.
+    /// Reads the root tag (upstream NBTReader.read).
     pub fn read(&mut self) -> io::Result<Tag> {
         let ty = self.u8()?;
         if ty != TAG_COMPOUND {
@@ -588,12 +403,17 @@ impl<'a> SliceReader<'a> {
     }
 }
 
-/// Serialize a named root tag (always writes a compound root like NBTWriter).
-pub fn write_nbt<W: Write>(w: &mut W, name: &str, tag: &Tag) -> io::Result<()> {
-    w.write_all(&[TAG_COMPOUND])?;
-    w.write_all(&(name.len() as u16).to_be_bytes())?;
-    w.write_all(name.as_bytes())?;
-    write_payload(w, tag)
+/// gzip-or-plain NBT blob -> root compound (player .dat files).
+pub(crate) fn read_compressed(bytes: &[u8]) -> Option<Compound> {
+    let raw = if bytes.starts_with(&[0x1f, 0x8b]) {
+        crate::mca::decompress(crate::mca::CompressionType::Gzip, bytes).ok()?
+    } else {
+        bytes.to_vec()
+    };
+    match SliceReader::new(&raw).read().ok()? {
+        Tag::Compound(c) => Some(c),
+        _ => None,
+    }
 }
 
 /// Serialize a compound borrowed as the root tag — same byte layout as
@@ -702,14 +522,8 @@ fn write_snbt(tag: &Tag, out: &mut String) {
             }
             out.push('"');
         }
-        Tag::List(et, items) => {
+        Tag::List(_, items) => {
             out.push('[');
-            match *et {
-                TAG_BYTE_ARRAY => {
-                    // stored as raw bytes
-                }
-                _ => {}
-            }
             for (i, it) in items.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
@@ -1068,22 +882,44 @@ fn utf8_len(b: u8) -> usize {
 // ---------------------------------------------------------------------------
 // path mutation: "a.b[0].c" (names and [index] list access)
 
-/// split "a.b[0].c" into path segments: names and indices
+/// split "a.b[0].c" into path segments: names and [index] list access.
+/// Inside brackets the content is literal — `.` stays part of the segment
+/// and `]` is addressable as `\]` (e.g. `x[a.b]` reads key "a.b").
 fn path_segments(path: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for part in path.split('.') {
-        let mut rest = part;
-        while let Some(br) = rest.find('[') {
-            if br > 0 {
-                out.push(rest[..br].to_string());
+    let mut cur = String::new();
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '.' => out.push(std::mem::take(&mut cur)),
+            '[' => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                let mut seg = String::new();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            if let Some(&n) = chars.peek() {
+                                if n == ']' || n == '\\' {
+                                    chars.next();
+                                    seg.push(n);
+                                    continue;
+                                }
+                            }
+                            seg.push(c);
+                        }
+                        ']' => break,
+                        _ => seg.push(c),
+                    }
+                }
+                out.push(seg);
             }
-            let end = rest.find(']').unwrap_or(rest.len());
-            out.push(rest[br + 1..end.min(rest.len())].to_string());
-            rest = &rest[end.min(rest.len() - 1) + 1..];
+            _ => cur.push(c),
         }
-        if !rest.is_empty() {
-            out.push(rest.to_string());
-        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
     }
     out
 }
@@ -1128,17 +964,32 @@ pub fn path_get_mut<'a>(root: &'a mut Compound, path: &str) -> Option<&'a mut Ta
 pub fn path_remove(root: &mut Compound, path: &str) -> bool {
     let mut segs = path_segments(path);
     let Some(last) = segs.pop() else { return false };
-    // navigate to parent container
-    let parent_path = segs.join(".");
-    let parent = if segs.is_empty() {
-        None
-    } else {
-        path_get_mut(root, &parent_path)
+    if segs.is_empty() {
+        return root.shift_remove(&last).is_some();
+    }
+    // navigate the parent segments directly — re-joining them with "." would
+    // reparse segments that legitimately contain dots
+    let first = segs.remove(0);
+    let mut cur = match root.get_mut(&first) {
+        Some(t) => t,
+        None => return false,
     };
-    match parent {
-        None => root.shift_remove(&last).is_some(),
-        Some(Tag::Compound(c)) => c.shift_remove(&last).is_some(),
-        Some(Tag::List(_, l)) => match last.parse::<usize>() {
+    for seg in segs {
+        cur = match cur {
+            Tag::Compound(c) => match c.get_mut(&seg) {
+                Some(t) => t,
+                None => return false,
+            },
+            Tag::List(_, l) => match seg.parse::<usize>().ok().and_then(|i| l.get_mut(i)) {
+                Some(t) => t,
+                None => return false,
+            },
+            _ => return false,
+        };
+    }
+    match cur {
+        Tag::Compound(c) => c.shift_remove(&last).is_some(),
+        Tag::List(_, l) => match last.parse::<usize>() {
             Ok(i) if i < l.len() => {
                 l.remove(i);
                 true
@@ -1174,37 +1025,6 @@ pub fn path_insert(root: &mut Compound, path: &str, name: &str, tag: Tag) -> Res
     }
 }
 
-
-/// set the leaf tag at a dotted path, creating intermediate compounds.
-/// `TAG_END` value deletes the leaf (upstream ChangeNbt "delete" semantics).
-pub fn path_set(c: &mut Compound, path: &str, val: Tag) {
-    let mut parts = path.split('.').peekable();
-    let mut cur: &mut Compound = c;
-    while let Some(p) = parts.next() {
-        if parts.peek().is_none() {
-            if val.id() == TAG_END {
-                cur.remove(p);
-            } else {
-                cur.insert(p.to_string(), val.clone());
-            }
-            return;
-        }
-        let entry = cur
-            .entry(p.to_string())
-            .or_insert_with(|| Tag::Compound(Default::default()));
-        match entry {
-            Tag::Compound(cc) => cur = cc,
-            _ => {
-                *entry = Tag::Compound(Default::default());
-                if let Tag::Compound(cc) = entry {
-                    cur = cc;
-                } else {
-                    return;
-                }
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod snbt_tests {

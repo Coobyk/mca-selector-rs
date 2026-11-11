@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub const HEADER_SIZE: usize = 8192;
-pub const HEADER_OFFSETS_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompressionType {
@@ -152,7 +151,7 @@ fn lz4_decompress_blocks(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// lz4 block output framing for saving (LZ4BlockOutputStream, 64KiB blocks).
-pub fn lz4_compress_blocks(data: &[u8]) -> Result<Vec<u8>> {
+fn lz4_compress_blocks(data: &[u8]) -> Result<Vec<u8>> {
     const BLOCK: usize = 64 * 1024;
     let mut out = Vec::new();
     for chunk in data.chunks(BLOCK) {
@@ -224,9 +223,9 @@ fn decompress_into<'a>(
     })
 }
 
-/// Per-worker decompression buffer. Region loads inflate up to 1024 chunks;
-/// reusing one Vec per thread turns ~1024 grow-to-size allocations per
-/// region into ~one per worker.
+// Per-worker decompression buffer. Region loads inflate up to 1024 chunks;
+// reusing one Vec per thread turns ~1024 grow-to-size allocations per
+// region into ~one per worker.
 thread_local! {
     static DECOMPRESS_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
@@ -283,6 +282,12 @@ pub struct McaFile {
     pub chunks: Vec<Option<Chunk>>,
     pub offsets: [i32; 1024],
     pub sectors: [u8; 1024],
+    /// set by `load(true)` — arrays were parsed as undecoded byte blobs and
+    /// would serialize back corrupted, so all write paths refuse.
+    pub raw_mode: bool,
+    /// chunks that failed to parse on the last `load` (upstream logs and
+    /// skips them; we count them so callers can surface the number).
+    pub skipped: usize,
 }
 
 /// 3-byte big-endian chunk-offset decode (header i-th entry)
@@ -346,6 +351,8 @@ impl McaFile {
             chunks: std::iter::repeat_with(|| None).take(1024).collect(),
             offsets: [0; 1024],
             sectors: [0; 1024],
+            raw_mode: false,
+            skipped: 0,
         })
     }
 
@@ -357,6 +364,8 @@ impl McaFile {
             chunks: std::iter::repeat_with(|| None).take(1024).collect(),
             offsets: [0; 1024],
             sectors: [0; 1024],
+            raw_mode: false,
+            skipped: 0,
         }
     }
 
@@ -410,21 +419,18 @@ impl McaFile {
         Ok(data)
     }
 
-    
-
-    /// loadOffsets: only the offset table — read just the first 4KiB instead
-    /// of the whole (multi-MB) region file; callers only need the header.
+    /// loadOffsets: read just the 8KiB header (offsets + sectors + timestamps)
+    /// instead of the whole (multi-MB) region file. Callers like defragment()
+    /// require all three header tables.
     pub fn load_offsets(&mut self) -> Result<()> {
-        let mut hdr = [0u8; HEADER_OFFSETS_SIZE];
+        let mut hdr = [0u8; HEADER_SIZE];
         let mut f = std::fs::File::open(&self.file)?;
         match f.read_exact(&mut hdr) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e.into()),
         }
-        for i in 0..1024 {
-            self.offsets[i] = offset_at(&hdr, i);
-        }
+        self.parse_header(&hdr);
         Ok(())
     }
 
@@ -443,9 +449,12 @@ impl McaFile {
     }
 
     /// load(raw): reads header then every chunk's NBT.
-    /// `raw` => arrays parse as raw bytes (fast path used by the renderer).
+    /// `raw` => arrays parse as raw bytes (fast path used by the renderer)
+    /// and marks the file unserializable (`raw_mode`).
     pub fn load(&mut self, raw: bool) -> Result<()> {
         let data = self.read_file()?;
+        self.raw_mode = raw;
+        self.skipped = 0;
         if data.len() <= HEADER_SIZE {
             return Ok(());
         }
@@ -455,6 +464,7 @@ impl McaFile {
         let offsets = &self.offsets;
         let timestamps = &self.timestamps;
         let file = &self.file;
+        let failed = std::sync::atomic::AtomicUsize::new(0);
         let parse = |i: usize| -> Option<Chunk> {
             if offsets[i] == 0 {
                 return None;
@@ -462,13 +472,12 @@ impl McaFile {
             let loc = origin.add_p(Point2i::from_chunk_index(i as i32));
             let pos = offsets[i] as usize * 4096;
             match Self::parse_chunk(data, pos, loc, file, raw) {
-                Ok(Some(mut c)) => {
+                Ok(mut c) => {
                     c.timestamp = timestamps[i];
                     Some(c)
                 }
-                Ok(None) => None,
-                Err(e) => {
-                    eprintln!("failed to load chunk at {loc}: {e}");
+                Err(_) => {
+                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     None
                 }
             }
@@ -493,16 +502,19 @@ impl McaFile {
         } else {
             (0..1024).map(parse).collect()
         };
+        self.skipped = failed.load(std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
+    /// Parse the `[len i32][type u8][payload]` record starting at `pos`.
+    /// A non-compound root yields a Chunk with data=None (never Ok(None)).
     fn parse_chunk(
         data: &[u8],
         pos: usize,
         loc: Point2i,
         file: &Path,
         raw: bool,
-    ) -> Result<Option<Chunk>> {
+    ) -> Result<Chunk> {
         if pos + 5 > data.len() {
             bail!("chunk offset out of bounds");
         }
@@ -543,7 +555,7 @@ impl McaFile {
             Tag::Compound(c) => Some(c),
             _ => None,
         };
-        Ok(Some(chunk))
+        Ok(chunk)
     }
 
     pub fn load_single_chunk(&self, chunk: Point2i, raw: bool) -> Result<Option<Chunk>> {
@@ -570,7 +582,8 @@ impl McaFile {
         let o = idx * 4;
         let timestamp = i32::from_be_bytes(hdr[4096 + o..4096 + o + 4].try_into().unwrap());
         if offset <= 0 {
-            return Ok(Some(Chunk::new(abs)));
+            // no chunk recorded — same as load() leaving the slot None
+            return Ok(None);
         }
         let pos = offset as usize * 4096;
         // parse_chunk wants a buffer laid out as [len i32][type u8][payload]
@@ -590,20 +603,10 @@ impl McaFile {
         let mut data = Vec::with_capacity(5 + payload_len);
         data.extend_from_slice(&head);
         (&mut f).take(payload_len as u64).read_to_end(&mut data)?;
-        match Self::parse_chunk(&data, 0, abs, &self.file, raw) {
-            Ok(mut c) => {
-                if let Some(c) = c.as_mut() {
-                    c.timestamp = timestamp;
-                }
-                Ok(c)
-            }
-            Err(e) => Err(e),
-        }
+        let mut c = Self::parse_chunk(&data, 0, abs, &self.file, raw)?;
+        c.timestamp = timestamp;
+        Ok(Some(c))
     }
-
-    
-
-    
 
     /// ChunkSet of present chunks (offsets > 0).
     pub fn offsets_chunk_set(&self) -> crate::selection::ChunkSet {
@@ -629,9 +632,22 @@ impl McaFile {
         }
     }
 
+    /// Refuse to serialize a raw-loaded file: its arrays are undecoded byte
+    /// blobs that would write back as corrupted ByteArrays (silent data loss).
+    fn ensure_serializable(&self) -> Result<()> {
+        if self.raw_mode {
+            bail!(
+                "refusing to write {}: file was loaded with raw=true",
+                self.file.display()
+            );
+        }
+        Ok(())
+    }
+
     /// save(raf): writes all chunks sequentially starting at sector 2.
     /// Returns false if no chunks were written.
-    pub fn save_to<W: std::io::Write + std::io::Seek>(&self, w: &mut W) -> Result<bool> {
+    fn save_to<W: std::io::Write + std::io::Seek>(&self, w: &mut W) -> Result<bool> {
+        self.ensure_serializable()?;
         use std::io::SeekFrom;
         let mut global_offset: i64 = 2;
         let mut last_written = 0usize;
@@ -677,18 +693,21 @@ impl McaFile {
 
     /// saveWithTempFile
     pub fn save_with_temp_file(&self, dest: &Path) -> Result<bool> {
+        self.ensure_serializable()?;
         let tmp = dest.with_extension("mca.tmp");
         let result = {
             let mut f = std::fs::File::create(&tmp)?;
             self.save_to(&mut std::io::BufWriter::new(&mut f))?;
-            f.sync_all().ok();
+            f.sync_all()?;
             // determine whether anything was written: re-open and check size > 8192
             drop(f);
             std::fs::metadata(&tmp).map(|m| m.len() > HEADER_SIZE as u64).unwrap_or(false)
         };
         if !result {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(&tmp); // temp cleanup: best-effort
             if dest.exists() {
+                // upstream deletes the file when a save produced nothing
+                // (all chunks deleted); a lingering file is harmless
                 let _ = std::fs::remove_file(dest);
             }
         } else {
@@ -700,6 +719,10 @@ impl McaFile {
 
     /// deFragment: copy raw sectors of present chunks into a compacted file.
     pub fn defragment(&self, dest: &Path) -> Result<()> {
+        // copies sectors, not NBT — but a raw-loaded file must never reach a
+        // write path, so the same guard applies. (load_offsets users never
+        // set raw_mode, so header-only defragment is unaffected.)
+        self.ensure_serializable()?;
         let src = self.read_file()?;
         let tmp = self.file.with_extension("mca.defrag.tmp");
         {
@@ -741,8 +764,9 @@ impl McaFile {
             w.flush()?;
             if skipped == 1024 {
                 drop(w);
-                let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::remove_file(&tmp); // temp cleanup: best-effort
                 if dest == self.file {
+                    // same empty-region delete as save_with_temp_file
                     let _ = std::fs::remove_file(dest);
                 }
                 invalidate_file_cache(dest);
@@ -754,60 +778,20 @@ impl McaFile {
         Ok(())
     }
 
-    /// RegionMCAFile.getStructures: chunk -> structure names from
-    /// structures.Starts (references + POI are upstream-cached separately).
+    /// RegionMCAFile.getStructures: chunk -> structure names via
+    /// `chunk::structure_starts` (upstream ChunkFilter.parseStructureStarts;
+    /// references + POI are upstream-cached separately).
     pub fn structures(&self) -> std::collections::HashMap<i64, Vec<String>> {
         let mut map = std::collections::HashMap::new();
         for chunk in self.chunks.iter().flatten() {
             let Some(data) = &chunk.data else { continue };
-            let mut names = Vec::new();
-            // modern (21w43a+): structures.starts — every compound entry's key
-            if let Some(starts) = data
-                .get("structures")
-                .and_then(Tag::as_compound)
-                .and_then(|st| st.get("starts"))
-                .and_then(Tag::as_compound)
-            {
-                for (name, tag) in starts {
-                    if tag.as_compound().is_some() && !names.contains(name) {
-                        names.push(name.clone());
-                    }
-                }
-            }
-            // legacy (15w32a+): {Level|region}.Structures.Starts — compound with
-            // size>1 and non-null "id" (upstream parseStructureStarts)
-            let level: Option<&Compound> = data
-                .get("Level")
-                .or_else(|| data.get("region"))
-                .and_then(Tag::as_compound)
-                .or(Some(data));
-            if let Some(starts) = level
-                .and_then(|l| l.get("Structures"))
-                .and_then(Tag::as_compound)
-                .and_then(|st| st.get("Starts"))
-                .and_then(Tag::as_compound)
-            {
-                for (_key, tag) in starts {
-                    if let Some(c) = tag.as_compound() {
-                        if c.len() > 1 {
-                            if let Some(id) = c.get("id").and_then(Tag::as_string) {
-                                let id = id.trim_start_matches("minecraft:");
-                                if !names.iter().any(|n| n == id) {
-                                    names.push(id.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let names = crate::chunk::structure_starts(data);
             if !names.is_empty() {
                 map.insert(chunk.absolute_location.as_long(), names);
             }
         }
         map
     }
-
-    
 }
 
 /// write a single chunk at the writer's current position (length + type + data).
@@ -849,29 +833,9 @@ fn write_chunk_data<W: std::io::Write>(
 }
 
 
-#[derive(Clone, Debug)]
-pub struct RegionDirectories {
-    pub location: Point2i,
-    pub region: Option<PathBuf>,
-    pub poi: Option<PathBuf>,
-    pub entities: Option<PathBuf>,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct WorldDirectories {
     pub region: Option<PathBuf>,
     pub poi: Option<PathBuf>,
     pub entities: Option<PathBuf>,
-}
-
-
-
-/// ChunkData bundles region+poi+entities chunks of one coordinate.
-#[derive(Default)]
-pub struct ChunkData<'a> {
-    pub location: Point2i,
-    pub region: Option<&'a Chunk>,
-    pub poi: Option<&'a Chunk>,
-    pub entities: Option<&'a Chunk>,
-    pub selected: bool,
 }

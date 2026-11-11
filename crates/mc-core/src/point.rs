@@ -1,4 +1,4 @@
-//! Port of util.point.Point2i / Point2f / Point3i.
+//! Port of util.point.Point2i / Point2f.
 //!
 //! All shift-based conversions use arithmetic shifts, matching Java's `>>`.
 
@@ -71,11 +71,6 @@ impl Point2i {
         Point2i::new(self.x << 5, self.z << 5)
     }
 
-    /// Java % semantics are not used: mod(32) in Point2i wraps to 0..31 via &.
-    pub fn modulo(&self, m: i32) -> Point2i {
-        Point2i::new(self.x % m, self.z % m)
-    }
-
     pub fn add(&self, x: i32, z: i32) -> Point2i {
         Point2i::new(self.x + x, self.z + z)
     }
@@ -91,8 +86,6 @@ impl Point2i {
     pub fn sub_v(&self, x: i32, z: i32) -> Point2i {
         Point2i::new(self.x - x, self.z - z)
     }
-
-    
 
     pub fn div(&self, d: i32) -> Point2i {
         Point2i::new(self.x / d, self.z / d)
@@ -146,12 +139,4 @@ impl Point2f {
         Point2i::new(self.x as i32, self.z as i32)
     }
 }
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Point3i {
-    pub x: i32,
-    pub y: i32,
-    pub z: i32,
-}
-
 

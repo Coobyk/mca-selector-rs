@@ -27,17 +27,6 @@ impl BitSet {
         let w = i >> 6;
         w < self.words.len() && (self.words[w] >> (i & 63)) & 1 == 1
     }
-    /// Java BitSet.toByteArray -> little endian bytes.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let n = self.len.div_ceil(8).max(1);
-        let mut out = vec![0u8; n];
-        for i in 0..self.len.max(n * 8) {
-            if self.get(i) {
-                out[i >> 3] |= 1 << (i & 7);
-            }
-        }
-        out
-    }
     /// BitSet.valueOf(byte[]).
     pub fn from_bytes(b: &[u8]) -> Self {
         let mut s = BitSet::new();
@@ -48,7 +37,7 @@ impl BitSet {
         }
         s
     }
-    
+
     pub fn from_base64(s: &str) -> Option<Self> {
         let b = base64::engine::general_purpose::STANDARD.decode(s).ok()?;
         Some(Self::from_bytes(&b))

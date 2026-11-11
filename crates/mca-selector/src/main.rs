@@ -1,9 +1,15 @@
 mod actions;
 mod config;
+mod dialogs;
+mod input;
 mod nbt_editor;
 mod ops;
+mod paint;
+mod slider;
+mod statusbar;
 mod tilemap;
 mod view;
+mod world;
 
 use actions::*;
 use gpui::*;

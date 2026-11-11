@@ -11,9 +11,6 @@ pub const TRANSPARENT: u8 = 0b0000_0001;
 pub const GRASS_TINT: u8 = 0b0000_0010;
 pub const FOLIAGE_TINT: u8 = 0b0000_0100;
 pub const WATER: u8 = 0b0000_1000;
-pub const FOLIAGE: u8 = 0b0001_0000;
-pub const STATIC_TINT: u8 = 0b0010_0000;
-pub const STATIC_COLOR: u8 = 0b0100_0000;
 pub const DRY_FOLIAGE_TINT: u8 = 0b1000_0000;
 pub const TINTED: u8 = GRASS_TINT | FOLIAGE_TINT | WATER | DRY_FOLIAGE_TINT;
 
@@ -44,12 +41,6 @@ impl StateColors {
                 .unwrap_or(*default),
         }
     }
-    pub fn default_color(&self) -> BlockColor {
-        match self {
-            StateColors::Single(c) => *c,
-            StateColors::States { default, .. } => *default,
-        }
-    }
     pub fn iter_entries(&self) -> Vec<(Option<BitSet>, BlockColor)> {
         match self {
             StateColors::Single(c) => vec![(None, *c)],
@@ -64,7 +55,6 @@ impl StateColors {
 #[derive(Debug)]
 pub struct BlockStates {
     states: HashMap<String, HashMap<String, usize>>,
-    waterlogged: usize,
 }
 
 impl BlockStates {
@@ -82,16 +72,6 @@ impl BlockStates {
         }
         Some(s)
     }
-    pub fn is_waterlogged(&self, properties: Option<&Compound>) -> bool {
-        match properties {
-            Some(p) => p
-                .get("waterlogged")
-                .and_then(|t| t.as_string())
-                .map(|s| s == "true")
-                .unwrap_or(false),
-            None => false,
-        }
-    }
 }
 
 /// Biome tints [grass, foliage, water, dry_foliage].
@@ -108,18 +88,13 @@ pub type TintCache = HashMap<String, HashMap<String, StateColors>>;
 pub struct ColorConfig {
     pub states: BlockStates,
     pub colors: HashMap<String, StateColors>,
-    pub tints: BiomeColors,
     pub tint_cache: TintCache,
 }
 
 impl ColorConfig {
-    pub fn get_color(&self, name: &str, biome: &str, properties: Option<&Compound>) -> BlockColor {
-        self.get_color_state(name, biome, self.states.get_state(properties).as_ref())
-    }
-
-    /// get_color with the block-state bitset already resolved. The renderer
-    /// computes each palette entry's state once instead of calling get_state
-    /// (which allocates a BitSet) for every column.
+    /// The block-state bitset is resolved by the caller — renderers compute
+    /// each palette entry's state once instead of calling get_state (which
+    /// allocates a BitSet) for every column.
     pub fn get_color_state(&self, name: &str, biome: &str, state: Option<&BitSet>) -> BlockColor {
         let block_color = self
             .colors
@@ -193,16 +168,7 @@ fn parse_block_color(v: &serde_json::Value) -> BlockColor {
 
 pub fn load_color_config(json: &str) -> ColorConfig {
     let raw: RawColorConfig = serde_json::from_str(json).expect("invalid color config json");
-    let waterlogged = raw
-        .states
-        .get("waterlogged")
-        .and_then(|m| m.get("true"))
-        .copied()
-        .unwrap_or(0);
-    let states = BlockStates {
-        states: raw.states,
-        waterlogged,
-    };
+    let states = BlockStates { states: raw.states };
     let mut colors: HashMap<String, StateColors> = HashMap::new();
     for (name, v) in raw.colors {
         match &v {
@@ -244,7 +210,6 @@ pub fn load_color_config(json: &str) -> ColorConfig {
     ColorConfig {
         states,
         colors,
-        tints,
         tint_cache,
     }
 }
@@ -302,8 +267,6 @@ pub struct ColorProperties {
     pub dry_foliage_tint: HashSet<String>,
     pub water: HashSet<String>,
     pub foliage: HashSet<String>,
-    pub static_tint: HashMap<String, String>,
-    pub static_color: HashMap<String, String>,
 }
 
 pub fn color_properties() -> &'static ColorProperties {

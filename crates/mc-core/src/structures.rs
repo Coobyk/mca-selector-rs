@@ -12,8 +12,6 @@ pub struct StructureData {
     pub icon: String,
     #[serde(default, rename = "allNames")]
     pub all_names: Vec<String>,
-    #[serde(default)]
-    pub alt: Option<Vec<String>>,
     #[serde(default, rename = "maxScale")]
     pub max_scale: f32,
 }

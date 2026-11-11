@@ -1,20 +1,17 @@
 //! Filter-driven region jobs, ported from upstream `io.job.SelectFilterJob`,
-//! `DeleteFilterJob` and `ExportFilterJob`.
+//! `DeleteFilterJob` and `ExportFilterJob` over the shared `batch` skeleton
+//! (upstream `WorldDirectories.listRegions` + `Region.loadRegion`).
 //!
-//! Each helper iterates the region locations present in any of the three
-//! directories (region / poi / entities) of `WorldDirectories`, loads the
-//! matching `McaFile`s and applies the compiled `filter::Expr` per chunk.
 //! Deviations: upstream `Region.deleteChunks`/`keepChunks` pass the *region*
 //! location to `Selection.isChunkSelected` (an upstream bug); we pass the
 //! absolute chunk location like `getFilteredChunks` does.
 
-use crate::files::{mca_file_name, parse_mca_file_name};
+use crate::batch::{self, RegionFiles};
 use crate::filter::{Expr, FilterCtx, MatchType};
 use crate::mca::{Chunk, McaFile, WorldDirectories};
 use crate::nbt;
 use crate::point::Point2i;
 use crate::selection::{ChunkSet, Selection};
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 /// upstream FilterChunksDialog.ApplyType for run_filter_select.
@@ -33,68 +30,22 @@ pub struct FilterJobResult {
     pub chunks_matched: usize,
     /// region files whose contents were written back / written out
     pub files_written: usize,
-    /// per-field errors collected while applying fields
+    /// per-field errors collected while applying fields + save failures
     pub errors: usize,
 }
 
-/// all r.x.z region locations present in any of the three world dirs,
-/// optionally restricted to regions touched by `selection`.
-fn region_locations(
-    wd: &WorldDirectories,
-    selection: Option<&Selection>,
-) -> Vec<Point2i> {
-    let mut locs = BTreeSet::new();
-    for dir in [&wd.region, &wd.poi, &wd.entities].into_iter().flatten() {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let Some(name) = e.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if let Some(r) = parse_mca_file_name(&name) {
-                if selection
-                    .map(|s| s.is_any_chunk_in_region_selected(r.as_long()))
-                    .unwrap_or(true)
-                {
-                    locs.insert(r.as_long());
-                }
-            }
-        }
-    }
-    locs.into_iter().map(Point2i::from_long).collect()
-}
-
-fn load_mca(path: &PathBuf) -> Option<McaFile> {
-    let mut m = McaFile::new(path.clone()).ok()?;
-    m.load(false).ok()?;
-    Some(m)
-}
-
-fn dir_file(dir: &Option<PathBuf>, r: Point2i) -> Option<PathBuf> {
-    dir.as_ref().map(|d| d.join(mca_file_name(r)))
-}
-
-struct RegionFiles {
-    region: Option<(PathBuf, McaFile)>,
-    poi: Option<(PathBuf, McaFile)>,
-    entities: Option<(PathBuf, McaFile)>,
-}
-
-fn load_region_files(wd: &WorldDirectories, r: Point2i) -> RegionFiles {
-    let load = |d: &Option<PathBuf>| dir_file(d, r).and_then(|p| load_mca(&p).map(|m| (p, m)));
-    RegionFiles {
-        region: load(&wd.region),
-        poi: load(&wd.poi),
-        entities: load(&wd.entities),
-    }
+/// `selection` as a `&Selection` usable in a `RegionJobCtx`: `None` maps to
+/// `Selection::all()` — the "whole world" encoding (inverted, no
+/// exclusions), so `ctx.chunk_selected` answers correctly either way.
+fn effective_sel<'a>(selection: Option<&'a Selection>, all: &'a Selection) -> &'a Selection {
+    selection.unwrap_or(all)
 }
 
 fn chunk_at<'a>(files: &'a RegionFiles, i: usize) -> Option<&'a Chunk> {
     files
         .region
         .as_ref()
-        .and_then(|(_, m)| m.chunks.get(i))
+        .and_then(|m| m.chunks.get(i))
         .and_then(|c| c.as_ref())
         .filter(|c| c.data.is_some())
 }
@@ -115,6 +66,16 @@ fn chunk_index_loc(r: Point2i, i: usize) -> Point2i {
     r.region_to_chunk().add_p(Point2i::from_chunk_index(i as i32))
 }
 
+fn dir_file(dir: &Option<PathBuf>, r: Point2i) -> Option<PathBuf> {
+    dir.as_ref().map(|d| d.join(crate::files::mca_file_name(r)))
+}
+
+fn chunk_mut(m: &mut Option<McaFile>, i: usize) -> Option<&mut Chunk> {
+    m.as_mut()
+        .and_then(|m| m.chunks.get_mut(i))
+        .and_then(|c| c.as_mut())
+}
+
 /// upstream SelectFilterJob: collect chunks matching `expr` (restricted to
 /// `selection` when given), expand by `radius` (bounded by `selection`),
 /// then merge into `target` per `apply`. Returns matched-chunk count.
@@ -127,55 +88,52 @@ pub fn run_filter_select(
     target: &mut Selection,
 ) -> Result<FilterJobResult, String> {
     let mut res = FilterJobResult::default();
-    let mut ctx = FilterCtx::new(wd.region.clone(), wd.entities.clone());
-    for r in region_locations(wd, selection) {
-        if !applies_to_region(expr, r, &mut ctx) {
-            continue;
-        }
-        res.regions_processed += 1;
-        let files = load_region_files(wd, r);
+    let mut fctx = FilterCtx::new(wd.region.clone(), wd.entities.clone());
+    let all = Selection::all();
+    let sel = effective_sel(selection, &all);
+    // region-level filter early-out happens before any file load (upstream
+    // SelectFilterJob skips the load when the filter can't match).
+    let regions: Vec<_> = batch::list_regions(wd, selection)
+        .into_iter()
+        .filter(|(r, _)| applies_to_region(expr, *r, &mut fctx))
+        .collect();
+    let sum = batch::run_region_loop(wd, sel, regions, false, |files, ctx, _errs| {
+        let r = ctx.region;
         let mut chunks = ChunkSet::new();
         for i in 0..1024 {
-            let loc = chunk_index_loc(r, i);
-            if selection.map(|s| s.is_chunk_selected(loc)).unwrap_or(true)
-                && matches(expr, &files, i, &mut ctx)
-            {
+            if ctx.chunk_selected(chunk_index_loc(r, i)) && matches(expr, files, i, &mut fctx) {
                 chunks.set(i);
             }
         }
         if chunks.is_empty() {
-            continue;
+            return;
         }
         res.chunks_matched += chunks.size();
-        // Selection.addAll(location, chunks): size==1024 -> whole region
         let mut per = Selection::new();
-        if chunks.size() == 1024 {
-            per.add_region(r.as_long());
-        } else {
-            per.selection.insert(r.as_long(), Some(chunks));
-        }
+        per.set_region(r.as_long(), Some(chunks));
         per.add_radius(radius, selection);
         match apply {
             ApplyType::Overwrite | ApplyType::Add => target.merge(&per),
             ApplyType::Subtract => {
-                for (region, cs) in &per.selection {
+                for (region, cs) in per.regions() {
                     match cs {
                         None => {
-                            target.remove_region(*region);
+                            target.remove_region(region);
                         }
                         Some(cs) => {
-                            let base = Point2i::from_long(*region).region_to_chunk();
+                            let base = Point2i::from_long(region).region_to_chunk();
                             for i in cs.iter() {
-                                target.remove_chunk(
-                                    base.add_p(Point2i::from_chunk_index(i as i32)),
-                                );
+                                target
+                                    .remove_chunk(base.add_p(Point2i::from_chunk_index(i as i32)));
                             }
                         }
                     }
                 }
             }
         }
-    }
+    });
+    res.regions_processed = sum.processed;
+    res.errors += sum.errors.len();
     Ok(res)
 }
 
@@ -187,37 +145,42 @@ pub fn run_filter_delete(
     selection: Option<&Selection>,
 ) -> Result<FilterJobResult, String> {
     let mut res = FilterJobResult::default();
-    let mut ctx = FilterCtx::new(wd.region.clone(), wd.entities.clone());
-    for r in region_locations(wd, selection) {
-        if !applies_to_region(expr, r, &mut ctx) {
-            continue;
-        }
-        res.regions_processed += 1;
-        let mut files = load_region_files(wd, r);
+    let mut fctx = FilterCtx::new(wd.region.clone(), wd.entities.clone());
+    let all = Selection::all();
+    let sel = effective_sel(selection, &all);
+    let regions: Vec<_> = batch::list_regions(wd, selection)
+        .into_iter()
+        .filter(|(r, _)| applies_to_region(expr, *r, &mut fctx))
+        .collect();
+    let sum = batch::run_region_loop(wd, sel, regions, false, |files, ctx, errs| {
+        let r = ctx.region;
         let mut to_delete = ChunkSet::new();
         for i in 0..1024 {
-            let loc = chunk_index_loc(r, i);
-            if selection.map(|s| s.is_chunk_selected(loc)).unwrap_or(true)
-                && matches(expr, &files, i, &mut ctx)
-            {
+            if ctx.chunk_selected(chunk_index_loc(r, i)) && matches(expr, files, i, &mut fctx) {
                 to_delete.set(i);
             }
         }
         if to_delete.is_empty() {
-            continue;
+            return;
         }
         res.chunks_matched += to_delete.size();
-        for f in [&mut files.region, &mut files.poi, &mut files.entities]
-            .into_iter()
-            .flatten()
-        {
-            f.1.delete_chunks(&to_delete);
-            let p = f.0.clone();
-            if f.1.save_with_temp_file(&p).unwrap_or(false) {
-                res.files_written += 1;
+        for kind in [batch::McKind::Region, batch::McKind::Poi, batch::McKind::Entities] {
+            let f = match kind {
+                batch::McKind::Region => &mut files.region,
+                batch::McKind::Poi => &mut files.poi,
+                batch::McKind::Entities => &mut files.entities,
+            };
+            if let Some(m) = f {
+                m.delete_chunks(&to_delete);
+                files.touch(kind);
             }
         }
-    }
+        // count actual writes here — save failures land in `errs`, not in
+        // files_written.
+        res.files_written += files.save_dirty(errs);
+    });
+    res.regions_processed = sum.processed;
+    res.errors += sum.errors.len();
     Ok(res)
 }
 
@@ -231,26 +194,19 @@ pub fn run_change_fields(
     selection: Option<&Selection>,
 ) -> Result<FilterJobResult, String> {
     let mut res = FilterJobResult::default();
-    for r in region_locations(wd, selection) {
-        let mut files = load_region_files(wd, r);
-        res.regions_processed += 1;
+    let all = Selection::all();
+    let sel = effective_sel(selection, &all);
+    let regions = batch::list_regions(wd, selection);
+    let sum = batch::run_region_loop(wd, sel, regions, false, |files, ctx, errs| {
+        let r = ctx.region;
         for i in 0..1024 {
-            let loc = chunk_index_loc(r, i);
-            if !selection.map(|s| s.is_chunk_selected(loc)).unwrap_or(true) {
+            if !ctx.chunk_selected(chunk_index_loc(r, i)) {
                 continue;
-            }
-            fn chunk_mut<'x>(
-                m: &'x mut Option<(PathBuf, McaFile)>,
-                i: usize,
-            ) -> Option<&'x mut Chunk> {
-                m.as_mut()
-                    .and_then(|(_, m)| m.chunks.get_mut(i))
-                    .and_then(|c| c.as_mut())
             }
             let has_data = [&files.region, &files.poi, &files.entities]
                 .into_iter()
                 .flatten()
-                .any(|(_, m)| {
+                .any(|m| {
                     m.chunks
                         .get(i)
                         .and_then(|c| c.as_ref())
@@ -260,25 +216,22 @@ pub fn run_change_fields(
             if !has_data {
                 continue;
             }
-            let mut refs = crate::changer::ChunkRefs {
+            let mut refs = crate::chunk::ChunkRefs {
                 region: chunk_mut(&mut files.region, i),
                 poi: chunk_mut(&mut files.poi, i),
                 entities: chunk_mut(&mut files.entities, i),
             };
             let cr = crate::changer::apply_change(&mut refs, fields, force);
             res.chunks_matched += 1;
-            res.errors += cr.errors.len();
+            errs.extend(cr.errors);
         }
-        for f in [&mut files.region, &mut files.poi, &mut files.entities]
-            .into_iter()
-            .flatten()
-        {
-            let p = f.0.clone();
-            if f.1.save_with_temp_file(&p).unwrap_or(false) {
-                res.files_written += 1;
-            }
+        for kind in [batch::McKind::Region, batch::McKind::Poi, batch::McKind::Entities] {
+            files.touch(kind);
         }
-    }
+        res.files_written += files.save_dirty(errs);
+    });
+    res.regions_processed = sum.processed;
+    res.errors += sum.errors.len();
     Ok(res)
 }
 
@@ -292,30 +245,27 @@ pub fn run_filter_export(
     dest: &WorldDirectories,
 ) -> Result<FilterJobResult, String> {
     let mut res = FilterJobResult::default();
-    let mut ctx = FilterCtx::new(wd.region.clone(), wd.entities.clone());
-    for r in region_locations(wd, selection) {
-        if !applies_to_region(expr, r, &mut ctx) {
-            continue;
-        }
-        let to_region = dir_file(&dest.region, r);
-        let to_poi = dir_file(&dest.poi, r);
-        let to_entities = dir_file(&dest.entities, r);
-        if [&to_region, &to_poi, &to_entities]
-            .into_iter()
-            .flatten()
-            .any(|p| p.exists())
-        {
-            continue; // upstream: "exists, not overwriting"
-        }
-        res.regions_processed += 1;
-        let mut files = load_region_files(wd, r);
+    let mut fctx = FilterCtx::new(wd.region.clone(), wd.entities.clone());
+    let all = Selection::all();
+    let sel = effective_sel(selection, &all);
+    let regions: Vec<_> = batch::list_regions(wd, selection)
+        .into_iter()
+        .filter(|(r, _)| applies_to_region(expr, *r, &mut fctx))
+        .filter(|(r, _)| {
+            // upstream: "exists, not overwriting" — the skip precedes the load
+            ![&dest.region, &dest.poi, &dest.entities]
+                .into_iter()
+                .flatten()
+                .map(|d| d.join(crate::files::mca_file_name(*r)))
+                .any(|p| p.exists())
+        })
+        .collect();
+    let sum = batch::run_region_loop(wd, sel, regions, false, |files, ctx, errs| {
+        let r = ctx.region;
         // keepChunks: delete everything that does NOT match
         let mut keep = ChunkSet::new();
         for i in 0..1024 {
-            let loc = chunk_index_loc(r, i);
-            if selection.map(|s| s.is_chunk_selected(loc)).unwrap_or(true)
-                && matches(expr, &files, i, &mut ctx)
-            {
+            if ctx.chunk_selected(chunk_index_loc(r, i)) && matches(expr, files, i, &mut fctx) {
                 keep.set(i);
             }
         }
@@ -323,19 +273,24 @@ pub fn run_filter_export(
         let mut discard = ChunkSet::new();
         discard.fill();
         discard.and_not(&keep);
-        let writes: [(&mut Option<(PathBuf, McaFile)>, Option<PathBuf>); 3] = [
-            (&mut files.region, to_region),
-            (&mut files.poi, to_poi),
-            (&mut files.entities, to_entities),
+        let writes: [(&mut Option<McaFile>, Option<PathBuf>); 3] = [
+            (&mut files.region, dir_file(&dest.region, r)),
+            (&mut files.poi, dir_file(&dest.poi, r)),
+            (&mut files.entities, dir_file(&dest.entities, r)),
         ];
         for (src, dst) in writes {
-            let (Some((_, m)), Some(dst)) = (src.as_mut(), dst) else {
+            let (Some(m), Some(dst)) = (src, dst) else {
                 continue;
             };
             m.delete_chunks(&discard);
-            m.defragment(&dst).map_err(|e| e.to_string())?;
-            res.files_written += 1;
+            // upstream ExportFilterJob logs+continues on per-region failure
+            match m.defragment(&dst) {
+                Ok(()) => res.files_written += 1,
+                Err(e) => errs.push(format!("{}: {e}", dst.display())),
+            }
         }
-    }
+    });
+    res.regions_processed = sum.processed;
+    res.errors += sum.errors.len();
     Ok(res)
 }

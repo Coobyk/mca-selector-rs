@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// meta db dir: base_cache_dir/cache  (same as upstream's cacheDBDir)
-pub fn db_dir() -> PathBuf {
+fn db_dir() -> PathBuf {
     crate::files::base_cache_dir().join("cache")
 }
 
@@ -91,16 +91,17 @@ pub fn set_structures(world_uuid: &str, r: Point2i, s: &HashMap<i64, Vec<String>
 
 // -- z>=32 lod images ------------------------------------------------------------
 
-pub fn get_lod_image(world_uuid: &str, r: Point2i) -> Option<(Vec<u32>, usize)> {
+/// pixels are always LOD_IMAGE_SIZE x LOD_IMAGE_SIZE.
+pub fn get_lod_image(world_uuid: &str, r: Point2i) -> Option<Vec<u32>> {
     let b = std::fs::read(lod_image_path(world_uuid, r)).ok()?;
-    if b.len() != 16 * 16 * 4 {
+    if b.len() != LOD_IMAGE_SIZE * LOD_IMAGE_SIZE * 4 {
         return None;
     }
     let px: Vec<u32> = b
         .chunks_exact(4)
         .map(|c| ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)
         .collect();
-    Some((px, LOD_IMAGE_SIZE))
+    Some(px)
 }
 
 /// fixed-resolution LOD image: one pixel per 2x2 chunks (upstream lodLevel).
