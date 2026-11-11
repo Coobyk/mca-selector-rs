@@ -203,14 +203,21 @@ fn main() {
         })
         .expect("open window");
 
-        // open world from argv if given
+        // open world from argv if given — deferred to the next frame:
+        // notify() during initial window setup can be dropped before the
+        // first frame is ever scheduled, leaving the world/dialog unpainted.
         if let Some(arg) = std::env::args().nth(1) {
             let p = std::path::PathBuf::from(arg);
             if p.is_dir() {
                 if let Some(w) = cx.windows().first().cloned() {
-                    let _ = w.update(cx, |root, _w, cx| {
+                    let _ = w.update(cx, |root, window, cx| {
                         if let Ok(v) = root.downcast::<view::MainView>() {
-                            v.update(cx, |v, cx| v.open_world_at(p.clone(), cx));
+                            let p = p.clone();
+                            let _ = v.update(cx, |_v, cx| {
+                                cx.on_next_frame(window, move |v, _w, cx| {
+                                    v.open_world_at(p.clone(), cx)
+                                });
+                            });
                         }
                     });
                 }
