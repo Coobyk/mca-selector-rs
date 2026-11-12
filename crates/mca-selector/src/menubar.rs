@@ -108,6 +108,10 @@ impl MainView {
                         .id("menu-backdrop")
                         .w(vp.width)
                         .h(px(f32::from(vp.height) - BAR_H))
+                        // the backdrop spans the whole canvas — occluding it
+                        // keeps menu-open clicks (click-away, panel rows,
+                        // padding) from reaching the map's selection handlers
+                        .occlude()
                         .on_mouse_down(MouseButton::Left, cx.listener(|v, _e, _w, cx| {
                             v.open_menu = None;
                             v.open_submenu = None;

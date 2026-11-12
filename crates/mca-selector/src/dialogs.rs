@@ -431,6 +431,7 @@ impl MainView {
             .id("modal-backdrop")
             .w(vp.width)
             .h(vp.height)
+            .occlude()
             .flex()
             .items_center()
             .justify_center()
