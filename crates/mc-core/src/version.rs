@@ -227,7 +227,10 @@ pub fn chunk_format(data_version: i32) -> ChunkFormat {
 
 fn palette_props<'a>(entry: Option<&'a Tag>) -> Option<&'a Compound> {
     match entry {
-        Some(Tag::Compound(c)) => c.get("Properties").and_then(Tag::as_compound),
+        Some(Tag::Compound(c)) => c
+            .get("Properties")
+            .or_else(|| c.get("properties"))
+            .and_then(Tag::as_compound),
         _ => None,
     }
 }

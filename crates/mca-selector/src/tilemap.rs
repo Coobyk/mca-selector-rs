@@ -104,7 +104,7 @@ impl Tile {
 /// Async results channel: worker -> UI.
 /// bump when the renderer's pixel output changes — forces every cached
 /// PNG/LOD image to be treated as stale and re-rendered once.
-const RENDER_CACHE_VERSION: i64 = 4;
+const RENDER_CACHE_VERSION: i64 = 5;
 
 /// fingerprint of everything that changes a tile's pixels. keyed caches
 /// (disk PNGs, meta) are invalidated by comparing this.
@@ -1618,17 +1618,35 @@ fn worker_probe_and_render(a: ProbeArgs) {
     let structures = m.structures();
 
     // persist: png pyramid (or lod) + meta. all worker-side; the UI just
-    // adopts the pixels.
+    // adopts the pixels. One render also writes every COARSER zoom's cache
+    // file — a scale_down chain costs ~1ms per level vs a ~70ms region load
+    // the next zoom-out would otherwise pay per tile.
     if a.zoom_level >= 32 {
         cache::set_lod_image(&a.uuid, region, &img);
     } else {
-        let size = TILE_SIZE / a.zoom_level as usize;
-        let path = files::png_cache_path(&a.cache_dir, a.zoom_level, region);
-        if let Some(p) = path.parent() {
-            let _ = std::fs::create_dir_all(p);
+        let mut px = img.clone();
+        let mut cur = TILE_SIZE / a.zoom_level as usize;
+        for zl in ZOOM_LEVELS {
+            if zl < a.zoom_level {
+                continue;
+            }
+            let to = TILE_SIZE / zl as usize;
+            if zl > a.zoom_level {
+                px = render::scale_down(&px, cur, to);
+                cur = to;
+            }
+            if zl >= 32 {
+                cache::set_lod_image(&a.uuid, region, &px);
+            } else {
+                let path = files::png_cache_path(&a.cache_dir, zl, region);
+                if let Some(p) = path.parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                let rgba = argb_to_rgba(&px);
+                let _ =
+                    image::save_buffer(&path, &rgba, to as u32, to as u32, image::ColorType::Rgba8);
+            }
         }
-        let rgba = argb_to_rgba(&img);
-        let _ = image::save_buffer(&path, &rgba, size as u32, size as u32, image::ColorType::Rgba8);
     }
     cache::set_file_time(&a.uuid, region, mt);
     cache::set_render_hash(&a.uuid, region, a.hash);
