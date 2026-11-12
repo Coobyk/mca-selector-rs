@@ -171,6 +171,9 @@ pub struct Pasted {
 pub struct TileMapState {
     pub scale: f32, // blocks per screen pixel; higher = more zoomed out
     pub offset: Point2f, // block coords at screen 0,0
+    /// canvas bounds origin in window coords — gpui mouse events are
+    /// window-space, so handlers subtract this to get canvas coords.
+    pub canvas_origin: Point2f,
     pub width: f32,
     pub height: f32,
     pub tiles: HashMap<i64, Tile>,
@@ -233,6 +236,7 @@ impl TileMapState {
         TileMapState {
             scale: std::env::var("MCA_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0),
             offset: Point2f::new(-400.0, -300.0),
+            canvas_origin: Point2f::new(0.0, 0.0),
             width: 800.0,
             height: 600.0,
             tiles: HashMap::new(),
@@ -456,6 +460,13 @@ impl TileMapState {
     }
     pub fn mouse_region(&self, x: f32, z: f32) -> Point2i {
         self.mouse_block(x, z).block_to_region()
+    }
+
+    /// window-space event coords -> canvas coords. gpui delivers mouse
+    /// positions relative to the window; upstream's canvas filled it so
+    /// all position math below is canvas-relative.
+    pub fn canvas_pos(&self, x: f32, z: f32) -> Point2f {
+        Point2f::new(x - self.canvas_origin.x, z - self.canvas_origin.z)
     }
 
     /// TileMap.setPastedChunks — enter paste mode, offset centered on screen.

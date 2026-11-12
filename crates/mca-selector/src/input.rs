@@ -46,7 +46,7 @@ impl MainView {
             let factor = if dy > 0.0 { 1.03 + dy / 1000.0 } else { 0.97 + dy / 1000.0 };
             let old = self.map.scale;
             self.map.scale /= factor;
-            let pos = Point2f::new(f32::from(event.position.x), f32::from(event.position.y));
+            let pos = self.map.canvas_pos(f32::from(event.position.x), f32::from(event.position.y));
             if self.map.update_scale(old, pos) {
                 // request fresh-resolution tiles at the next paint — a wheel
                 // burst then costs one O(visible) update per frame instead
@@ -66,7 +66,7 @@ impl MainView {
             return;
         }
         self.focus.focus(window);
-        let pos = Point2f::new(f32::from(event.position.x), f32::from(event.position.y));
+        let pos = self.map.canvas_pos(f32::from(event.position.x), f32::from(event.position.y));
         let meta = event.modifiers.platform;
         match event.button {
             MouseButton::Left => {
@@ -143,7 +143,7 @@ impl MainView {
             self.set_render_height(h, false, cx);
             return;
         }
-        let pos = Point2f::new(f32::from(event.position.x), f32::from(event.position.y));
+        let pos = self.map.canvas_pos(f32::from(event.position.x), f32::from(event.position.y));
         // repaint only when something visible actually changed: mouse moves
         // that keep the same hovered block / paste offset / selection would
         // repaint the full scene for every event.

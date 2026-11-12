@@ -416,8 +416,8 @@ impl Render for MainView {
                 // bar or window edge) so the status bar shows "-, -". Moves
                 // leaving the window entirely are never delivered, so a
                 // stale hover can persist until the next move event.
-                let x = f32::from(e.position.x);
-                let y = f32::from(e.position.y);
+                let x = f32::from(e.position.x) - v.map.canvas_origin.x;
+                let y = f32::from(e.position.y) - v.map.canvas_origin.z;
                 let inside = x >= 0.0 && y >= 0.0 && x < v.map.width && y < v.map.height;
                 if !inside && v.map.hovered_block.take().is_some() {
                     cx.notify();

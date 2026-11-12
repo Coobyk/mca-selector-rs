@@ -25,6 +25,7 @@ pub(crate) enum CoordKey {
 
 impl MainView {
     pub(crate) fn paint_map(&mut self, bounds: Bounds<Pixels>, window: &mut Window, _cx: &mut App) {
+        self.map.canvas_origin = Point2f::new(f32::from(bounds.origin.x), f32::from(bounds.origin.y));
         self.map.width = f32::from(bounds.size.width);
         self.map.height = f32::from(bounds.size.height);
         let now = std::time::Instant::now();
@@ -125,7 +126,7 @@ impl MainView {
                     continue;
                 }
                 let b = Bounds {
-                    origin: point(px(ox), px(oz)),
+                    origin: bounds.origin + point(px(ox), px(oz)),
                     size: size(px(tile_px), px(tile_px)),
                 };
                 let Some(tile) = map.tiles.get(&key) else { continue };
@@ -159,7 +160,7 @@ impl MainView {
                         None
                     } else {
                         Some(Bounds {
-                            origin: point(px(ox), px(oz)),
+                            origin: bounds.origin + point(px(ox), px(oz)),
                             size: size(px(tile_px), px(tile_px)),
                         })
                     }
@@ -422,7 +423,7 @@ impl MainView {
                     let sx = px(((rx * 512 + i * 16) as f32 - self.map.offset.x) / scale);
                     if sx >= px(0.) && sx <= bounds.size.width {
                         window.paint_quad(fill(
-                            Bounds { origin: point(sx, px(0.)), size: size(px(GRID_LINE_WIDTH), bounds.size.height) },
+                            Bounds { origin: point(sx + bounds.origin.x, bounds.origin.y), size: size(px(GRID_LINE_WIDTH), bounds.size.height) },
                             rgba(CHUNK_GRID_COLOR),
                         ));
                     }
@@ -433,7 +434,7 @@ impl MainView {
                     let sz = px(((rz * 512 + i * 16) as f32 - self.map.offset.z) / scale);
                     if sz >= px(0.) && sz <= bounds.size.height {
                         window.paint_quad(fill(
-                            Bounds { origin: point(px(0.), sz), size: size(bounds.size.width, px(GRID_LINE_WIDTH)) },
+                            Bounds { origin: point(bounds.origin.x, sz + bounds.origin.y), size: size(bounds.size.width, px(GRID_LINE_WIDTH)) },
                             rgba(CHUNK_GRID_COLOR),
                         ));
                     }
@@ -445,7 +446,7 @@ impl MainView {
                 let sx = px((rx as f32 * 512.0 - self.map.offset.x) / scale);
                 if sx >= px(0.) && sx <= bounds.size.width {
                     window.paint_quad(fill(
-                        Bounds { origin: point(sx, px(0.)), size: size(px(GRID_LINE_WIDTH), bounds.size.height) },
+                        Bounds { origin: point(sx + bounds.origin.x, bounds.origin.y), size: size(px(GRID_LINE_WIDTH), bounds.size.height) },
                         rgba(REGION_GRID_COLOR),
                     ));
                 }
@@ -454,7 +455,7 @@ impl MainView {
                 let sz = px((rz as f32 * 512.0 - self.map.offset.z) / scale);
                 if sz >= px(0.) && sz <= bounds.size.height {
                     window.paint_quad(fill(
-                        Bounds { origin: point(px(0.), sz), size: size(bounds.size.width, px(GRID_LINE_WIDTH)) },
+                        Bounds { origin: point(bounds.origin.x, sz + bounds.origin.y), size: size(bounds.size.width, px(GRID_LINE_WIDTH)) },
                         rgba(REGION_GRID_COLOR),
                     ));
                 }
@@ -489,7 +490,7 @@ fn paint_coord(
             cache.entry(key).or_insert(l)
         }
     };
-    let _ = line.paint(point(px(sx), px(sz)), px(14.), window, cx);
+    let _ = line.paint(window.element_offset() + point(px(sx), px(sz)), px(14.), window, cx);
 }
 
 /// upstream two-line "x,\nz" grid label — two cached ShapedLines stacked.
@@ -566,7 +567,10 @@ fn paint_structure_icons(
             }
             if let Some(icon) = load_icon(icon_cache, &sd.icon) {
                 let b = Bounds {
-                    origin: point(px(icon_l), px(icon_t)),
+                    origin: point(
+                        px(icon_l + map.canvas_origin.x),
+                        px(icon_t + map.canvas_origin.z),
+                    ),
                     size: size(px(icon_size), px(icon_size)),
                 };
                 if b.size.width >= px(0.5) {
