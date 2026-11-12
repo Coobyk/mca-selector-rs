@@ -83,6 +83,7 @@ pub fn generate_image(
     // is a pure partition only when that stride equals `size`, i.e. for
     // power-of-two scales that keep chunk_size > 0 (1,2,4,8,16). Anything
     // else runs the original sequential loop verbatim.
+    let t0 = std::time::Instant::now();
     let xaero_used = if chunk_size > 0 && scale > 0 && (scale & (scale - 1)) == 0 {
         draw_bands(
             mca,
@@ -111,6 +112,8 @@ pub fn generate_image(
             &mut water_heights,
         )
     };
+    let draw_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let t1 = std::time::Instant::now();
 
     if xaero_used && !cfg.caves && !cfg.layer_only {
         xaero_shade(
@@ -126,6 +129,7 @@ pub fn generate_image(
     } else if cfg.shade && !cfg.layer_only {
         shade(&mut pixel_buffer, &water_pixels, &terrain_heights, &water_heights, scale, cfg);
     }
+    eprintln!("[bench] draw={:.1}ms shade={:.1}ms", draw_ms, t1.elapsed().as_secs_f64() * 1e3);
     Some(pixel_buffer)
 }
 
