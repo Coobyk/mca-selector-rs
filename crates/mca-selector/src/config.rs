@@ -230,6 +230,26 @@ impl WorldState {
     pub fn region_dir(&self) -> &Path {
         self.dirs.region.as_deref().unwrap()
     }
+
+    /// build-limit slider range for the active dimension: nether/end-style
+    /// dims are 0..255, overworld(-like) dims -64..319. Derived from the
+    /// dimension dir name — level.dat dimension types aren't parsed yet.
+    pub fn height_range(&self) -> (i32, i32) {
+        let name = self
+            .region_dir()
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if name.contains("nether")
+            || name.contains("end")
+            || matches!(name.as_str(), "dim-1" | "dim1")
+        {
+            (0, 255)
+        } else {
+            (-64, 319)
+        }
+    }
 }
 
 pub fn global() -> GlobalConfig {

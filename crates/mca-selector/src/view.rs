@@ -229,6 +229,16 @@ impl Render for MainView {
             .key_context("app")
             .track_focus(&self.focus)
             .size_full()
+            .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, _w, _cx| {
+                eprintln!(
+                    "[mca] mousedown {:?} ({}, {}) dialog={} menu={:?}",
+                    e.button,
+                    f32::from(e.position.x) as i32,
+                    f32::from(e.position.y) as i32,
+                    v.dialog.as_ref().map(|d| d.name()).unwrap_or("-"),
+                    v.open_menu
+                );
+            }))
             .flex()
             .flex_col()
             .bg(rgb(0x0a0a0a))
@@ -248,6 +258,20 @@ impl Render for MainView {
                 v.open_world_at(std::path::PathBuf::from(&a.path), cx);
             }))
             .on_action(cx.listener(|v, _: &OpenDimensionAction, w, cx| v.open_dimension_dialog(w, cx)))
+            .on_action(cx.listener(|v, a: &OpenDim, _w, cx| {
+                // flyout row → open that dimension, keeping the world's
+                // full dimension list like upstream setWorld.
+                let dims = config::world()
+                    .map(|w| w.dimensions.clone())
+                    .unwrap_or_default();
+                if let Some(dp) = dims
+                    .iter()
+                    .find(|d| d.to_string_lossy() == a.path)
+                    .cloned()
+                {
+                    v.do_open(dp, dims, cx);
+                }
+            }))
             .on_action(cx.listener(|v, _: &SettingsAction, _w, cx| {
                 v.dialog = Some(Dialog::Settings { draft: config::global() });
                 cx.notify();

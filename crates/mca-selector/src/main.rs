@@ -36,9 +36,36 @@ fn menus(cx: &App) -> Vec<Menu> {
             )
         })
         .collect();
+    // dimension flyout — same interaction as Open recent World: rows are
+    // the dimension dir names (upstream FileNameListCell style).
+    let dims: Vec<MenuItem> = config::world()
+        .map(|w| {
+            w.dimensions
+                .iter()
+                .map(|d| {
+                    let label = d
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| d.display().to_string());
+                    MenuItem::action(
+                        label,
+                        OpenDim { path: d.to_string_lossy().into_owned() },
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let dim_item = if dims.len() > 1 {
+        MenuItem::submenu(Menu {
+            name: "Open Dimension".into(),
+            items: dims,
+        })
+    } else {
+        MenuItem::action("Open Dimension", OpenDimensionAction)
+    };
     let mut file_items = vec![
         MenuItem::action("Open World", OpenWorldAction),
-        MenuItem::action("Open Dimension", OpenDimensionAction),
+        dim_item,
         MenuItem::submenu(Menu {
             name: "Open recent World".into(),
             items: if recent.is_empty() {

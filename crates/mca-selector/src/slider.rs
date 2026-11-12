@@ -8,17 +8,19 @@ use gpui::*;
 
 impl MainView {
     pub(crate) fn height_from_slider_x(&self, x: f32) -> i32 {
-        let cur = config::WORLD.read().unwrap().as_ref()
-            .map(|w| w.cfg.render_height).unwrap_or(319);
+        let w = config::WORLD.read().unwrap().as_ref()
+            .map(|w| (w.cfg.render_height, w.height_range()))
+            .unwrap_or((319, (-64, 319)));
+        let (cur, (lo, hi)) = w;
         let Some(b) = *self.height_slider_bounds.borrow() else {
             return cur;
         };
-        let w = f32::from(b.size.width);
-        if w <= 0. {
+        let bw = f32::from(b.size.width);
+        if bw <= 0. {
             return cur;
         }
-        let frac = ((x - f32::from(b.origin.x)) / w).clamp(0., 1.);
-        (-64. + frac * 383.).round() as i32
+        let frac = ((x - f32::from(b.origin.x)) / bw).clamp(0., 1.);
+        (lo as f32 + frac * (hi - lo) as f32).round() as i32
     }
 
     /// upstream HeightSlider: the slider pins at -64..319 but the numeric
@@ -48,9 +50,10 @@ impl MainView {
     }
 
     pub(crate) fn render_height_slider(&self, cx: &mut Context<Self>) -> AnyElement {
-        let h = config::WORLD.read().unwrap().as_ref()
-            .map(|w| w.cfg.render_height).unwrap_or(319);
-        let frac = (((h + 64) as f32) / 383.).clamp(0., 1.);
+        let (h, (lo, hi)) = config::WORLD.read().unwrap().as_ref()
+            .map(|w| (w.cfg.render_height, w.height_range()))
+            .unwrap_or((319, (-64, 319)));
+        let frac = (((h - lo) as f32) / (hi - lo) as f32).clamp(0., 1.);
         let slot = self.height_slider_bounds.clone();
         div()
             .h(px(32.))
@@ -63,7 +66,7 @@ impl MainView {
             .text_size(px(12.))
             .text_color(rgb(0xbbbbbb))
             // upstream: min label, slider, max label, numeric field
-            .child(div().w(px(30.)).flex_none().child("-64"))
+            .child(div().w(px(30.)).flex_none().child(format!("{lo}")))
             .child(
                 div()
                     .id("height-slider")
@@ -76,7 +79,7 @@ impl MainView {
                         v.set_render_height(hh, false, cx);
                     }))
                     // upstream slider scroll adjusts the height by +/-1
-                    .on_scroll_wheel(cx.listener(|v, e: &ScrollWheelEvent, _w, cx| {
+                    .on_scroll_wheel(cx.listener(move |v, e: &ScrollWheelEvent, _w, cx| {
                         let dy = match e.delta {
                             ScrollDelta::Pixels(p) => f32::from(p.y),
                             ScrollDelta::Lines(l) => l.y,
@@ -85,7 +88,7 @@ impl MainView {
                             let cur = config::WORLD.read().unwrap().as_ref()
                                 .map(|w| w.cfg.render_height).unwrap_or(319);
                             let next = cur + if dy > 0.0 { 1 } else { -1 };
-                            v.set_render_height(next.clamp(-64, 319), true, cx);
+                            v.set_render_height(next.clamp(lo, hi), true, cx);
                         }
                     }))
                     .child(canvas(
@@ -116,7 +119,7 @@ impl MainView {
                         },
                     )),
             )
-            .child(div().w(px(30.)).flex_none().child("319"))
+            .child(div().w(px(30.)).flex_none().child(format!("{hi}")))
             // upstream NumberTextField(-64..2047): click the value to type a
             // height — values above 319 pin the slider thumb at max but set
             // render_height to the typed number.

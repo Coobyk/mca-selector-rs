@@ -53,6 +53,13 @@ pub struct OpenRecentWorld {
     pub path: String,
 }
 
+/// data-carrying action for the File > Open Dimension flyout rows.
+#[derive(gpui::Action, serde::Deserialize, serde::Serialize, Clone, PartialEq, gpui::private::schemars::JsonSchema)]
+#[action(namespace = mca_selector)]
+pub struct OpenDim {
+    pub path: String,
+}
+
 #[derive(gpui::Action, serde::Deserialize, serde::Serialize, Clone, PartialEq, schemars::JsonSchema)]
 #[action(namespace = mca_selector)]
 pub struct ToggleStructureIcon {

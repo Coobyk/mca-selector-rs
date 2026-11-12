@@ -134,11 +134,39 @@ pub enum Dialog {
     },
 }
 
+impl Dialog {
+    /// short name for trace logging — avoids Debug-formatting the payloads.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Dialog::Goto { .. } => "Goto",
+            Dialog::About => "About",
+            Dialog::Error { .. } => "Error",
+            Dialog::Confirm { .. } => "Confirm",
+            Dialog::SelectDimension { .. } => "SelectDimension",
+            Dialog::Settings { .. } => "Settings",
+            Dialog::RenderSettings { .. } => "RenderSettings",
+            Dialog::Info { .. } => "Info",
+            Dialog::PasteConfirm { .. } => "PasteConfirm",
+            Dialog::JobProgress => "JobProgress",
+            Dialog::NbtEditor { .. } => "NbtEditor",
+            Dialog::TextInput { .. } => "TextInput",
+            Dialog::Filter { .. } => "Filter",
+            Dialog::ChangeFields { .. } => "ChangeFields",
+            Dialog::Import { .. } => "Import",
+            Dialog::OverlayEditor { .. } => "OverlayEditor",
+        }
+    }
+}
+
 // -- keyboard ---------------------------------------------------------------
 
 impl MainView {
     pub(crate) fn dialog_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = event.keystroke.key.as_str();
+        eprintln!(
+            "[mca] dialog_key {k} dialog={}",
+            self.dialog.as_ref().map(|d| d.name()).unwrap_or("-")
+        );
         if let Some(Dialog::Goto { x, z, focus_x, invalid }) = &mut self.dialog {
             match k {
                 "enter" => {
@@ -662,6 +690,7 @@ impl MainView {
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| d.display().to_string());
                     let dp = d.clone();
+                    let dp_log = d.clone();
                     let dims_for_click = all_dims.clone();
                     list = list.child(
                         div()
@@ -669,7 +698,16 @@ impl MainView {
                             .px_2().py_1().rounded_sm()
                             .hover(|s| s.bg(rgb(0x3a3a3a)))
                             .child(text_el(label, 12.))
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |_v, e: &MouseDownEvent, _w, _cx| {
+                                eprintln!(
+                                    "[mca] dim row mousedown {} ({}, {})",
+                                    dp_log.display(),
+                                    f32::from(e.position.x) as i32,
+                                    f32::from(e.position.y) as i32
+                                );
+                            }))
                             .on_click(cx.listener(move |v, _, _w, cx| {
+                                eprintln!("[mca] dimension picked: {}", dp.display());
                                 // close the picker FIRST — after do_open,
                                 // `dialog = None` used to erase its error
                                 // dialog, turning a failed open into a
@@ -1199,17 +1237,15 @@ impl MainView {
             }
         };
         let overlay = overlay
-            .on_mouse_down(MouseButton::Left, cx.listener(|v, e, _w, cx| {
-                let _ = e;
-                match v.dialog {
-                    Some(Dialog::Confirm { .. }) | Some(Dialog::Info { .. }) | Some(Dialog::Goto { .. })
-                        | Some(Dialog::JobProgress) | Some(Dialog::NbtEditor { .. }) | Some(Dialog::TextInput { .. })
-                        | Some(Dialog::Filter { .. }) | Some(Dialog::ChangeFields { .. })
-                        | Some(Dialog::Import { .. }) | Some(Dialog::OverlayEditor { .. })
-                        | Some(Dialog::PasteConfirm { .. }) => {}
-                    _ => v.dialog = None,
-                }
-                cx.notify();
+            .on_mouse_down(MouseButton::Left, cx.listener(|v, e: &MouseDownEvent, _w, _cx| {
+                // upstream dialogs are modal — an outside click never
+                // dismisses them (SelectDimension used to vanish here).
+                eprintln!(
+                    "[mca] backdrop mousedown ({}, {}) dialog={}",
+                    f32::from(e.position.x) as i32,
+                    f32::from(e.position.y) as i32,
+                    v.dialog.as_ref().map(|d| d.name()).unwrap_or("-")
+                );
             }))
             .child(body);
         Some(
