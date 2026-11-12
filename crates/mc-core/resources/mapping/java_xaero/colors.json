@@ -361,8 +361,8 @@
     "minecraft:andesite_stairs": "878888",
     "minecraft:andesite_wall": "878888",
     "minecraft:anvil": "494949",
-    "minecraft:attached_melon_stem": "7a7a7a",
-    "minecraft:attached_pumpkin_stem": "828382",
+    "minecraft:attached_melon_stem": "6a5e0d",
+    "minecraft:attached_pumpkin_stem": "71650e",
     "minecraft:azalea": "677f2f",
     "minecraft:azalea_leaves": "58712b",
     "minecraft:azure_bluet": "8bb938",
@@ -1529,7 +1529,10 @@
     "minecraft:mangrove_fence": "7e4036",
     "minecraft:mangrove_fence_gate": "7e4036",
     "minecraft:mangrove_hanging_sign": "77362f",
-    "minecraft:mangrove_leaves": "455c21",
+    "minecraft:mangrove_leaves": {
+      "color": "797777",
+      "properties": 4
+    },
     "minecraft:mangrove_log": {
       "states": {
         "AAAAIA==": "67312a"
@@ -1558,7 +1561,18 @@
     "minecraft:mangrove_wood": "554429",
     "minecraft:medium_amethyst_bud": "a881ce",
     "minecraft:melon": "6e901e",
-    "minecraft:melon_stem": "7a7a7a",
+    "minecraft:melon_stem": {
+      "states": {
+        "AAE=": "5b620b",
+        "AAI=": "6a5e0d",
+        "CA==": "0f7501",
+        "EA==": "1e7103",
+        "IA==": "2d6e05",
+        "QA==": "3d6a07",
+        "gA==": "4c6609"
+      },
+      "default": "007900"
+    },
     "minecraft:moss_block": "576c2c",
     "minecraft:moss_carpet": "576c2c",
     "minecraft:mossy_cobblestone": "6d755e",
@@ -2067,7 +2081,18 @@
     "minecraft:prismarine_stairs": "60a090",
     "minecraft:prismarine_wall": "60a090",
     "minecraft:pumpkin": "c57619",
-    "minecraft:pumpkin_stem": "828382",
+    "minecraft:pumpkin_stem": {
+      "states": {
+        "AAE=": "61690c",
+        "AAI=": "71650e",
+        "CA==": "107e02",
+        "EA==": "207a04",
+        "IA==": "307606",
+        "QA==": "417208",
+        "gA==": "516e0a"
+      },
+      "default": "008200"
+    },
     "minecraft:purple_banner": "b39259",
     "minecraft:purple_bed": "b39259",
     "minecraft:purple_candle": {
@@ -3925,7 +3950,10 @@
       "color": "b3b3b3",
       "properties": 8
     },
-    "minecraft:water_cauldron": "313135",
+    "minecraft:water_cauldron": {
+      "color": "313135",
+      "properties": 8
+    },
     "minecraft:waxed_chiseled_copper": "c36c52",
     "minecraft:waxed_copper_block": "ca7256",
     "minecraft:waxed_copper_bulb": {
@@ -4685,12 +4713,14 @@
     "minecraft:attached_melon_stem": {
       "a": 255,
       "op": 0,
-      "invis": true
+      "invis": true,
+      "tint": "attached_melon_stem"
     },
     "minecraft:attached_pumpkin_stem": {
       "a": 255,
       "op": 0,
-      "invis": true
+      "invis": true,
+      "tint": "attached_pumpkin_stem"
     },
     "minecraft:azalea": {
       "a": 255,
@@ -5317,8 +5347,7 @@
     },
     "minecraft:cherry_leaves": {
       "a": 255,
-      "op": 1,
-      "tint": "unknown"
+      "op": 1
     },
     "minecraft:cherry_log": {
       "a": 255,
@@ -7053,7 +7082,7 @@
     "minecraft:mangrove_leaves": {
       "a": 255,
       "op": 1,
-      "tint": "mangrove"
+      "tint": "foliage"
     },
     "minecraft:mangrove_log": {
       "a": 255,
@@ -7521,8 +7550,7 @@
     },
     "minecraft:pale_oak_leaves": {
       "a": 255,
-      "op": 1,
-      "tint": "unknown"
+      "op": 1
     },
     "minecraft:pale_oak_log": {
       "a": 255,
@@ -9102,7 +9130,8 @@
     },
     "minecraft:water_cauldron": {
       "a": 255,
-      "op": 0
+      "op": 0,
+      "tint": "water"
     },
     "minecraft:waxed_chiseled_copper": {
       "a": 255,

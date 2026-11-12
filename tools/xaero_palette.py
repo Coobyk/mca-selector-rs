@@ -76,23 +76,28 @@ def rot_dir(direction, x=0, y=0, el=None):
 SKIP_BLOCKS = {"air", "cave_air", "void_air"}
 
 # name -> tint kind used for `properties` bits in the colors table
+# mirrors vanilla BlockColors.create() (decompiled 1.21.4): grass providers
 TINT_GRASS = {
     "grass_block", "short_grass", "tall_grass", "fern", "large_fern",
-    "sugar_cane", "pink_petals", "wildflowers",
+    "sugar_cane", "pink_petals",
 }
 TINT_FOLIAGE = {
     "oak_leaves", "jungle_leaves", "acacia_leaves", "dark_oak_leaves",
-    "azalea_leaves", "flowering_azalea_leaves", "vine",
+    "mangrove_leaves", "vine",
 }
-TINT_WATER = {"water", "bubble_column"}
+TINT_WATER = {"water", "bubble_column", "water_cauldron"}
 TINT_DRY = {"leaf_litter"}
 # fixed (non-biome) tints baked into the emitted color
 STATIC_TINT = {
     "birch_leaves": 0x80A755,
     "spruce_leaves": 0x619961,
-    "mangrove_leaves": 0x92C648,
     "lily_pad": 0x208030,
+    "attached_pumpkin_stem": 0xE0C71C,
+    "attached_melon_stem": 0xE0C71C,
 }
+# models carry a tintindex quad but vanilla registers no color provider for
+# these — the raw texture color is used
+KNOWN_UNTINTED = {"cherry_leaves", "pale_oak_leaves"}
 
 # property bit values (colors.rs: GRASS_TINT|FOLIAGE_TINT|WATER|DRY_FOLIAGE)
 P_GRASS, P_FOLIAGE, P_WATER, P_DRY = 2, 4, 8, 128
@@ -526,7 +531,7 @@ def classify_tint(name, tintindex, is_quad, reports):
         return ("water", P_WATER, None)
     if name in TINT_DRY:
         return ("dry", P_DRY, None)
-    if is_quad and tintindex >= 0:
+    if is_quad and tintindex >= 0 and name not in KNOWN_UNTINTED:
         reports["unknown_tint"].add(name)
         return ("unknown", 0, None)
     return (None, 0, None)
@@ -686,6 +691,15 @@ def main():
                 p = int(props.get("power", 0))
                 per_state[tuple(sorted(props.items()))] = (
                     WIRE_COLORS[p], a, 0, None)
+                continue
+            if name in ("pumpkin_stem", "melon_stem"):
+                # vanilla BlockColors: axk.a(age*32, 255-age*8, age*4) on the
+                # stem texture — age 7 matches the attached-stem 0xE0C71C
+                age = int(props.get("age", 0))
+                ramp = (min(age * 32, 255) << 16) | \
+                    (max(255 - age * 8, 0) << 8) | min(age * 4, 255)
+                per_state[tuple(sorted(props.items()))] = (
+                    tint_multiply(rgb, ramp), a, 0, None)
                 continue
             kind, pbit, baked = classify_tint(name, tintidx, is_quad, reports)
             if baked is not None:
