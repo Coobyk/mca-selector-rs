@@ -93,6 +93,9 @@ pub enum ColorMap {
     Null,
     Legacy(&'static LegacyColorMapping),
     Config(&'static ColorConfig),
+    /// Xaero palette + per-version config as fallback for blocks the
+    /// generated xaero table doesn't know.
+    Xaero(&'static ColorConfig, &'static ColorConfig),
 }
 
 impl ColorMap {
@@ -109,6 +112,27 @@ impl ColorMap {
                 };
                 c.get_color_state(name, biome_name, state).color | 0xFF00_0000
             }
+            ColorMap::Xaero(x, fallback) => {
+                let biome_name = match biome {
+                    BiomeKey::Name(s) => s,
+                    BiomeKey::Idx(id) => biome_id_to_name(id),
+                };
+                let bc = x.get_color_state(name, biome_name, state);
+                if bc.color == colors::MISSING_COLOR {
+                    fallback.get_color_state(name, biome_name, state).color | 0xFF00_0000
+                } else {
+                    bc.color | 0xFF00_0000
+                }
+            }
+        }
+    }
+
+    /// the generated xaero table when this mapping uses it — entry
+    /// resolution consults it for overlay/invisible/glow/short metadata.
+    pub fn xaero_cfg(&self) -> Option<&'static ColorConfig> {
+        match self {
+            ColorMap::Xaero(x, _) => Some(x),
+            _ => None,
         }
     }
 
@@ -159,7 +183,7 @@ pub fn color_mapping(data_version: i32) -> ColorMap {
         return ColorMap::Legacy(legacy_colors());
     }
     let (_, f) = chunk::dv_floor_key(TABLE, data_version).unwrap();
-    ColorMap::Config(f())
+    ColorMap::Xaero(colors::cfg_xaero(), f())
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +245,13 @@ const F_WATER: u8 = 0b0010;
 const F_WATERLOGGED: u8 = 0b0100;
 const F_FOLIAGE: u8 = 0b1000;
 
+// xaero-model flags (MapWriter column classification)
+const X_INVIS: u8 = 0b0001;
+const X_OVERLAY: u8 = 0b0010;
+const X_GLOW: u8 = 0b0100;
+const X_SHORT: u8 = 0b1000;
+const X_AIR: u8 = 0b1_0000;
+
 struct PalEntry<'a> {
     name: &'a str,
     /// block-state properties — kept so the color can be resolved lazily.
@@ -228,6 +259,11 @@ struct PalEntry<'a> {
     /// resolved color (+state for tinted entries); filled on first opaque hit.
     cell: std::cell::OnceCell<CellVal>,
     flags: u8,
+    /// xaero-model flags (0 when the chunk's color map isn't ColorMap::Xaero).
+    xflags: u8,
+    /// overlay metadata — texture alpha and per-layer opacity.
+    xalpha: u8,
+    xop: u8,
 }
 
 /// The color-mapping half of palette resolution, deferred until a column
@@ -243,7 +279,11 @@ struct CellVal {
 
 /// Eager half of resolution: the name/props-derived flags the column scan
 /// and the whole-section skips test per visited block.
-fn resolve_entry<'a>(name: &'a str, props: Option<&'a Compound>) -> PalEntry<'a> {
+fn resolve_entry<'a>(
+    name: &'a str,
+    props: Option<&'a Compound>,
+    xaero: Option<&ColorConfig>,
+) -> PalEntry<'a> {
     let cp = colors::color_properties();
     let mut flags = 0u8;
     if cp.transparent.contains(name) {
@@ -263,11 +303,38 @@ fn resolve_entry<'a>(name: &'a str, props: Option<&'a Compound>) -> PalEntry<'a>
     {
         flags |= F_WATERLOGGED;
     }
+    let mut xflags = 0u8;
+    let mut xalpha = 255u8;
+    let mut xop = 0u8;
+    if let Some(xc) = xaero {
+        if matches!(name, "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air") {
+            xflags |= X_AIR;
+        }
+        if let Some(m) = xc.xaero_meta.get(name) {
+            if m.invis {
+                xflags |= X_INVIS;
+            }
+            if m.overlay {
+                xflags |= X_OVERLAY;
+            }
+            if m.glow {
+                xflags |= X_GLOW;
+            }
+            if m.is_short(props) {
+                xflags |= X_SHORT;
+            }
+            xalpha = m.alpha;
+            xop = m.opacity.min(15);
+        }
+    }
     PalEntry {
         name,
         props,
         cell: std::cell::OnceCell::new(),
         flags,
+        xflags,
+        xalpha,
+        xop,
     }
 }
 
@@ -276,56 +343,66 @@ fn resolve_entry<'a>(name: &'a str, props: Option<&'a Compound>) -> PalEntry<'a>
 /// color is a state-independent Single that is not tinted, matching the old
 /// code's `s.color(state)` where Single ignores `state` entirely.
 fn resolve_color(cm: &ColorMap, name: &str, props: Option<&Compound>) -> CellVal {
-    match cm {
-        ColorMap::Config(c) => {
-            let sc = c.colors.get(name);
-            let (state, bc) = match sc {
-                Some(colors::StateColors::Single(bc)) => {
-                    if bc.properties & colors::TINTED != 0 {
-                        // tint_cache lookups still consume the state.
-                        (c.states.get_state(props), *bc)
-                    } else {
-                        (None, *bc)
-                    }
-                }
-                Some(s) => {
-                    let st = c.states.get_state(props);
-                    let bc = s.color(st.as_ref());
-                    (st, bc)
-                }
-                None => (
-                    None,
-                    colors::BlockColor {
-                        color: colors::MISSING_COLOR,
-                        properties: 0,
-                    },
-                ),
-            };
-            if bc.properties & colors::TINTED != 0 {
-                // rgb is resolved per-biome at render time (memoized).
-                CellVal {
-                    state,
-                    rgb: 0,
-                    tinted: true,
-                }
+    let c = match cm {
+        ColorMap::Config(c) => *c,
+        ColorMap::Xaero(x, fb) => {
+            if x.colors.contains_key(name) {
+                x
             } else {
-                CellVal {
-                    state: None,
-                    rgb: bc.color | 0xFF00_0000,
-                    tinted: false,
-                }
+                fb
             }
         }
-        ColorMap::Null => CellVal {
-            state: None,
+        ColorMap::Null => {
+            return CellVal {
+                state: None,
+                rgb: 0,
+                tinted: false,
+            }
+        }
+        ColorMap::Legacy(_) => {
+            return CellVal {
+                state: None,
+                rgb: 0xFF00_0000,
+                tinted: false,
+            }
+        }
+    };
+    let sc = c.colors.get(name);
+    let (state, bc) = match sc {
+        Some(colors::StateColors::Single(bc)) => {
+            if bc.properties & colors::TINTED != 0 {
+                // tint_cache lookups still consume the state.
+                (c.states.get_state(props), *bc)
+            } else {
+                (None, *bc)
+            }
+        }
+        Some(s) => {
+            let st = c.states.get_state(props);
+            let bc = s.color(st.as_ref());
+            (st, bc)
+        }
+        None => (
+            None,
+            colors::BlockColor {
+                color: colors::MISSING_COLOR,
+                properties: 0,
+            },
+        ),
+    };
+    if bc.properties & colors::TINTED != 0 {
+        // rgb is resolved per-biome at render time (memoized).
+        CellVal {
+            state,
             rgb: 0,
-            tinted: false,
-        },
-        ColorMap::Legacy(_) => CellVal {
+            tinted: true,
+        }
+    } else {
+        CellVal {
             state: None,
-            rgb: 0xFF00_0000,
+            rgb: bc.color | 0xFF00_0000,
             tinted: false,
-        },
+        }
     }
 }
 
@@ -338,6 +415,9 @@ fn oob_entry() -> PalEntry<'static> {
         props: None,
         cell: std::cell::OnceCell::new(),
         flags: 0,
+        xflags: 0,
+        xalpha: 255,
+        xop: 0,
     }
 }
 
@@ -361,6 +441,8 @@ struct IndexedSection<'a> {
     all_transparent: bool,
     /// same for the caves renderer (transparent OR foliage never counts).
     caves_inert: bool,
+    /// xaero scan: every entry is air or invisible => skippable.
+    x_inert: bool,
 }
 
 /// An in-range section tag plus its slot geometry. The expensive part
@@ -374,6 +456,7 @@ struct SectionSlot<'a> {
     format: ChunkFormat,
     start_height: i32,
     section_height: i32,
+    xaero: Option<&'static ColorConfig>,
     built: std::cell::OnceCell<IndexedSection<'a>>,
 }
 
@@ -387,6 +470,7 @@ impl<'a> SectionSlot<'a> {
                 self.format,
                 self.start_height,
                 self.section_height,
+                self.xaero,
             )
         })
     }
@@ -566,6 +650,7 @@ fn index_sections<'a>(
     format: ChunkFormat,
     height: i32,
     y_min: i32,
+    xaero: Option<&'static ColorConfig>,
 ) -> Vec<Option<SectionSlot<'a>>> {
     let modern = is_modern(format);
     let (lo, hi) = if modern {
@@ -603,6 +688,7 @@ fn index_sections<'a>(
                 15
             },
             section_height: (idx as i32 + lo) * 16,
+            xaero,
             built: std::cell::OnceCell::new(),
         });
     }
@@ -618,6 +704,7 @@ fn build_section<'a>(
     format: ChunkFormat,
     start_height: i32,
     section_height: i32,
+    xaero: Option<&'static ColorConfig>,
 ) -> IndexedSection<'a> {
     fn raw<'a>(t: Option<&'a Tag>) -> PackedSrc<'a> {
         t.and_then(|t| t.as_bytes()).map(PackedSrc::Raw).unwrap_or_default()
@@ -658,7 +745,7 @@ fn build_section<'a>(
 
     let entries: Vec<PalEntry> = palette
         .iter()
-        .map(|t| resolve_entry(chunk::palette_entry_name(t), palette_props(Some(t))))
+        .map(|t| resolve_entry(chunk::palette_entry_name(t), palette_props(Some(t)), xaero))
         .collect();
     // every palette index the packed data can produce must be in range for a
     // whole-section skip to be sound (oob entries resolve as opaque).
@@ -672,6 +759,12 @@ fn build_section<'a>(
         && entries
             .iter()
             .all(|e| e.flags & (F_TRANSPARENT | F_FOLIAGE) != 0);
+    let x_inert = xaero.is_some()
+        && no_oob
+        && !entries.is_empty()
+        && entries
+            .iter()
+            .all(|e| e.xflags & (X_INVIS | X_AIR) != 0);
     IndexedSection {
         entries,
         block,
@@ -682,6 +775,7 @@ fn build_section<'a>(
         section_height,
         all_transparent,
         caves_inert,
+        x_inert,
     }
 }
 
@@ -692,6 +786,13 @@ pub struct RenderOut<'a> {
     pub water_heights: Option<&'a mut [i16]>,
     pub water: bool,
     pub height: i32,
+    /// nether-style "cave dimension": scan past the ceiling and render the
+    /// first floor below open space (Xaero caveModeType==2 semantics).
+    pub full_cave: bool,
+    /// set by draw_chunk when the xaero pipeline ran — the pixel buffers
+    /// carry the xaero layout (water_* = overlay data, pixel alpha 0xFE
+    /// marks glowing blocks), so the shade pass must be xaero_shade.
+    pub xaero: bool,
 }
 
 const WATER_DUMMY_NAME: &str = "minecraft:water";
@@ -711,11 +812,15 @@ pub fn draw_chunk(
         ChunkFormat::Legacy15w32a => return draw_chunk_legacy(root, cm, x, z, scale, out),
         _ => {}
     }
+    if let Some(xc) = cm.xaero_cfg() {
+        out.xaero = true;
+        return draw_chunk_xaero(root, xc, cm, format, x, z, scale, out);
+    }
     let Some((list, container)) = chunk::sections(root) else { return };
     let y_min = nbt::int_from(Some(container), "yPos", -4);
     let modern = is_modern(format);
     let height = out.height;
-    let indexed = index_sections(Some(list), format, height, y_min);
+    let indexed = index_sections(Some(list), format, height, y_min, cm.xaero_cfg());
     if indexed.is_empty() {
         return;
     }
@@ -733,7 +838,7 @@ pub fn draw_chunk(
     let start = ((abs_h >> 4).min(indexed.len() as i32 - 1)).max(0) as usize;
     let mut memo = RgbMemo::default();
     let oob = oob_entry();
-    let water_entry = resolve_entry(WATER_DUMMY_NAME, None);
+    let water_entry = resolve_entry(WATER_DUMMY_NAME, None, None);
     let row = 512usize >> scale_bits;
 
     for cx in (0..16usize).step_by(scale as usize) {
@@ -808,8 +913,243 @@ pub fn draw_chunk(
     }
 }
 
+/// One merged overlay layer during the xaero column scan — same-state
+/// translucent blocks merge, accumulating opacity (Xaero's Overlay +
+/// OverlayBuilder, opacity capped at 15).
+struct MergeOverlay {
+    entry: usize, // PalEntry address — merge key (same palette slot+state)
+    rgb: u32,
+    alpha: u8,
+    opacity: u8,
+}
 
-/// per-chunk rgb memo for tinted blocks: each resolved PalEntry already
+/// Xaero's MapWriter.loadPixel: translucent blocks (water/ice/stained
+/// glass/…) stack as overlays above the surface block; the surface block
+/// and its height feed the MapPixel shading pass (xaero_shade in render.rs).
+/// Per column the scan writes:
+///   pixel_buffer    = tinted surface rgb, alpha 0xFE = glowing, 0xFF normal
+///   terrain_heights = effective surface height (short blocks -1)
+///   water_heights   = packed (top_height & 0xFFF) | sun_left << 12
+///   water_pixels    = acc_transparency<<24 | premultiplied overlay rgb
+/// Overlays are composited in shade: rgb*(9+sun)/24*acc_tr + overlay_rgb.
+fn draw_chunk_xaero(
+    root: &Compound,
+    xc: &'static ColorConfig,
+    cm: &ColorMap,
+    format: ChunkFormat,
+    x: usize,
+    z: usize,
+    scale: i32,
+    out: &mut RenderOut,
+) {
+    let Some((list, container)) = chunk::sections(root) else { return };
+    let y_min = nbt::int_from(Some(container), "yPos", -4);
+    let modern = is_modern(format);
+    let height = out.height;
+    let indexed = index_sections(Some(list), format, height, y_min, Some(xc));
+    if indexed.is_empty() {
+        return;
+    }
+    let chunk_biomes = if modern {
+        None
+    } else {
+        container.get("Biomes").and_then(|t| t.as_bytes())
+    };
+    let scale_bits = scale.ilog2() as i32;
+    let abs_h = if modern {
+        height - y_min * 16
+    } else {
+        height.clamp(0, 255)
+    };
+    let start = ((abs_h >> 4).min(indexed.len() as i32 - 1)).max(0) as usize;
+    let mut memo = RgbMemo::default();
+    let oob = oob_entry();
+    let water_entry = resolve_entry(WATER_DUMMY_NAME, None, Some(xc));
+    let row = 512usize >> scale_bits;
+    let full_cave = out.full_cave;
+    let (Some(wp_buf), Some(wh_buf)) = (out.water_pixels.as_deref_mut(), out.water_heights.as_deref_mut()) else {
+        return;
+    };
+
+    for cx in (0..16usize).step_by(scale as usize) {
+        'zloop: for cz in (0..16usize).step_by(scale as usize) {
+            let pixel_index = (z + (cz >> scale_bits)) * row + (x + (cx >> scale_bits));
+            // underair: "open space above" — in surface mode it stays true;
+            // in full-cave mode the ceiling keeps it false until the first
+            // air gap below it (Xaero's underair/shouldEnterGround).
+            let mut underair = true;
+            let mut entered = !full_cave;
+            let mut top_h = i32::MIN;
+            // merged overlay accumulator + the running composite — a new
+            // overlay type folds the current one into (sun, acc_tr, ov)
+            // before starting a fresh merge record.
+            let mut cur_ov: Option<MergeOverlay> = None;
+            let mut sun = 15i32;
+            let mut acc_tr = 1.0f32;
+            let mut ov_sum = [0f32; 3];
+            macro_rules! flush_ov {
+                () => {
+                    if let Some(o) = cur_ov.take() {
+                        let tr = o.alpha as f32 / 255.0;
+                        // daylight render: max(sun, light) = 15 -> brightness
+                        // is 1, so the overlay contributes rgb*tr*rem.
+                        let inten = tr * acc_tr;
+                        ov_sum[0] += (o.rgb >> 16 & 0xFF) as f32 * inten;
+                        ov_sum[1] += (o.rgb >> 8 & 0xFF) as f32 * inten;
+                        ov_sum[2] += (o.rgb & 0xFF) as f32 * inten;
+                        sun = (sun - o.opacity as i32).max(0);
+                        acc_tr *= 1.0 - tr;
+                    }
+                };
+            }
+            for slot in indexed[..=start].iter().rev().flatten() {
+                let s = slot.get();
+                if s.x_inert {
+                    continue;
+                }
+                let uniform = s.block.bits == 0;
+                let top_index = chunk::location_to_index(cx, s.start_height as usize, cz);
+                let mut cur = s.block.cursor(top_index, 256);
+                for cy in (0..=s.start_height).rev() {
+                    let e = if uniform {
+                        s.entries.first().unwrap_or(&oob)
+                    } else {
+                        let pi = cur.get() as usize;
+                        if cy > 0 {
+                            cur.prev();
+                        }
+                        s.entries.get(pi).unwrap_or(&oob)
+                    };
+                    if e.xflags & X_INVIS != 0 {
+                        if uniform {
+                            break;
+                        }
+                        continue;
+                    }
+                    if !entered {
+                        // first solid block closes the ceiling column;
+                        // air/overlay/waterlogged blocks pass through.
+                        if e.xflags & (X_AIR | X_OVERLAY) == 0 && e.flags & F_WATERLOGGED == 0 {
+                            entered = true;
+                            underair = false;
+                        }
+                        if uniform {
+                            break;
+                        }
+                        continue;
+                    }
+                    if e.xflags & X_AIR != 0 {
+                        underair = true;
+                        if uniform {
+                            break;
+                        }
+                        continue;
+                    }
+                    if !underair {
+                        if uniform {
+                            break;
+                        }
+                        continue;
+                    }
+                    let y_abs = s.section_height + cy;
+                    if e.xflags & X_OVERLAY != 0 {
+                        if top_h == i32::MIN {
+                            top_h = y_abs;
+                        }
+                        let key = e as *const PalEntry as usize;
+                        match cur_ov.as_mut() {
+                            Some(o) if o.entry == key => {
+                                o.opacity = o.opacity.saturating_add(e.xop).min(15);
+                            }
+                            _ => {
+                                flush_ov!();
+                                let mut rgb = entry_rgb(&mut memo, cm, e, || {
+                                    biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min)
+                                });
+                                if e.xflags & X_GLOW != 0 {
+                                    let sum = ((rgb >> 16 & 0xFF) + (rgb >> 8 & 0xFF) + (rgb & 0xFF)) as f32;
+                                    let b = (407.0 / sum).max(1.0);
+                                    let r = ((rgb >> 16 & 0xFF) as f32 * b).min(255.0) as u32;
+                                    let g = ((rgb >> 8 & 0xFF) as f32 * b).min(255.0) as u32;
+                                    let bl = ((rgb & 0xFF) as f32 * b).min(255.0) as u32;
+                                    rgb = r << 16 | g << 8 | bl;
+                                }
+                                cur_ov = Some(MergeOverlay {
+                                    entry: key,
+                                    rgb,
+                                    alpha: e.xalpha,
+                                    opacity: e.xop,
+                                });
+                            }
+                        }
+                        if uniform {
+                            // every remaining level repeats this overlay
+                            if let Some(o) = cur_ov.as_mut() {
+                                o.opacity = o.opacity.saturating_add(e.xop * cy as u8).min(15);
+                            }
+                            break;
+                        }
+                        continue;
+                    }
+                    if e.flags & F_WATERLOGGED != 0 {
+                        // contained fluid renders as a water overlay first
+                        // (Xaero processes fluidState before the block itself)
+                        if top_h == i32::MIN {
+                            top_h = y_abs;
+                        }
+                        let key = &water_entry as *const PalEntry as usize;
+                        match cur_ov.as_mut() {
+                            Some(o) if o.entry == key => {
+                                o.opacity = o.opacity.saturating_add(1).min(15);
+                            }
+                            _ => {
+                                flush_ov!();
+                                cur_ov = Some(MergeOverlay {
+                                    entry: key,
+                                    rgb: entry_rgb(&mut memo, cm, &water_entry, || {
+                                        biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min)
+                                    }),
+                                    alpha: water_entry.xalpha,
+                                    opacity: 1,
+                                });
+                            }
+                        }
+                    }
+                    // surface block — composite the accumulated overlays.
+                    let mut rgb = entry_rgb(&mut memo, cm, e, || {
+                        biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min)
+                    });
+                    flush_ov!();
+                    let glowing = e.xflags & X_GLOW != 0;
+                    if glowing {
+                        let sum = ((rgb >> 16 & 0xFF) + (rgb >> 8 & 0xFF) + (rgb & 0xFF)) as f32;
+                        let b = (407.0 / sum).max(1.0);
+                        let r = ((rgb >> 16 & 0xFF) as f32 * b).min(255.0) as u32;
+                        let g = ((rgb >> 8 & 0xFF) as f32 * b).min(255.0) as u32;
+                        let bl = ((rgb & 0xFF) as f32 * b).min(255.0) as u32;
+                        rgb = r << 16 | g << 8 | bl;
+                    }
+                    out.pixel_buffer[pixel_index] =
+                        (if glowing { 0xFE } else { 0xFF }) << 24 | (rgb & 0xFF_FFFF);
+                    out.terrain_heights[pixel_index] =
+                        (y_abs - if e.xflags & X_SHORT != 0 { 1 } else { 0 }) as i16;
+                    if top_h == i32::MIN {
+                        top_h = y_abs;
+                    }
+                    if acc_tr < 1.0 {
+                        wp_buf[pixel_index] = ((acc_tr * 255.0) as u32) << 24
+                            | (ov_sum[0].min(255.0) as u32) << 16
+                            | (ov_sum[1].min(255.0) as u32) << 8
+                            | ov_sum[2].min(255.0) as u32;
+                        wh_buf[pixel_index] =
+                            ((top_h & 0xFFF) as i16) | (((sun.max(0) & 0xF) as i16) << 12);
+                    }
+                    continue 'zloop;
+                }
+            }
+        }
+    }
+}
 /// carries its state bitset, so (entry address, biome) -> rgb can be memoized
 /// instead of re-running get_state + the string-keyed color lookups.
 #[derive(Default)]
@@ -860,7 +1200,7 @@ pub fn draw_layer(
         }
     }
     let Some(section) = target else { return };
-    let s = build_section(section, modern, format, 15, target_y * 16);
+    let s = build_section(section, modern, format, 15, target_y * 16, cm.xaero_cfg());
     let chunk_biomes = if modern {
         None
     } else {
@@ -916,7 +1256,7 @@ pub fn draw_caves(
     };
     let y_min = nbt::int_from(Some(container), "yPos", -4);
     let modern = is_modern(format);
-    let indexed = index_sections(sections_opt, format, height, y_min);
+    let indexed = index_sections(sections_opt, format, height, y_min, cm.xaero_cfg());
     let chunk_biomes = if modern {
         None
     } else {

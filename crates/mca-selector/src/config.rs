@@ -234,20 +234,29 @@ impl WorldState {
     /// build-limit slider range for the active dimension: nether/end-style
     /// dims are 0..255, overworld(-like) dims -64..319. Derived from the
     /// dimension dir name — level.dat dimension types aren't parsed yet.
-    pub fn height_range(&self) -> (i32, i32) {
-        let name = self
-            .region_dir()
+    fn dim_name(&self) -> String {
+        self.region_dir()
             .parent()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        if name.contains("nether")
-            || name.contains("end")
-            || matches!(name.as_str(), "dim-1" | "dim1")
-        {
-            (0, 255)
+            .unwrap_or_default()
+    }
+
+    pub fn dim_kind(&self) -> mc_core::render::DimKind {
+        let name = self.dim_name();
+        if name.contains("nether") || name == "dim-1" {
+            mc_core::render::DimKind::Nether
+        } else if name.contains("end") || name == "dim1" {
+            mc_core::render::DimKind::End
         } else {
-            (-64, 319)
+            mc_core::render::DimKind::Overworld
+        }
+    }
+
+    pub fn height_range(&self) -> (i32, i32) {
+        match self.dim_kind() {
+            mc_core::render::DimKind::Overworld => (-64, 319),
+            _ => (0, 255),
         }
     }
 }

@@ -2,7 +2,7 @@
 //! MCA_REGION_PATH=/path/to/r.x.z.mca MCA_OUT=/tmp/out.png cargo test -p mc-core render_to_png -- --nocapture --ignored
 
 use mc_core::mca::McaFile;
-use mc_core::render::{generate_image, RenderSettings};
+use mc_core::render::{generate_image, DimKind, RenderSettings};
 use std::path::PathBuf;
 
 #[test]
@@ -13,7 +13,16 @@ fn render_to_png() {
     let mut m = McaFile::new(PathBuf::from(&path)).expect("region file");
     m.load(true).expect("load");
     let corrupted = [0u32; 256];
-    let img = generate_image(&m, 1, &RenderSettings::default(), &corrupted).expect("image");
+    let dim = match std::env::var("MCA_DIM").as_deref() {
+        Ok("nether") => DimKind::Nether,
+        Ok("end") => DimKind::End,
+        _ => DimKind::Overworld,
+    };
+    let cfg = RenderSettings {
+        dim,
+        ..RenderSettings::default()
+    };
+    let img = generate_image(&m, 1, &cfg, &corrupted).expect("image");
     let mut rgba = Vec::with_capacity(img.len() * 4);
     for &p in img.iter() {
         rgba.push((p >> 16) as u8);

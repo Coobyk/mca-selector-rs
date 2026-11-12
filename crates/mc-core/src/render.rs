@@ -9,6 +9,16 @@ pub const TILE_SIZE: usize = 512;
 pub const CHUNK_SIZE: usize = 16;
 pub const SIZE_IN_CHUNKS: usize = 32;
 
+/// Dimension kind — drives Xaero's per-dimension ambient color,
+/// depth curve and (nether) the full-cave column scan.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum DimKind {
+    #[default]
+    Overworld,
+    Nether,
+    End,
+}
+
 #[derive(Clone, Copy)]
 pub struct RenderSettings {
     pub render_height: i32,
@@ -17,6 +27,7 @@ pub struct RenderSettings {
     pub shade: bool,
     pub shade_water: bool,
     pub shade_altitude: bool,
+    pub dim: DimKind,
 }
 
 impl Default for RenderSettings {
@@ -28,6 +39,7 @@ impl Default for RenderSettings {
             shade: true,
             shade_water: true,
             shade_altitude: true,
+            dim: DimKind::Overworld,
         }
     }
 }
@@ -59,17 +71,19 @@ pub fn generate_image(
     let pixels = TILE_SIZE * TILE_SIZE / (scale * scale) as usize;
 
     let mut pixel_buffer = vec![0u32; pixels];
-    let shade_water = cfg.shade && cfg.shade_water && !cfg.caves;
-    let mut water_pixels = if shade_water { vec![0u32; pixels] } else { Vec::new() };
+    // the overlay buffers are always allocated for surface rendering —
+    // the xaero pipeline needs them unconditionally.
+    let aux = !cfg.caves;
+    let mut water_pixels = if aux { vec![0u32; pixels] } else { Vec::new() };
     let mut terrain_heights = vec![0i16; pixels];
-    let mut water_heights = if shade_water { vec![0i16; pixels] } else { Vec::new() };
+    let mut water_heights = if aux { vec![0i16; pixels] } else { Vec::new() };
 
     // The renderers address the buffers with a row stride of
     // `512 >> ilog2(scale)`; splitting the buffers into per-chunk-row bands
     // is a pure partition only when that stride equals `size`, i.e. for
     // power-of-two scales that keep chunk_size > 0 (1,2,4,8,16). Anything
     // else runs the original sequential loop verbatim.
-    if chunk_size > 0 && scale > 0 && (scale & (scale - 1)) == 0 {
+    let xaero_used = if chunk_size > 0 && scale > 0 && (scale & (scale - 1)) == 0 {
         draw_bands(
             mca,
             scale,
@@ -81,7 +95,7 @@ pub fn generate_image(
             &mut terrain_heights,
             &mut water_pixels,
             &mut water_heights,
-        );
+        )
     } else {
         draw_sequential(
             mca,
@@ -91,15 +105,23 @@ pub fn generate_image(
             size,
             chunk_size,
             pixels,
-            shade_water,
             &mut pixel_buffer,
             &mut terrain_heights,
             &mut water_pixels,
             &mut water_heights,
-        );
-    }
+        )
+    };
 
-    if cfg.caves {
+    if xaero_used && !cfg.caves && !cfg.layer_only {
+        xaero_shade(
+            &mut pixel_buffer,
+            &water_pixels,
+            &terrain_heights,
+            &water_heights,
+            scale,
+            cfg,
+        );
+    } else if cfg.caves {
         flat_shade(&mut pixel_buffer, &terrain_heights, scale);
     } else if cfg.shade && !cfg.layer_only {
         shade(&mut pixel_buffer, &water_pixels, &terrain_heights, &water_heights, scale, cfg);
@@ -124,16 +146,17 @@ fn draw_bands(
     terrain_heights: &mut [i16],
     water_pixels: &mut [u32],
     water_heights: &mut [i16],
-) {
+) -> bool {
     let band = chunk_size * size;
     if water_pixels.is_empty() {
         pixel_buffer
             .par_chunks_mut(band)
             .zip(terrain_heights.par_chunks_mut(band))
             .enumerate()
-            .for_each(|(crz, (pb, th))| {
-                draw_band(mca, crz, scale, cfg, corrupted, chunk_size, size, pb, th, None, None);
-            });
+            .map(|(crz, (pb, th))| {
+                draw_band(mca, crz, scale, cfg, corrupted, chunk_size, size, pb, th, None, None)
+            })
+            .reduce(|| false, |a, b| a || b)
     } else {
         pixel_buffer
             .par_chunks_mut(band)
@@ -141,7 +164,7 @@ fn draw_bands(
             .zip(water_pixels.par_chunks_mut(band))
             .zip(water_heights.par_chunks_mut(band))
             .enumerate()
-            .for_each(|(crz, (((pb, th), wp), wh))| {
+            .map(|(crz, (((pb, th), wp), wh))| {
                 draw_band(
                     mca,
                     crz,
@@ -154,8 +177,9 @@ fn draw_bands(
                     th,
                     Some(wp),
                     Some(wh),
-                );
-            });
+                )
+            })
+            .reduce(|| false, |a, b| a || b)
     }
 }
 
@@ -202,15 +226,16 @@ fn draw_band(
     terrain_band: &mut [i16],
     mut water_px_band: Option<&mut [u32]>,
     mut water_h_band: Option<&mut [i16]>,
-) {
+) -> bool {
     let mut dispatch = Dispatch::new();
+    let mut xaero = false;
     for crx in 0..SIZE_IN_CHUNKS {
         let index = crz * SIZE_IN_CHUNKS + crx;
         let Some(chunk) = &mca.chunks[index] else { continue };
         let Some(data) = &chunk.data else { continue };
         let (format, cm) = dispatch.get(nbt::data_version(Some(data)));
         let x = crx * chunk_size;
-        draw_one(
+        xaero |= draw_one(
             data,
             cm,
             format,
@@ -227,6 +252,7 @@ fn draw_band(
             water_h_band.as_deref_mut(),
         );
     }
+    xaero
 }
 
 /// The original sequential loop, kept verbatim for scales where the
@@ -241,13 +267,13 @@ fn draw_sequential(
     size: usize,
     chunk_size: usize,
     pixels: usize,
-    shade_water: bool,
     pixel_buffer: &mut [u32],
     terrain_heights: &mut [i16],
     water_pixels: &mut Vec<u32>,
     water_heights: &mut Vec<i16>,
-) {
+) -> bool {
     let mut dispatch = Dispatch::new();
+    let mut xaero = false;
     for cx in 0..SIZE_IN_CHUNKS {
         for cz in 0..SIZE_IN_CHUNKS {
             let index = cz * SIZE_IN_CHUNKS + cx;
@@ -256,7 +282,7 @@ fn draw_sequential(
             let (format, cm) = dispatch.get(nbt::data_version(Some(data)));
             let x = cx * chunk_size;
             let z = cz * chunk_size;
-            draw_one(
+            xaero |= draw_one(
                 data,
                 cm,
                 format,
@@ -269,12 +295,12 @@ fn draw_sequential(
                 pixels,
                 pixel_buffer,
                 terrain_heights,
-                if shade_water {
+                if !water_pixels.is_empty() {
                     Some(water_pixels.as_mut_slice())
                 } else {
                     None
                 },
-                if shade_water {
+                if !water_heights.is_empty() {
                     Some(water_heights.as_mut_slice())
                 } else {
                     None
@@ -282,6 +308,7 @@ fn draw_sequential(
             );
         }
     }
+    xaero
 }
 
 /// One chunk's draw_chunk/draw_layer/draw_caves + the corrupted-overlay
@@ -306,7 +333,8 @@ fn draw_one(
     terrain_heights: &mut [i16],
     mut water_pixels: Option<&mut [u32]>,
     mut water_heights: Option<&mut [i16]>,
-) {
+) -> bool {
+    let mut xaero_used = false;
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut out = RenderOut {
             pixel_buffer: &mut *pixel_buffer,
@@ -315,6 +343,8 @@ fn draw_one(
             water_heights: water_heights.as_deref_mut(),
             water: cfg.shade && cfg.shade_water,
             height: cfg.render_height,
+            full_cave: cfg.dim == DimKind::Nether,
+            xaero: false,
         };
         if cfg.caves {
             version::draw_caves(data, cm, format, x, z, scale, out.pixel_buffer, out.terrain_heights, cfg.render_height);
@@ -322,6 +352,7 @@ fn draw_one(
             version::draw_layer(data, cm, format, x, z, scale, out.pixel_buffer, cfg.render_height);
         } else {
             version::draw_chunk(data, cm, format, x, z, scale, &mut out);
+            xaero_used = out.xaero;
         }
     }));
     if res.is_err() {
@@ -340,6 +371,7 @@ fn draw_one(
             }
         }
     }
+    xaero_used
 }
 
 fn flat_shade(px: &mut [u32], heights: &[i16], _scale: i32) {
@@ -426,6 +458,139 @@ fn shade(
         });
 }
 
+/// Xaero's MapPixel.getPixelColours shading, applied as a tile post-pass
+/// (their updateBuffers step). Per pixel:
+///   brightness = (9 + max(sun_left, 0)) / 24   when overlays are present
+///   * depth    = height/63 clamped [0.9, 1.0]   (terrain_slopes=2 bounds)
+///   * slope    = shadow*0.2 + 0.5 + directLight — cosine of the surface
+///     direction (vs = h - hN, ds = h - hNW) against a diagonal light
+///   final rgb  = base*brightness*acc_tr + overlay_rgb
+/// water_pixels carries accTr<<24|premult overlay rgb; water_heights
+/// carries topHeight|sun<<12; pixel alpha 0xFE marks glowing blocks.
+fn xaero_shade(
+    px: &mut [u32],
+    overlay_px: &[u32],
+    terrain: &[i16],
+    top: &[i16],
+    scale: i32,
+    cfg: &RenderSettings,
+) {
+    let size = TILE_SIZE / scale as usize;
+    if size == 0 || overlay_px.is_empty() {
+        return;
+    }
+    // MapDimension ambient shadow + dimension height for the depth curve.
+    let (shadow, dim_h) = match cfg.dim {
+        DimKind::Overworld => ([0.518f32, 0.678, 1.0], 384.0f32),
+        DimKind::Nether => ([1.0f32, 0.0, 0.0], 256.0f32),
+        DimKind::End => ([1.0f32, 1.0, 1.0], 256.0f32),
+    };
+    let max_direct = 0.666_666_7f32;
+    px[..size * size]
+        .par_chunks_mut(size)
+        .enumerate()
+        .for_each(|(z, prow)| {
+            let hrow = &terrain[z * size..(z + 1) * size];
+            let hup = if z == 0 {
+                hrow
+            } else {
+                &terrain[(z - 1) * size..z * size]
+            };
+            let orow = &overlay_px[z * size..(z + 1) * size];
+            let trow = &top[z * size..(z + 1) * size];
+            for x in 0..size {
+                let argb = prow[x];
+                if argb == 0 {
+                    continue;
+                }
+                let glowing = (argb >> 24) == 0xFE;
+                let h = hrow[x] as f32;
+                let ov = orow[x];
+                let (mut br, mut bg, mut bb, acc_tr, or_, og_, ob_) = if ov != 0 {
+                    let acc_tr = (ov >> 24 & 0xFF) as f32 / 255.0;
+                    let sun = ((trow[x] as u16) >> 12) as i32;
+                    let b = if glowing {
+                        1.0
+                    } else {
+                        (9 + sun.max(0)) as f32 / 24.0
+                    };
+                    (
+                        b,
+                        b,
+                        b,
+                        acc_tr,
+                        (ov >> 16 & 0xFF) as f32,
+                        (ov >> 8 & 0xFF) as f32,
+                        (ov & 0xFF) as f32,
+                    )
+                } else {
+                    (1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0)
+                };
+                if cfg.shade_altitude && !glowing {
+                    // terrainDepth — nether caves use the dim-height curve.
+                    let depth = if cfg.dim == DimKind::Nether {
+                        0.7 + 0.3 * h / dim_h
+                    } else {
+                        h / 63.0
+                    };
+                    let depth = depth.clamp(0.9, 1.0);
+                    br *= depth;
+                    bg *= depth;
+                    bb *= depth;
+                }
+                if cfg.shade {
+                    // slopeUnknown when a neighbor pixel is empty (or at a
+                    // tile edge) — Xaero leaves those unshaded.
+                    let (vs, ds, known) = if z > 0 && x > 0 && hup[x] != 0 && hup[x - 1] != 0 {
+                        (
+                            h - hup[x] as f32,
+                            h - hup[x - 1] as f32,
+                            true,
+                        )
+                    } else {
+                        (0.0, 0.0, false)
+                    };
+                    if known {
+                        let (amb_c, amb_w, md) = if glowing {
+                            (0.0, 1.0, 0.222_222_24f32)
+                        } else {
+                            (0.2, 0.5, max_direct)
+                        };
+                        // terrain_slopes == 2: N+NW cross-product vs light dir
+                        let cross_z = -vs;
+                        let cos = if cross_z < 1.0 {
+                            if vs == 1.0 && ds == 1.0 {
+                                1.0
+                            } else {
+                                let cross_x = vs - ds;
+                                let cast = 1.0 - cross_z;
+                                let mag = (cross_x * cross_x + 1.0 + cross_z * cross_z).sqrt();
+                                cast / mag / std::f32::consts::SQRT_2
+                            }
+                        } else {
+                            0.0
+                        };
+                        let direct = if cos == 1.0 {
+                            md
+                        } else if cos > 0.0 {
+                            (cos * 10.0).ceil() / 10.0 * md * 0.883_88
+                        } else {
+                            0.0
+                        };
+                        let white = amb_w + direct;
+                        br *= shadow[0] * amb_c + white;
+                        bg *= shadow[1] * amb_c + white;
+                        bb *= shadow[2] * amb_c + white;
+                    }
+                }
+                let r = ((argb >> 16 & 0xFF) as f32 * br * acc_tr + or_).min(255.0) as u32;
+                let g = ((argb >> 8 & 0xFF) as f32 * bg * acc_tr + og_).min(255.0) as u32;
+                let b = ((argb & 0xFF) as f32 * bb * acc_tr + ob_).min(255.0) as u32;
+                prow[x] = 0xFF00_0000 | r << 16 | g << 8 | b;
+            }
+        });
+}
+
 /// generateImageFromChunkSet — the green LOD tile used at high zoom levels.
 pub fn lod_image(chunk_set: &crate::selection::ChunkSet, color: u32) -> Vec<u32> {
     let mut pixels = vec![0u32; 1024];
@@ -435,7 +600,8 @@ pub fn lod_image(chunk_set: &crate::selection::ChunkSet, color: u32) -> Vec<u32>
     pixels
 }
 
-/// scaleDownFXImage — nearest neighbor downscale of a square argb buffer.
+/// scaleDownFXImage — box-average downscale of a square argb buffer
+/// (Xaero's branch textures are recursive 2x2 box averages).
 pub fn scale_down(img: &[u32], from_size: usize, to_size: usize) -> Vec<u32> {
     let factor = from_size / to_size;
     let mut out = vec![0u32; to_size * to_size];
@@ -445,10 +611,22 @@ pub fn scale_down(img: &[u32], from_size: usize, to_size: usize) -> Vec<u32> {
         return out;
     }
     for (y, row) in out.chunks_exact_mut(to_size).enumerate() {
-        let base = y * factor * from_size;
-        let src = &img[base..base + (to_size - 1) * factor + 1];
-        for (p, v) in row.iter_mut().zip(src.iter().step_by(factor)) {
-            *p = *v;
+        for (x, p) in row.iter_mut().enumerate() {
+            let mut a = 0u32;
+            let mut r = 0u32;
+            let mut g = 0u32;
+            let mut b = 0u32;
+            for dy in 0..factor {
+                let base = (y * factor + dy) * from_size + x * factor;
+                for v in &img[base..base + factor] {
+                    a += v >> 24 & 0xFF;
+                    r += v >> 16 & 0xFF;
+                    g += v >> 8 & 0xFF;
+                    b += v & 0xFF;
+                }
+            }
+            let n = (factor * factor) as u32;
+            *p = (a / n) << 24 | (r / n) << 16 | (g / n) << 8 | (b / n);
         }
     }
     out

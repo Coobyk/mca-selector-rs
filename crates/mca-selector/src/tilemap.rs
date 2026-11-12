@@ -89,12 +89,13 @@ impl Tile {
 /// Async results channel: worker -> UI.
 /// bump when the renderer's pixel output changes — forces every cached
 /// PNG/LOD image to be treated as stale and re-rendered once.
-const RENDER_CACHE_VERSION: i64 = 2;
+const RENDER_CACHE_VERSION: i64 = 3;
 
 /// fingerprint of everything that changes a tile's pixels. keyed caches
 /// (disk PNGs, meta) are invalidated by comparing this.
-fn render_hash(cfg: &crate::config::WorldConfig) -> i64 {
+fn render_hash(cfg: &crate::config::WorldConfig, dim: mc_core::render::DimKind) -> i64 {
     ((cfg.render_height.clamp(-64, 2047) + 64) as i64)
+        | (dim as i64) << 15
         | (cfg.render_layer_only as i64) << 10
         | (cfg.render_caves as i64) << 11
         | (cfg.shade as i64) << 12
@@ -661,8 +662,9 @@ impl TileMapState {
             shade: ws.cfg.shade,
             shade_water: ws.cfg.shade_water,
             shade_altitude: ws.cfg.shade_altitude,
+            dim: ws.dim_kind(),
         };
-        let hash = render_hash(&ws.cfg);
+        let hash = render_hash(&ws.cfg, ws.dim_kind());
         let corrupted = CORRUPTED.with(|c| *c.borrow());
         jobs::pools().add_process(Job::new(
             jobs::PRIORITY_MEDIUM,
@@ -868,7 +870,7 @@ impl TileMapState {
         if self.loading.len() >= MAX_IN_FLIGHT_LOADS {
             return;
         }
-        let hash = render_hash(&ws.cfg);
+        let hash = render_hash(&ws.cfg, ws.dim_kind());
 
         if let Some(p) = self.pool.get(&zoom_level).and_then(|m| m.get(&key)) {
             // exact pool hit: pixels + gpu image are already Arc'd — adopt
@@ -1119,7 +1121,7 @@ impl TileMapState {
                     // render settings must not land — keep it unloaded so the
                     // next update re-renders under current settings.
                     if let (Some(h), Some(ws)) = (enq, &ws) {
-                        if h != render_hash(&ws.cfg) {
+                        if h != render_hash(&ws.cfg, ws.dim_kind()) {
                             if let Some(t) = self.tiles.get_mut(&key) {
                                 t.loaded = false;
                             }

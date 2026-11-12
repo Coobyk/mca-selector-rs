@@ -475,6 +475,7 @@ impl MainView {
                 shade: w.cfg.shade,
                 shade_water: w.cfg.shade_water,
                 shade_altitude: w.cfg.shade_altitude,
+                dim: w.dim_kind(),
             }
         }).unwrap_or_default();
         let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();

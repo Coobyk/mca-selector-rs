@@ -85,10 +85,58 @@ pub struct BiomeColors {
 /// tintCache: block -> biome -> StateColors
 pub type TintCache = HashMap<String, HashMap<String, StateColors>>;
 
+/// Per-block render metadata emitted by tools/xaero_palette.py — the
+/// equivalents of Xaero's runtime texture/model/light queries.
+#[derive(Clone, Debug, Default)]
+pub struct XaeroMeta {
+    /// average alpha of the block's map texture (0-255) — the overlay
+    /// transparency used in MapPixel's compositing.
+    pub alpha: u8,
+    /// vanilla lightFilter/lightBlock value — sun attenuation per overlay
+    /// layer and per waterlogged block.
+    pub opacity: u8,
+    /// luminance >= 1 (MapPixel.glowing).
+    pub glow: bool,
+    /// translucent render layer -> the block stacks as an overlay, never
+    /// a surface (water, ice, stained glass, ...).
+    pub overlay: bool,
+    /// Xaero renders nothing for this block (torches, small plants, glass,
+    /// decorations with no map color).
+    pub invis: bool,
+    /// unconditionally short (carpets, rails, redstone wire, ...).
+    pub short: bool,
+    /// collision-height < 0.25 predicate: all listed properties must match
+    /// for the effective height to drop by one.
+    pub short_if: Vec<(String, String)>,
+    pub short_in: Vec<(String, Vec<String>)>,
+}
+
+impl XaeroMeta {
+    /// isShort(state): effective height subtracts one.
+    pub fn is_short(&self, props: Option<&Compound>) -> bool {
+        if self.short {
+            return true;
+        }
+        if self.short_if.is_empty() && self.short_in.is_empty() {
+            return false;
+        }
+        let Some(props) = props else { return false };
+        let get = |k: &str| props.get(k).and_then(|t| t.as_string());
+        self.short_if
+            .iter()
+            .all(|(k, v)| get(k).map(|s| s == v.as_str()).unwrap_or(false))
+            && self
+                .short_in
+                .iter()
+                .all(|(k, vs)| get(k).map(|s| vs.iter().any(|v| v == s)).unwrap_or(false))
+    }
+}
+
 pub struct ColorConfig {
     pub states: BlockStates,
     pub colors: HashMap<String, StateColors>,
     pub tint_cache: TintCache,
+    pub xaero_meta: HashMap<String, XaeroMeta>,
 }
 
 impl ColorConfig {
@@ -137,8 +185,50 @@ struct RawColorConfig {
     states: HashMap<String, HashMap<String, usize>>,
     colors: HashMap<String, serde_json::Value>,
     tints: Option<HashMap<String, Vec<String>>>,
+    xaero_meta: Option<HashMap<String, RawXaeroMeta>>,
     #[serde(rename = "block_name_to_id")]
     _bnti: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct RawXaeroMeta {
+    a: Option<u8>,
+    op: Option<u8>,
+    glow: Option<bool>,
+    ov: Option<serde_json::Value>,
+    invis: Option<bool>,
+    short: Option<bool>,
+    short_layers: Option<u8>,
+    short_if: Option<HashMap<String, String>>,
+    short_in: Option<HashMap<String, Vec<String>>>,
+}
+
+impl From<RawXaeroMeta> for XaeroMeta {
+    fn from(r: RawXaeroMeta) -> Self {
+        let mut short_in: Vec<(String, Vec<String>)> = r
+            .short_in
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default();
+        if let Some(n) = r.short_layers {
+            short_in.push((
+                "layers".into(),
+                (1..=n).map(|i| i.to_string()).collect(),
+            ));
+        }
+        XaeroMeta {
+            alpha: r.a.unwrap_or(255),
+            opacity: r.op.unwrap_or(0),
+            glow: r.glow.unwrap_or(false),
+            overlay: r.ov.map(|v| !v.is_null()).unwrap_or(false),
+            invis: r.invis.unwrap_or(false),
+            short: r.short.unwrap_or(false),
+            short_if: r
+                .short_if
+                .map(|m| m.into_iter().collect())
+                .unwrap_or_default(),
+            short_in,
+        }
+    }
 }
 
 fn parse_block_color(v: &serde_json::Value) -> BlockColor {
@@ -207,10 +297,15 @@ pub fn load_color_config(json: &str) -> ColorConfig {
         }
     }
     let tint_cache = create_tint_cache(&colors, &tints);
+    let xaero_meta = raw
+        .xaero_meta
+        .map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect())
+        .unwrap_or_default();
     ColorConfig {
         states,
         colors,
         tint_cache,
+        xaero_meta,
     }
 }
 
@@ -312,5 +407,9 @@ embedded_cfg!(cfg_25w32a, "../resources/mapping/java_1_21/colors_25w32a.json");
 embedded_cfg!(cfg_26_1_s1, "../resources/mapping/java_26/colors_26.1-snapshot-1.json");
 embedded_cfg!(cfg_26_2_s1, "../resources/mapping/java_26/colors_26.2-snapshot-1.json");
 embedded_cfg!(cfg_26_3_s1, "../resources/mapping/java_26/colors_26.3-snapshot-1.json");
+
+// Xaero-World-Map-equivalent palette, generated from the vanilla client
+// assets by tools/xaero_palette.py (texture averages + block metadata).
+embedded_cfg!(cfg_xaero, "../resources/mapping/java_xaero/colors.json");
 
 // legacy (<=1.12) csv color mapping lives in version.rs (LegacyColorMapping).
