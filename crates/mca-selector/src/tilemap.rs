@@ -104,7 +104,7 @@ impl Tile {
 /// Async results channel: worker -> UI.
 /// bump when the renderer's pixel output changes — forces every cached
 /// PNG/LOD image to be treated as stale and re-rendered once.
-const RENDER_CACHE_VERSION: i64 = 5;
+const RENDER_CACHE_VERSION: i64 = 6;
 
 /// fingerprint of everything that changes a tile's pixels. keyed caches
 /// (disk PNGs, meta) are invalidated by comparing this.

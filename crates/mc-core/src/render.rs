@@ -73,6 +73,13 @@ pub fn generate_image(
 ) -> Option<Vec<u32>> {
     let size = TILE_SIZE / scale as usize;
     let chunk_size = CHUNK_SIZE / scale as usize;
+    // at scale 32 a chunk spans half a pixel (chunk_size=0): the per-chunk
+    // loops collapse onto pixel 0 and emit an empty image. Render at scale
+    // 16 and box-average down instead — keeps real terrain at max zoom-out.
+    if chunk_size == 0 {
+        let fine = generate_image(mca, scale / 2, cfg, corrupted)?;
+        return Some(scale_down(&fine, TILE_SIZE / (scale / 2) as usize, size));
+    }
     let pixels = TILE_SIZE * TILE_SIZE / (scale * scale) as usize;
 
     let mut pixel_buffer = vec![0u32; pixels];
