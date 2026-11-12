@@ -667,20 +667,18 @@ impl TileMapState {
             let (request, need_overlay) = match self.tiles.get_mut(&key) {
                 Some(tile) => {
                     let need_overlay = self.overlay.is_some() && !tile.overlay_loaded;
-                    // Any existing image is paintable at ANY zoom: paint_map
-                    // draws render_image into a fixed-size screen rect and the
-                    // GPU does the stretching. A finer-than-needed image
-                    // (img_zoom < zoom_level) just paints smaller — keeping it
-                    // is free, while the old scale_down + texture rebuild cost
-                    // a ~1MB CPU rescale and an atlas upload per tile per zoom
-                    // boundary. Only an image too coarse for the current zoom
-                    // (img_zoom > zoom_level) still needs a finer render; it
-                    // stays on screen until that lands. A region whose mca
-                    // load keeps failing stops being re-requested after
-                    // MAX_TILE_FAILURES attempts (reset on invalidate).
+                    // the tile shows the image AT the current zoom level —
+                    // finer versions (img_zoom < zoom_level) are swapped for
+                    // the coarser pool/cache copy (upstream ImagePool hands
+                    // out the image at the requested zoom; a stretched 512px
+                    // tile painted into a few pixels is wasted texture);
+                    // coarser versions (img_zoom > zoom_level) need a finer
+                    // render. The old image stays until the swap lands.
+                    // A region whose mca load keeps failing stops being
+                    // re-requested after MAX_TILE_FAILURES attempts.
                     let request = tile.failures < MAX_TILE_FAILURES
                         && (!tile.loaded
-                            || (tile.image.is_some() && tile.image_zoom_level() > zoom_level));
+                            || (tile.image.is_some() && tile.image_zoom_level() != zoom_level));
                     (request, need_overlay)
                 }
                 None => {
@@ -1515,6 +1513,31 @@ fn worker_probe_and_render(a: ProbeArgs) {
                     seq: a.seq,
                 });
                 return;
+            }
+            // no lod yet — a finer png pyramid level downscales to it
+            // without a region load (writes the lod cache for next time).
+            for zl in ZOOM_LEVELS {
+                if zl >= 32 {
+                    continue;
+                }
+                let png = files::png_cache_path(&a.cache_dir, zl, region);
+                if png.exists() {
+                    if let Some((img, gpu_img)) = decode_png_scaled(&png, zl, 32) {
+                        cache::set_lod_image(&a.uuid, region, &img);
+                        let _ = a.tx.send(TileResult::Image {
+                            region,
+                            image: Some(TileImage {
+                                argb: img,
+                                render: Some(gpu_img),
+                            }),
+                            zoom: 32,
+                            structures: cache::get_structures(&a.uuid, region),
+                            hash: a.hash,
+                            seq: a.seq,
+                        });
+                        return;
+                    }
+                }
             }
         } else {
             let png = files::png_cache_path(&a.cache_dir, a.zoom_level, region);
