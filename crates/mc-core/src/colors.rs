@@ -217,6 +217,14 @@ pub fn load_color_config(json: &str) -> ColorConfig {
 fn create_tint_cache(colors: &HashMap<String, StateColors>, tints: &BiomeColors) -> TintCache {
     let mut cache: TintCache = HashMap::new();
     for (name, sc) in colors {
+        // tint the config's fallback entry as well: iter_entries only yields
+        // the state-keyed colors, so without it a runtime state that matches
+        // none of them (or the `.color(None)` plains fallback) resolves to
+        // BlockColor::default() — opaque black patches on the map.
+        let cfg_default = match sc {
+            StateColors::Single(c) => *c,
+            StateColors::States { default, .. } => *default,
+        };
         for (state, bc) in sc.iter_entries() {
             let tint_idx = if bc.properties & GRASS_TINT != 0 {
                 Some(0)
@@ -243,7 +251,10 @@ fn create_tint_cache(colors: &HashMap<String, StateColors>, tints: &BiomeColors)
                                 .entry(biome.clone())
                                 .or_insert_with(|| StateColors::States {
                                     states: HashMap::new(),
-                                    default: BlockColor::default(),
+                                    default: BlockColor {
+                                        color: apply_tint(cfg_default.color, bt[ti]),
+                                        properties: 0,
+                                    },
                                 });
                             if let StateColors::States { states, .. } = e {
                                 states.insert(st.clone(), BlockColor { color: c, properties: 0 });
