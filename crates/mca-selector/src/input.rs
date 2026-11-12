@@ -48,10 +48,10 @@ impl MainView {
             self.map.scale /= factor;
             let pos = self.map.canvas_pos(f32::from(event.position.x), f32::from(event.position.y));
             if self.map.update_scale(old, pos) {
-                // request fresh-resolution tiles at the next paint — a wheel
-                // burst then costs one O(visible) update per frame instead
-                // of one per event.
-                self.request_update();
+                // debounce: keep stretching the already-rendered images
+                // while the wheel spins; poll_tick fires one request pass
+                // once the zoom settles (~220ms after the last crossing).
+                self.zoom_settle = Some(std::time::Instant::now() + std::time::Duration::from_millis(220));
             }
             // a scroll fully eaten by the min/max clamp repaints an
             // identical frame, so skip it.
@@ -338,7 +338,7 @@ impl MainView {
         let old = self.map.scale;
         self.map.scale /= factor;
         if self.map.update_scale(old, center) {
-            self.request_update();
+            self.zoom_settle = Some(std::time::Instant::now() + std::time::Duration::from_millis(220));
         }
         cx.notify();
     }

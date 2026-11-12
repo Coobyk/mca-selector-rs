@@ -12,7 +12,24 @@ use gpui::*;
 const BAR_H: f32 = 24.0;
 const ROW_H: f32 = 24.0;
 const PANEL_W: f32 = 300.0;
+const PANEL_W_MAX: f32 = 700.0;
 const SEP_H: f32 = 9.0;
+
+/// panel width for a menu's items: sized to the longest label (12px text is
+/// ~6.8px/char + 2*px_3 padding + check/arrow gutter), clamped to
+/// [PANEL_W, PANEL_W_MAX]. Rows still ellipsize past the cap.
+fn panel_w(items: &[MenuItem]) -> f32 {
+    let max = items
+        .iter()
+        .map(|i| match i {
+            MenuItem::Action { name, .. } => name.len(),
+            MenuItem::Submenu(s) => s.name.len() + 2,
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0) as f32;
+    (max * 6.8 + 56.0).clamp(PANEL_W, PANEL_W_MAX)
+}
 
 impl MainView {
     /// The top bar row. Dropdown + click-away backdrop live in
@@ -101,8 +118,9 @@ impl MainView {
         .priority(1)
         .into_any_element();
 
+        let pw = panel_w(&menu.items);
         let mut panel = v_flex()
-            .w(px(PANEL_W))
+            .w(px(pw))
             .bg(rgb(0x2b2b2b))
             .border_1()
             .border_color(rgb(0x555555))
@@ -146,7 +164,7 @@ impl MainView {
                         flyout = Some(
                             deferred(
                                 anchored()
-                                    .position(point(px(drop_x + PANEL_W), px(BAR_H + item_top)))
+                                    .position(point(px(drop_x + pw), px(BAR_H + item_top)))
                                     .child(self.submenu_panel(sub, open, ii, cx)),
                             )
                             .priority(3)
@@ -200,7 +218,7 @@ impl MainView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let mut panel = v_flex()
-            .w(px(PANEL_W))
+            .w(px(panel_w(&sub.items)))
             .bg(rgb(0x2b2b2b))
             .border_1()
             .border_color(rgb(0x555555))
@@ -263,5 +281,13 @@ fn menu_row(
         .cursor_pointer()
         .on_mouse_move(cx.listener(move |v, _e, _w, cx| on_hover(v, cx)))
         .on_mouse_down(MouseButton::Left, cx.listener(move |v, _e, w, cx| on_click(v, w, cx)))
-        .child(label)
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_x_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
+                .child(label),
+        )
 }

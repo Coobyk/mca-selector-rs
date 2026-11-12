@@ -43,7 +43,7 @@ impl MainView {
         // frame-paced tile dispatch: scroll/zoom/view changes arm update_now
         // per input event; running the O(visible-regions) update once here
         // coalesces bursts (scroll wheels can fire many events per frame).
-        if self.update_now {
+        if self.update_now && self.zoom_settle.is_none() {
             self.map.update();
             self.update_now = false;
         }

@@ -9,6 +9,7 @@ pub const TILE_SIZE: usize = 512;
 pub const CHUNK_SIZE: usize = 16;
 pub const SIZE_IN_CHUNKS: usize = 32;
 
+#[derive(Clone, Copy)]
 pub struct RenderSettings {
     pub render_height: i32,
     pub layer_only: bool,

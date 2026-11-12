@@ -370,13 +370,12 @@ impl TileMapState {
             .sub(self.offset.add(center.x * self.scale, center.z * self.scale));
         self.offset = self.offset.add_p(diff);
         let changed = get_zoom_level(old_scale) != get_zoom_level(self.scale);
-        if changed {
-            // keep the stale tile images: they stay painted at whatever
-            // resolution they have (the GPU stretches them) until a fresh
-            // render lands — clearing them here makes the map flash black
-            // on every wheel tick.
-            self.cancel_jobs();
-        }
+        // stale tile images stay painted at whatever resolution they have
+        // (the GPU stretches them) until a fresh render lands — clearing
+        // them here would flash the map black on every wheel tick. Queued
+        // jobs are kept too: a render at an intermediate zoom still lands
+        // in the image pool and is reusable if the zoom settles back
+        // there — cancelling on every crossing just threw that work away.
         changed
     }
 
@@ -599,6 +598,9 @@ impl TileMapState {
         // `requests` Vec (up to 8k entries = alloc + copy) between the
         // priority assignment and the request loop even when priorities were
         // already current. Steady-state ticks are now alloc-free here.
+        // Render-job specs are collected and dispatched by one worker job so
+        // the Job/path/closure construction per region leaves the UI thread.
+        let mut renders: Vec<(Point2i, i32, i64)> = Vec::new();
         Self::for_regions_spiral(bounds.0, bounds.1, MAX_TILE_REQUESTS, |region| {
             let key = region.as_long();
             // get_mut before insert: visible tiles almost always already
@@ -626,7 +628,7 @@ impl TileMapState {
                 }
             };
             if request {
-                self.request_image(&ws, region, zoom_level);
+                self.request_image(&ws, region, zoom_level, &mut renders);
             } else {
                 // ready tile: kick off the one-shot worker-side structures
                 // read unless it already ran for this image.
@@ -636,6 +638,63 @@ impl TileMapState {
                 self.request_overlay(&ws, region);
             }
         });
+        if !renders.is_empty() {
+            self.dispatch_renders(&ws, renders);
+        }
+    }
+
+    /// One dispatcher job that builds + enqueues the collected render jobs
+    /// on a pool worker: the per-region Job::new, path joins and ws field
+    /// clones happen off the UI thread. `loading` entries were inserted at
+    /// collect time so a follow-up update() can't double-request.
+    fn dispatch_renders(&mut self, ws: &crate::config::WorldState, specs: Vec<(Point2i, i32, i64)>) {
+        let tx = self.result_tx.clone();
+        let uuid = ws.uuid.clone();
+        let cache_dir = ws.cache_dir.clone();
+        let region_dir = ws.region_dir().to_path_buf();
+        let header_zoom = ws.cfg.render_header_only_zoom_level;
+        let lod_color = ws.cfg.zoom_level_lod_color;
+        let cfg = mc_core::render::RenderSettings {
+            render_height: ws.cfg.render_height,
+            layer_only: ws.cfg.render_layer_only,
+            caves: ws.cfg.render_caves,
+            shade: ws.cfg.shade,
+            shade_water: ws.cfg.shade_water,
+            shade_altitude: ws.cfg.shade_altitude,
+        };
+        let hash = render_hash(&ws.cfg);
+        let corrupted = CORRUPTED.with(|c| *c.borrow());
+        jobs::pools().add_process(Job::new(
+            jobs::PRIORITY_MEDIUM,
+            Option::<Box<dyn Fn() -> i64 + Send>>::None,
+            move || {
+                for (region, zoom_level, priority) in specs {
+                    let tx = tx.clone();
+                    let uuid = uuid.clone();
+                    let cache_dir = cache_dir.clone();
+                    let region_dir = region_dir.clone();
+                    jobs::pools().add_process(Job::new(
+                        jobs::PRIORITY_LOW,
+                        Some(Box::new(move || priority)),
+                        move || {
+                            worker_probe_and_render(ProbeArgs {
+                                tx,
+                                uuid,
+                                cache_dir,
+                                region_dir,
+                                region,
+                                zoom_level,
+                                cfg,
+                                header_zoom,
+                                lod_color,
+                                hash,
+                                corrupted,
+                            });
+                        },
+                    ));
+                }
+            },
+        ));
     }
 
     /// OverlayPool.requestImage: parse overlay data for a region and send back
@@ -792,8 +851,10 @@ impl TileMapState {
         self.overlay_loading.clear();
     }
 
-    /// ImagePool.requestImage.
-    fn request_image(&mut self, ws: &crate::config::WorldState, region: Point2i, zoom_level: i32) {
+    /// ImagePool.requestImage. On a full miss the job isn't built here —
+    /// a (region, zoom_level, priority) spec is pushed onto `renders` and
+    /// dispatch_renders constructs + enqueues the Jobs on a pool worker.
+    fn request_image(&mut self, ws: &crate::config::WorldState, region: Point2i, zoom_level: i32, renders: &mut Vec<(Point2i, i32, i64)>) {
         let key = region.as_long();
         if !self.regions.contains(&key) {
             if let Some(t) = self.tiles.get_mut(&key) {
@@ -883,43 +944,11 @@ impl TileMapState {
 
         // everything below runs on a pool worker: cache probing, file
         // deletes, png decode, nbt render and cache writes are all file IO +
-        // CPU work that must not stall the UI thread.
+        // CPU work that must not stall the UI thread — and neither does the
+        // Job construction itself, which the dispatcher now batches.
         self.loading.insert(key, hash);
-        let tx = self.result_tx.clone();
-        let uuid = ws.uuid.clone();
-        let cache_dir = ws.cache_dir.clone();
-        let region_dir = ws.region_dir().to_path_buf();
-        let header_zoom = ws.cfg.render_header_only_zoom_level;
-        let lod_color = ws.cfg.zoom_level_lod_color;
-        let cfg = mc_core::render::RenderSettings {
-            render_height: ws.cfg.render_height,
-            layer_only: ws.cfg.render_layer_only,
-            caves: ws.cfg.render_caves,
-            shade: ws.cfg.shade,
-            shade_water: ws.cfg.shade_water,
-            shade_altitude: ws.cfg.shade_altitude,
-        };
         let priority = self.tile_priority(region);
-        let corrupted = CORRUPTED.with(|c| *c.borrow());
-        jobs::pools().add_process(Job::new(
-            jobs::PRIORITY_LOW,
-            Some(Box::new(move || priority)),
-            move || {
-                worker_probe_and_render(ProbeArgs {
-                    tx,
-                    uuid,
-                    cache_dir,
-                    region_dir,
-                    region,
-                    zoom_level,
-                    cfg,
-                    header_zoom,
-                    lod_color,
-                    hash,
-                    corrupted,
-                });
-            },
-        ));
+        renders.push((region, zoom_level, priority));
     }
 
     /// structures-cache lookup for a ready tile: one-shot worker job (was a

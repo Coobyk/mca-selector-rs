@@ -57,6 +57,13 @@ pub struct MainView {
     pub(crate) pan_shift: bool,
     /// status-bar busy-spinner frame
     pub(crate) spin: u8,
+    /// zoom debounce deadline: while the wheel/keys keep changing the zoom
+    /// level, tile re-requests are held off and the canvas only stretches the
+    /// already-rendered images. When the deadline passes, poll_tick arms one
+    /// request_update() at the settled zoom — a wheel burst then costs one
+    /// update pass instead of a queue-clear + O(visible) request storm per
+    /// zoom-level crossing.
+    pub(crate) zoom_settle: Option<std::time::Instant>,
 }
 
 impl MainView {
@@ -96,6 +103,7 @@ impl MainView {
             pan_accum: std::time::Duration::ZERO,
             pan_shift: false,
             spin: 0,
+            zoom_settle: None,
         };
         // upstream loads the persisted overlay config (OverlayConfig) globally;
         // restore serialized overlay lines saved by the overlay editor.
@@ -151,7 +159,16 @@ impl MainView {
             self.dialog = Some(Dialog::Info { msg: m });
         }
         let changed = self.map.poll_results();
-        if self.update_needed || changed {
+        // zoom debounce: while a zoom is unsettled, don't run update() at
+        // all — even when results keep landing (changed). The settled pass
+        // requests at the final zoom level once.
+        if let Some(deadline) = self.zoom_settle {
+            if std::time::Instant::now() >= deadline {
+                self.zoom_settle = None;
+                self.request_update();
+            }
+        }
+        if (self.update_needed || changed) && self.zoom_settle.is_none() {
             self.map.update();
             self.map.evict_invisible();
             self.update_needed = false;
@@ -200,7 +217,10 @@ impl Render for MainView {
                 });
             },
         )
-        .size_full();
+        .size_full()
+        // quads painted in the canvas callback are clipped by the content
+        // mask — without this tiles at negative offsets paint over the bar.
+        .overflow_hidden();
 
         div()
             .id("root")
