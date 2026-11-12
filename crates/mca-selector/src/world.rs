@@ -17,10 +17,23 @@ impl MainView {
             prompt: Some("Select a world directory".into()),
         });
         cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
-            if let Ok(Ok(Some(paths))) = rx.await {
-                if let Some(p) = paths.into_iter().next() {
-                    let _ = this.update(&mut *cx, |v, cx| v.open_world_at(p, cx));
+            match rx.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(p) = paths.into_iter().next() {
+                        let _ = this.update(&mut *cx, |v, cx| v.open_world_at(p, cx));
+                    }
                 }
+                // a portal/picker failure used to drop silently — File >
+                // Open World then appears to do nothing at all.
+                Ok(Err(e)) => {
+                    let _ = this.update(&mut *cx, |v, cx| {
+                        v.dialog = Some(Dialog::Error {
+                            msg: format!("could not open file picker:\n{e}"),
+                        });
+                        cx.notify();
+                    });
+                }
+                _ => {}
             }
         })
         .detach();
@@ -40,28 +53,19 @@ impl MainView {
             cx.notify();
             return;
         }
-        // upstream showWorldDialog: if not a valid dimension itself, scan it;
-        // if it contains multiple dims, open dimension dialog; else open.
-        if files::is_valid_dimension(&dir) {
-            let dims = files::detect_dimension_directories(&dir);
-            let mut ordered = vec![dir.clone()];
-            ordered.extend(dims.iter().filter(|d| **d != dir).cloned());
-            self.do_open(dir.clone(), ordered, cx);
-            return;
-        }
+        // upstream openWorld: detect dims under the picked dir (the dir
+        // itself counts if it holds a valid region folder), open the sole
+        // one directly, or show the SelectWorldDialog picker.
         let dims = files::detect_dimension_directories(&dir);
-        if dims.len() > 1 {
-            self.dialog = Some(Dialog::SelectDimension { dims });
-            cx.notify();
-        } else if let Some(d) = dims.into_iter().next() {
-            // route through do_open_at_dir on the DETECTED dimension dir —
-            // this used to pass `dir` (the base, not a valid dimension) and
-            // dropped the dimension list entirely.
-            self.do_open_at_dir(d, cx);
-        } else {
+        if dims.is_empty() {
             self.dialog = Some(Dialog::Error {
-                msg: format!("no minecraft installation found in\n{}", dir.display()),
+                msg: format!("no dimensions found in {}", dir.display()),
             });
+            cx.notify();
+        } else if dims.len() == 1 {
+            self.do_open(dims[0].clone(), dims, cx);
+        } else {
+            self.dialog = Some(Dialog::SelectDimension { dims });
             cx.notify();
         }
     }
@@ -81,6 +85,27 @@ impl MainView {
         self.map.cancel_jobs();
         let ws = config::open_world(dirs, dims.clone());
         self.map.regions = files::scan_region_files(ws.region_dir());
+        // upstream keeps the camera across opens — but if the current view
+        // shows none of this world's regions it looks like nothing opened.
+        // Center on the mean loaded region only in that case.
+        let (vmin, vmax) = self
+            .map
+            .visible_region_bounds(mc_core::point::Point2f::new(0.0, 0.0));
+        let overlaps = self.map.regions.iter().any(|&k| {
+            let r = mc_core::point::Point2i::from_long(k);
+            r.x >= vmin.x - 1 && r.x <= vmax.x + 1 && r.z >= vmin.z - 1 && r.z <= vmax.z + 1
+        });
+        if !overlaps && !self.map.regions.is_empty() {
+            let n = self.map.regions.len() as i64;
+            let (mut sx, mut sz) = (0i64, 0i64);
+            for &k in &self.map.regions {
+                let r = mc_core::point::Point2i::from_long(k);
+                sx += r.x as i64;
+                sz += r.z as i64;
+            }
+            self.map
+                .go_to((sx / n) as i32 * 512 + 256, (sz / n) as i32 * 512 + 256);
+        }
         // `disabled` is derived from config::WORLD — setting the world above
         // enables the map.
         self.request_update();
@@ -88,13 +113,6 @@ impl MainView {
         g.add_recent_world(root);
         config::set_global(g);
         cx.notify();
-    }
-
-    pub(crate) fn do_open_at_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        let dims = files::detect_dimension_directories(&dir);
-        let mut ordered = vec![dir.clone()];
-        ordered.extend(dims.iter().filter(|d| **d != dir).cloned());
-        self.do_open(dir.clone(), ordered, cx);
     }
 
     pub fn open_dimension_dialog(&mut self, _window: &mut Window, cx: &mut Context<Self>) {

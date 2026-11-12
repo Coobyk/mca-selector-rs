@@ -653,9 +653,15 @@ impl MainView {
             ),
             Dialog::SelectDimension { dims } => {
                 let mut list = v_flex().gap_1().child(text_el("Select dimension", 16.));
+                let all_dims = dims.clone();
                 for d in dims {
-                    let label = d.display().to_string();
+                    // upstream FileNameListCell shows file.getName(), not the path
+                    let label = d
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| d.display().to_string());
                     let dp = d.clone();
+                    let dims_for_click = all_dims.clone();
                     list = list.child(
                         div()
                             .id(SharedString::from(label.clone()))
@@ -663,11 +669,12 @@ impl MainView {
                             .hover(|s| s.bg(rgb(0x3a3a3a)))
                             .child(text_el(label, 12.))
                             .on_click(cx.listener(move |v, _, _w, cx| {
-                                // open through the real path: queue cancel,
-                                // selection reset, recent-world update — the
-                                // inlined version used to skip all of it.
-                                v.do_open_at_dir(dp.clone(), cx);
+                                // close the picker FIRST — after do_open,
+                                // `dialog = None` used to erase its error
+                                // dialog, turning a failed open into a
+                                // silent nothing.
                                 v.dialog = None;
+                                v.do_open(dp.clone(), dims_for_click.clone(), cx);
                                 cx.notify();
                             })),
                     );
