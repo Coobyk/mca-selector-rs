@@ -217,10 +217,12 @@ impl Render for MainView {
                 });
             },
         )
-        .size_full()
-        // quads painted in the canvas callback are clipped by the content
-        // mask — without this tiles at negative offsets paint over the bar.
-        .overflow_hidden();
+        .size_full();
+
+        // the canvas paints raw window-space quads; only a Div applies an
+        // overflow mask around its children, so the clip lives on a wrapper
+        // — without it tiles at negative offsets paint over the menu bar.
+        let map_clip = div().size_full().overflow_hidden().child(map_el);
 
         div()
             .id("root")
@@ -467,7 +469,7 @@ impl Render for MainView {
                             .on_mouse_up(MouseButton::Middle, cx.listener(|v, e, w, cx| v.on_mouse_up(e, w, cx)))
                             .on_mouse_move(cx.listener(|v, e, w, cx| v.on_mouse_move(e, w, cx)))
                             .on_scroll_wheel(cx.listener(|v, e, w, cx| v.on_scroll(e, w, cx)))
-                            .child(map_el),
+                            .child(map_clip),
                     )
                     .children(self.render_menu_overlay(window, cx))
                     .children(self.render_dialog(window, cx)),
