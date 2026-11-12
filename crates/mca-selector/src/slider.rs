@@ -6,6 +6,12 @@ use crate::dialogs::Dialog;
 use crate::view::MainView;
 use gpui::*;
 
+/// debounce window for render-height invalidation: changes arriving inside
+/// it extend the deadline rather than each triggering a full tile
+/// re-render (upstream re-renders per change — fine for clicks, ruinous
+/// for 60Hz slider drags).
+const RENDER_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
 impl MainView {
     pub(crate) fn height_from_slider_x(&self, x: f32) -> i32 {
         let w = config::WORLD.read().unwrap().as_ref()
@@ -33,6 +39,7 @@ impl MainView {
         if h == cur && !persist {
             return;
         }
+        let changed = h != cur;
         // mutate under the write lock — cloning WorldState + set_world per
         // slider-move event was avoidable alloc work on the drag path.
         // (save runs after the lock is released, as before.)
@@ -44,9 +51,66 @@ impl MainView {
                 ws.cfg.save(&ws.cache_dir);
             }
         }
-        self.map.mark_all_tiles_obsolete();
-        self.request_update();
+        if changed {
+            match self.render_settle {
+                // a change burst is in flight (slider drag / scroll burst):
+                // just extend the settle window — the flush re-renders the
+                // tile set ONCE at the final height instead of re-
+                // invalidating every visible region per input tick (~200ms
+                // of render work each). Tiles keep their old pixels as
+                // placeholders in the meantime, like upstream.
+                Some((_, last)) => {
+                    self.render_settle = Some((
+                        std::time::Instant::now() + RENDER_SETTLE,
+                        last,
+                    ));
+                }
+                // first change of a burst: invalidate now like upstream —
+                // a one-shot height change re-renders with no added delay —
+                // then coalesce follow-up changes inside the window.
+                None => {
+                    self.map.mark_all_tiles_obsolete();
+                    let new_hash = config::WORLD.read().unwrap().as_ref()
+                        .map(|w| crate::tilemap::render_hash(&w.cfg, w.dim_kind()))
+                        .unwrap_or(0);
+                    self.render_settle = Some((
+                        std::time::Instant::now() + RENDER_SETTLE,
+                        new_hash,
+                    ));
+                    self.request_update();
+                }
+            }
+        }
         cx.notify();
+    }
+
+    /// The settle window expired (or a slider drag ended): if the effective
+    /// render settings moved since the last invalidation, invalidate once
+    /// at the final values — a drag/scroll burst costs exactly one extra
+    /// tile re-render generation instead of one per input tick.
+    pub(crate) fn settle_render_height(&mut self) {
+        if let Some((_, last_hash)) = self.render_settle.take() {
+            let cur = config::WORLD.read().unwrap().as_ref()
+                .map(|w| crate::tilemap::render_hash(&w.cfg, w.dim_kind()));
+            if Some(last_hash) != cur {
+                self.map.mark_all_tiles_obsolete();
+                self.request_update();
+            }
+        }
+    }
+
+    /// slider drag end (shared by the canvas and root-level mouse-up
+    /// handlers — whichever fires first): persist the height and flush a
+    /// pending settle immediately instead of waiting out the deadline.
+    pub(crate) fn finish_height_drag(&mut self) {
+        if !self.height_slider_drag {
+            return;
+        }
+        self.height_slider_drag = false;
+        if let Some(ws) = config::world() {
+            ws.cfg.save(&ws.cache_dir);
+        }
+        self.settle_render_height();
     }
 
     pub(crate) fn render_height_slider(&self, cx: &mut Context<Self>) -> AnyElement {

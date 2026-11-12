@@ -44,6 +44,11 @@ impl Default for RenderSettings {
     }
 }
 
+fn bench_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MCA_BENCH").is_some())
+}
+
 pub fn shade_color(argb: u32, shade: i32) -> u32 {
     let r = (((argb >> 16) & 0xFF) as i32 + shade).clamp(0, 255) as u32;
     let g = (((argb >> 8) & 0xFF) as i32 + shade).clamp(0, 255) as u32;
@@ -129,7 +134,9 @@ pub fn generate_image(
     } else if cfg.shade && !cfg.layer_only {
         shade(&mut pixel_buffer, &water_pixels, &terrain_heights, &water_heights, scale, cfg);
     }
-    eprintln!("[bench] draw={:.1}ms shade={:.1}ms", draw_ms, t1.elapsed().as_secs_f64() * 1e3);
+    if bench_timing() {
+        eprintln!("[bench] draw={:.1}ms shade={:.1}ms", draw_ms, t1.elapsed().as_secs_f64() * 1e3);
+    }
     Some(pixel_buffer)
 }
 

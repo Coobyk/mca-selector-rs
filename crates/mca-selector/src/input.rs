@@ -2,7 +2,6 @@
 //! handlers + KeyActivator held-key pan). Dialog keystrokes are dispatched
 //! from on_key_down into dialogs::dialog_key.
 
-use crate::config;
 use crate::tilemap::CHUNK_GRID_SCALE;
 use crate::view::MainView;
 use gpui::*;
@@ -56,6 +55,10 @@ impl MainView {
             // a scroll fully eaten by the min/max clamp repaints an
             // identical frame, so skip it.
             if self.map.scale != old {
+                // zooming exposes fresh regions at the edges even when the
+                // zoom *level* didn't change — request them this frame
+                // rather than at the next 100ms poll.
+                self.request_update();
                 cx.notify();
             }
         }
@@ -181,6 +184,9 @@ impl MainView {
             let dz = (self.previous.z - pos.z) * self.map.scale;
             if dx != 0.0 || dz != 0.0 {
                 self.map.offset = self.map.offset.add(dx, dz);
+                // newly exposed regions were only requested on the 100ms
+                // poll — dispatch them in this frame instead.
+                self.request_update();
                 dirty = true;
             }
         } else if pressed.is_some() && self.drag != Drag::None {
@@ -267,12 +273,7 @@ impl MainView {
     }
 
     pub(crate) fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.height_slider_drag {
-            self.height_slider_drag = false;
-            if let Some(ws) = config::world() {
-                ws.cfg.save(&ws.cache_dir);
-            }
-        }
+        self.finish_height_drag();
         if let Some(p) = &mut self.map.pasted {
             p.first_mouse = None;
         }
@@ -363,6 +364,9 @@ impl MainView {
             let dx = if self.pressed_keys & 2 != 0 { -speed } else if self.pressed_keys & 8 != 0 { speed } else { 0.0 };
             let dz = if self.pressed_keys & 1 != 0 { -speed } else if self.pressed_keys & 4 != 0 { speed } else { 0.0 };
             self.map.offset = self.map.offset.add(dx * self.map.scale, dz * self.map.scale);
+            // held-key pan exposes new regions each step — dispatch their
+            // requests now instead of at the next 100ms poll.
+            self.request_update();
         }
         window.on_next_frame(|w, _| w.refresh());
     }

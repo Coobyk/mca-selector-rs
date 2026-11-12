@@ -285,16 +285,9 @@ fn resolve_entry<'a>(
     xaero: Option<&ColorConfig>,
 ) -> PalEntry<'a> {
     let cp = colors::color_properties();
-    let mut flags = 0u8;
-    if cp.transparent.contains(name) {
-        flags |= F_TRANSPARENT;
-    }
-    if cp.water.contains(name) {
-        flags |= F_WATER;
-    }
-    if cp.foliage.contains(name) {
-        flags |= F_FOLIAGE;
-    }
+    // the aggregated name->flag map folds the per-set probes into one.
+    let pf = cp.flags.get(name).copied().unwrap_or(0);
+    let mut flags = pf & (F_TRANSPARENT | F_WATER | F_FOLIAGE);
     if props
         .and_then(|p| p.get("waterlogged"))
         .and_then(|t| t.as_string())
@@ -307,7 +300,7 @@ fn resolve_entry<'a>(
     let mut xalpha = 255u8;
     let mut xop = 0u8;
     if let Some(xc) = xaero {
-        if matches!(name, "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air") {
+        if pf & colors::FLAG_AIR != 0 {
             xflags |= X_AIR;
         }
         if let Some(m) = xc.xaero_meta.get(name) {
@@ -443,6 +436,36 @@ struct IndexedSection<'a> {
     caves_inert: bool,
     /// xaero scan: every entry is air or invisible => skippable.
     x_inert: bool,
+    // -- per-palette-index pass masks (only when block.bits <= 6, so every
+    // index the packed data can produce fits a u64 bit; a 0 mask simply
+    // disables its fast path)
+    /// xaero scan: index skips unconditionally when the column is entered
+    /// (air | invis).
+    x_skip: u64,
+    /// subset of x_skip that sets underair — air but not invis (invis is
+    /// tested first and leaves underair untouched). Doubles as the
+    /// "can re-open underair" mask for the entered+!underair fast path;
+    /// u64::MAX when the palette is too wide for masks so that path never
+    /// skips (its x_skip-gated use is unreachable then anyway).
+    x_air: u64,
+    /// draw_chunk: transparent entries.
+    trans_skip: u64,
+    /// draw_caves: transparent | foliage (valid only before the first
+    /// solid block — see the scan's `ignored` gate).
+    caves_skip: u64,
+    // -- non-spanning column-cursor precomputes (per-section constants;
+    // keep the per-block step division-free)
+    /// indexes per long (PackedData::ipl).
+    col_ipl: u32,
+    /// ceil(2^24 / ipl): `index * col_div >> 24` == index / ipl for the
+    /// in-section index range (< 4096).
+    col_div: u32,
+    /// longs per 256-index down-step.
+    col_step_li: u32,
+    /// bit-shift decrement per step ((256 % ipl) * bits).
+    col_step_shift: i32,
+    /// shift add-back on wrap (ipl * bits).
+    col_ipl_shift: i32,
 }
 
 /// An in-range section tag plus its slot geometry. The expensive part
@@ -457,22 +480,25 @@ struct SectionSlot<'a> {
     start_height: i32,
     section_height: i32,
     xaero: Option<&'static ColorConfig>,
-    built: std::cell::OnceCell<IndexedSection<'a>>,
+    /// boxed so the per-chunk slot table stays small — the Vec is
+    /// allocated and zeroed for every rendered chunk.
+    built: std::cell::OnceCell<Box<IndexedSection<'a>>>,
 }
 
 impl<'a> SectionSlot<'a> {
     #[inline]
     fn get(&self) -> &IndexedSection<'a> {
-        self.built.get_or_init(|| {
-            build_section(
+        let b = self.built.get_or_init(|| {
+            Box::new(build_section(
                 self.src,
                 self.modern,
                 self.format,
                 self.start_height,
                 self.section_height,
                 self.xaero,
-            )
-        })
+            ))
+        });
+        &**b
     }
 }
 
@@ -564,29 +590,6 @@ fn entry_rgb<'a>(
         cv.rgb
     } else {
         memo.get(cm, e, cv, bk())
-    }
-}
-
-/// small multiplicative hasher for pointer/integer keys — the memo is hit
-/// once or more per rendered column and std's SipHash dominates otherwise.
-#[derive(Default)]
-struct PtrHasher(u64);
-impl std::hash::Hasher for PtrHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 = (self.0 ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            self.0 = self.0.rotate_left(23);
-        }
-    }
-    #[inline]
-    fn write_usize(&mut self, i: usize) {
-        self.0 = (self.0 ^ i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        self.0 = self.0.rotate_left(23);
     }
 }
 
@@ -765,6 +768,37 @@ fn build_section<'a>(
         && entries
             .iter()
             .all(|e| e.xflags & (X_INVIS | X_AIR) != 0);
+    // per-index pass masks for the column scans' fast path — only dense
+    // enough to cover every producible index when bits <= 6.
+    let (x_skip, x_air, trans_skip, caves_skip) = if block.bits <= 6 {
+        let mut xs = 0u64;
+        let mut xa = 0u64;
+        let mut ts = 0u64;
+        let mut cs = 0u64;
+        for (i, e) in entries.iter().enumerate().take(64) {
+            let b = 1u64 << i;
+            let xf = e.xflags;
+            if xf & (X_INVIS | X_AIR) != 0 {
+                xs |= b;
+            }
+            // air re-opens underair; invis is tested first and does not.
+            if xf & X_AIR != 0 && xf & X_INVIS == 0 {
+                xa |= b;
+            }
+            if e.flags & F_TRANSPARENT != 0 {
+                ts |= b;
+            }
+            if e.flags & (F_TRANSPARENT | F_FOLIAGE) != 0 {
+                cs |= b;
+            }
+        }
+        (xs, xa, ts, cs)
+    } else {
+        (0, u64::MAX, 0, 0)
+    };
+    // non-spanning column cursor constants (unused when spanning/bits==0).
+    let col_ipl = block.ipl() as u32;
+    let step_rem = 256 % col_ipl as usize;
     IndexedSection {
         entries,
         block,
@@ -776,6 +810,112 @@ fn build_section<'a>(
         all_transparent,
         caves_inert,
         x_inert,
+        x_skip,
+        x_air,
+        trans_skip,
+        caves_skip,
+        col_ipl,
+        col_div: ((1u32 << 24) + col_ipl - 1) / col_ipl,
+        col_step_li: (256 / col_ipl as usize) as u32,
+        col_step_shift: (step_rem * block.bits) as i32,
+        col_ipl_shift: (col_ipl as usize * block.bits) as i32,
+    }
+}
+
+/// bitmask for `bits`-wide reads — matches chunk.rs's private helper.
+#[inline]
+fn bmask(bits: usize) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
+}
+
+/// spanning-layout read (< 20w17a) — chunk.rs's private helper duplicated
+/// so the column cursor doesn't need a division-free PackedData::get.
+#[inline]
+fn get_spanning(src: &PackedSrc<'_>, bit: usize, bits: usize) -> u64 {
+    let li = bit >> 6;
+    let off = bit & 63;
+    if off + bits > 64 {
+        let prev = src.long(li) >> off;
+        let next = src.long(li + 1) & bmask(off + bits - 64);
+        (next << (64 - off)) | prev
+    } else {
+        (src.long(li) >> off) & bmask(bits)
+    }
+}
+
+/// Incremental top-down column cursor (steps of 256 indexes — one section
+/// row). For the non-spanning layout `prev` is a pair of integer updates:
+/// the ipl constant and the 256/ipl split are precomputed per section, so
+/// no division runs per block (PackedCursor::prev calls ipl() whenever
+/// the in-long offset wraps). Spanning-layout sections fall back to an
+/// absolute-index PackedData::get — those formats are legacy.
+struct ColCursor<'a> {
+    src: PackedSrc<'a>,
+    /// absolute index — spanning layout only.
+    index: usize,
+    spanning: bool,
+    bits: usize,
+    li: usize,
+    shift: i32,
+    step_li: usize,
+    step_shift: i32,
+    ipl_shift: i32,
+    mask: u64,
+}
+
+fn col_cursor<'a>(s: &IndexedSection<'a>, index: usize) -> ColCursor<'a> {
+    let b = s.block;
+    let mut c = ColCursor {
+        src: b.src,
+        index,
+        spanning: b.spanning,
+        bits: b.bits,
+        li: 0,
+        shift: 0,
+        step_li: s.col_step_li as usize,
+        step_shift: s.col_step_shift,
+        ipl_shift: s.col_ipl_shift,
+        mask: u64::MAX,
+    };
+    if !b.spanning {
+        // index / ipl via the precomputed ceil(2^24/ipl) multiplier —
+        // exact for all in-section indexes (< 4096 < 2^12).
+        let li = ((index as u64 * s.col_div as u64) >> 24) as usize;
+        c.li = li;
+        c.shift = ((index - li * s.col_ipl as usize) * b.bits) as i32;
+        c.mask = bmask(b.bits);
+    }
+    c
+}
+
+impl ColCursor<'_> {
+    #[inline]
+    fn get(&self) -> u64 {
+        if self.spanning {
+            get_spanning(&self.src, self.index * self.bits, self.bits)
+        } else {
+            (self.src.long(self.li) >> self.shift) & self.mask
+        }
+    }
+
+    /// move one section row (256 indexes) down — saturates like
+    /// PackedCursor::prev on corrupt data.
+    #[inline]
+    fn prev(&mut self) {
+        if self.spanning {
+            self.index = self.index.saturating_sub(256);
+        } else {
+            self.shift -= self.step_shift;
+            if self.shift < 0 {
+                self.shift += self.ipl_shift;
+                self.li = self.li.saturating_sub(1);
+            }
+            self.li = self.li.saturating_sub(self.step_li);
+        }
     }
 }
 
@@ -836,81 +976,91 @@ pub fn draw_chunk(
         height.clamp(0, 255)
     };
     let start = ((abs_h >> 4).min(indexed.len() as i32 - 1)).max(0) as usize;
-    let mut memo = RgbMemo::default();
     let oob = oob_entry();
     let water_entry = resolve_entry(WATER_DUMMY_NAME, None, None);
     let row = 512usize >> scale_bits;
+    // top-down sequence of present sections — filtered once per chunk
+    // instead of re-checking every Option slot per column.
+    let mut present = Vec::with_capacity(start + 1);
+    present.extend(indexed[..=start].iter().rev().flatten());
 
-    for cx in (0..16usize).step_by(scale as usize) {
-        'zloop: for cz in (0..16usize).step_by(scale as usize) {
-            let pixel_index = (z + (cz >> scale_bits)) * row + (x + (cx >> scale_bits));
-            let mut water_depth = false;
-            // top-down section sequence; a rev+flatten iterator rebuilds the
-            // same order per column without a per-chunk Vec allocation.
-            for slot in indexed[..=start].iter().rev().flatten() {
-                let s = slot.get();
-                if s.all_transparent {
-                    continue;
-                }
-                // packed-data cursor: stepping y by -1 subtracts exactly 256
-                // indexes — the cursor tracks the long/bit offset
-                // incrementally (chunk::PackedCursor).
-                let uniform = s.block.bits == 0;
-                let top_index = chunk::location_to_index(cx, s.start_height as usize, cz);
-                let mut cur = s.block.cursor(top_index, 256);
-                for cy in (0..=s.start_height).rev() {
-                    let e = if uniform {
-                        s.entries.first().unwrap_or(&oob)
-                    } else {
-                        let pi = cur.get() as usize;
-                        if cy > 0 {
-                            cur.prev();
-                        }
-                        s.entries.get(pi).unwrap_or(&oob)
-                    };
-                    if e.flags & F_TRANSPARENT != 0 {
-                        if uniform {
-                            // every row holds the same entry — nothing else
-                            // in this section can block the column.
-                            break;
-                        }
+    with_memo(|memo| {
+        for cx in (0..16usize).step_by(scale as usize) {
+            'zloop: for cz in (0..16usize).step_by(scale as usize) {
+                let pixel_index = (z + (cz >> scale_bits)) * row + (x + (cx >> scale_bits));
+                let mut water_depth = false;
+                for slot in &present {
+                    let s = slot.get();
+                    if s.all_transparent {
                         continue;
                     }
-                    let bk = || biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min);
-                    let y_abs = s.section_height + cy;
-                    if out.water {
-                        let wh = out.water_heights.as_deref_mut().unwrap();
-                        if !water_depth {
-                            out.pixel_buffer[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
-                            wh[pixel_index] = y_abs as i16;
-                        }
-                        if e.flags & F_WATER != 0 {
-                            water_depth = true;
+                    // packed-data cursor: stepping y by -1 subtracts exactly
+                    // 256 indexes — tracked incrementally (ColCursor).
+                    let uniform = s.block.bits == 0;
+                    let top_index =
+                        chunk::location_to_index(cx, s.start_height as usize, cz);
+                    let mut cur = col_cursor(s, top_index);
+                    for cy in (0..=s.start_height).rev() {
+                        let e = if uniform {
+                            s.entries.first().unwrap_or(&oob)
+                        } else {
+                            let pi = cur.get() as usize;
+                            if cy > 0 {
+                                cur.prev();
+                            }
+                            // transparent runs skip with a single mask test
+                            // — no palette-entry load. (& 63 keeps the
+                            // shift defined for wide-palette sections.)
+                            if (s.trans_skip >> (pi & 63)) & 1 != 0 {
+                                continue;
+                            }
+                            s.entries.get(pi).unwrap_or(&oob)
+                        };
+                        if e.flags & F_TRANSPARENT != 0 {
                             if uniform {
+                                // every row holds the same entry — nothing
+                                // else in this section can block the column.
                                 break;
                             }
                             continue;
-                        } else if e.flags & F_WATERLOGGED != 0 {
-                            out.pixel_buffer[pixel_index] =
-                                entry_rgb(&mut memo, cm, &water_entry, bk);
-                            if let Some(wp) = out.water_pixels.as_deref_mut() {
-                                wp[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
-                            }
-                            wh[pixel_index] = y_abs as i16;
-                            out.terrain_heights[pixel_index] = (y_abs - 1) as i16;
-                            continue 'zloop;
-                        } else if let Some(wp) = out.water_pixels.as_deref_mut() {
-                            wp[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
                         }
-                    } else {
-                        out.pixel_buffer[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
+                        let bk =
+                            || biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min);
+                        let y_abs = s.section_height + cy;
+                        if out.water {
+                            let wh = out.water_heights.as_deref_mut().unwrap();
+                            if !water_depth {
+                                out.pixel_buffer[pixel_index] = entry_rgb(memo, cm, e, bk);
+                                wh[pixel_index] = y_abs as i16;
+                            }
+                            if e.flags & F_WATER != 0 {
+                                water_depth = true;
+                                if uniform {
+                                    break;
+                                }
+                                continue;
+                            } else if e.flags & F_WATERLOGGED != 0 {
+                                out.pixel_buffer[pixel_index] =
+                                    entry_rgb(memo, cm, &water_entry, bk);
+                                if let Some(wp) = out.water_pixels.as_deref_mut() {
+                                    wp[pixel_index] = entry_rgb(memo, cm, e, bk);
+                                }
+                                wh[pixel_index] = y_abs as i16;
+                                out.terrain_heights[pixel_index] = (y_abs - 1) as i16;
+                                continue 'zloop;
+                            } else if let Some(wp) = out.water_pixels.as_deref_mut() {
+                                wp[pixel_index] = entry_rgb(memo, cm, e, bk);
+                            }
+                        } else {
+                            out.pixel_buffer[pixel_index] = entry_rgb(memo, cm, e, bk);
+                        }
+                        out.terrain_heights[pixel_index] = y_abs as i16;
+                        continue 'zloop;
                     }
-                    out.terrain_heights[pixel_index] = y_abs as i16;
-                    continue 'zloop;
                 }
             }
         }
-    }
+    });
 }
 
 /// One merged overlay layer during the xaero column scan — same-state
@@ -962,7 +1112,6 @@ fn draw_chunk_xaero(
         height.clamp(0, 255)
     };
     let start = ((abs_h >> 4).min(indexed.len() as i32 - 1)).max(0) as usize;
-    let mut memo = RgbMemo::default();
     let oob = oob_entry();
     let water_entry = resolve_entry(WATER_DUMMY_NAME, None, Some(xc));
     let row = 512usize >> scale_bits;
@@ -970,193 +1119,261 @@ fn draw_chunk_xaero(
     let (Some(wp_buf), Some(wh_buf)) = (out.water_pixels.as_deref_mut(), out.water_heights.as_deref_mut()) else {
         return;
     };
+    // top-down sequence of present sections — filtered once per chunk
+    // instead of re-checking every Option slot per column.
+    let mut present = Vec::with_capacity(start + 1);
+    present.extend(indexed[..=start].iter().rev().flatten());
 
-    for cx in (0..16usize).step_by(scale as usize) {
-        'zloop: for cz in (0..16usize).step_by(scale as usize) {
-            let pixel_index = (z + (cz >> scale_bits)) * row + (x + (cx >> scale_bits));
-            // underair: "open space above" — in surface mode it stays true;
-            // in full-cave mode the ceiling keeps it false until the first
-            // air gap below it (Xaero's underair/shouldEnterGround).
-            let mut underair = true;
-            let mut entered = !full_cave;
-            let mut top_h = i32::MIN;
-            // merged overlay accumulator + the running composite — a new
-            // overlay type folds the current one into (sun, acc_tr, ov)
-            // before starting a fresh merge record.
-            let mut cur_ov: Option<MergeOverlay> = None;
-            let mut sun = 15i32;
-            let mut acc_tr = 1.0f32;
-            let mut ov_sum = [0f32; 3];
-            macro_rules! flush_ov {
-                () => {
-                    if let Some(o) = cur_ov.take() {
-                        let tr = o.alpha as f32 / 255.0;
-                        // daylight render: max(sun, light) = 15 -> brightness
-                        // is 1, so the overlay contributes rgb*tr*rem.
-                        let inten = tr * acc_tr;
-                        ov_sum[0] += (o.rgb >> 16 & 0xFF) as f32 * inten;
-                        ov_sum[1] += (o.rgb >> 8 & 0xFF) as f32 * inten;
-                        ov_sum[2] += (o.rgb & 0xFF) as f32 * inten;
-                        sun = (sun - o.opacity as i32).max(0);
-                        acc_tr *= 1.0 - tr;
-                    }
-                };
-            }
-            for slot in indexed[..=start].iter().rev().flatten() {
-                let s = slot.get();
-                if s.x_inert {
-                    continue;
-                }
-                let uniform = s.block.bits == 0;
-                let top_index = chunk::location_to_index(cx, s.start_height as usize, cz);
-                let mut cur = s.block.cursor(top_index, 256);
-                for cy in (0..=s.start_height).rev() {
-                    let e = if uniform {
-                        s.entries.first().unwrap_or(&oob)
-                    } else {
-                        let pi = cur.get() as usize;
-                        if cy > 0 {
-                            cur.prev();
+    with_memo(|memo| {
+        for cx in (0..16usize).step_by(scale as usize) {
+            'zloop: for cz in (0..16usize).step_by(scale as usize) {
+                let pixel_index = (z + (cz >> scale_bits)) * row + (x + (cx >> scale_bits));
+                // underair: "open space above" — in surface mode it stays
+                // true; in full-cave mode the ceiling keeps it false until
+                // the first air gap below it (Xaero's underair /
+                // shouldEnterGround).
+                let mut underair = true;
+                let mut entered = !full_cave;
+                let mut top_h = i32::MIN;
+                // merged overlay accumulator + the running composite — a new
+                // overlay type folds the current one into (sun, acc_tr, ov)
+                // before starting a fresh merge record.
+                let mut cur_ov: Option<MergeOverlay> = None;
+                let mut sun = 15i32;
+                let mut acc_tr = 1.0f32;
+                let mut ov_sum = [0f32; 3];
+                macro_rules! flush_ov {
+                    () => {
+                        if let Some(o) = cur_ov.take() {
+                            let tr = o.alpha as f32 / 255.0;
+                            // daylight render: max(sun, light) = 15 ->
+                            // brightness is 1, so the overlay contributes
+                            // rgb*tr*rem.
+                            let inten = tr * acc_tr;
+                            ov_sum[0] += (o.rgb >> 16 & 0xFF) as f32 * inten;
+                            ov_sum[1] += (o.rgb >> 8 & 0xFF) as f32 * inten;
+                            ov_sum[2] += (o.rgb & 0xFF) as f32 * inten;
+                            sun = (sun - o.opacity as i32).max(0);
+                            acc_tr *= 1.0 - tr;
                         }
-                        s.entries.get(pi).unwrap_or(&oob)
                     };
-                    if e.xflags & X_INVIS != 0 {
-                        if uniform {
-                            break;
-                        }
+                }
+                for slot in &present {
+                    let s = slot.get();
+                    if s.x_inert {
                         continue;
                     }
-                    if !entered {
-                        // first solid block closes the ceiling column;
-                        // air/overlay/waterlogged blocks pass through.
-                        if e.xflags & (X_AIR | X_OVERLAY) == 0 && e.flags & F_WATERLOGGED == 0 {
-                            entered = true;
-                            underair = false;
-                        }
-                        if uniform {
-                            break;
-                        }
-                        continue;
-                    }
-                    if e.xflags & X_AIR != 0 {
-                        underair = true;
-                        if uniform {
-                            break;
-                        }
-                        continue;
-                    }
-                    if !underair {
-                        if uniform {
-                            break;
-                        }
-                        continue;
-                    }
-                    let y_abs = s.section_height + cy;
-                    if e.xflags & X_OVERLAY != 0 {
-                        if top_h == i32::MIN {
-                            top_h = y_abs;
-                        }
-                        let key = e as *const PalEntry as usize;
-                        match cur_ov.as_mut() {
-                            Some(o) if o.entry == key => {
-                                o.opacity = o.opacity.saturating_add(e.xop).min(15);
+                    let uniform = s.block.bits == 0;
+                    let top_index =
+                        chunk::location_to_index(cx, s.start_height as usize, cz);
+                    let mut cur = col_cursor(s, top_index);
+                    for cy in (0..=s.start_height).rev() {
+                        let e = if uniform {
+                            s.entries.first().unwrap_or(&oob)
+                        } else {
+                            let pi = cur.get() as usize;
+                            if cy > 0 {
+                                cur.prev();
                             }
-                            _ => {
-                                flush_ov!();
-                                let mut rgb = entry_rgb(&mut memo, cm, e, || {
-                                    biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min)
-                                });
-                                if e.xflags & X_GLOW != 0 {
-                                    let sum = ((rgb >> 16 & 0xFF) + (rgb >> 8 & 0xFF) + (rgb & 0xFF)) as f32;
-                                    let b = (407.0 / sum).max(1.0);
-                                    let r = ((rgb >> 16 & 0xFF) as f32 * b).min(255.0) as u32;
-                                    let g = ((rgb >> 8 & 0xFF) as f32 * b).min(255.0) as u32;
-                                    let bl = ((rgb & 0xFF) as f32 * b).min(255.0) as u32;
-                                    rgb = r << 16 | g << 8 | bl;
+                            // entered columns pass straight through
+                            // air/invis runs — one mask test replaces the
+                            // palette-entry load + flag chain; air still
+                            // re-opens underair for the cave scan. Below a
+                            // sealed ceiling (entered && !underair) only
+                            // air changes state, so everything else also
+                            // skips on a single test.
+                            if entered {
+                                if !underair && (s.x_air >> (pi & 63)) & 1 == 0 {
+                                    continue;
                                 }
-                                cur_ov = Some(MergeOverlay {
-                                    entry: key,
-                                    rgb,
-                                    alpha: e.xalpha,
-                                    opacity: e.xop,
-                                });
+                                if (s.x_skip >> (pi & 63)) & 1 != 0 {
+                                    underair =
+                                        underair || (s.x_air >> (pi & 63)) & 1 != 0;
+                                    continue;
+                                }
+                            }
+                            s.entries.get(pi).unwrap_or(&oob)
+                        };
+                        if e.xflags & X_INVIS != 0 {
+                            if uniform {
+                                break;
+                            }
+                            continue;
+                        }
+                        if !entered {
+                            // first solid block closes the ceiling column;
+                            // air/overlay/waterlogged blocks pass through.
+                            if e.xflags & (X_AIR | X_OVERLAY) == 0
+                                && e.flags & F_WATERLOGGED == 0
+                            {
+                                entered = true;
+                                underair = false;
+                            }
+                            if uniform {
+                                break;
+                            }
+                            continue;
+                        }
+                        if e.xflags & X_AIR != 0 {
+                            underair = true;
+                            if uniform {
+                                break;
+                            }
+                            continue;
+                        }
+                        if !underair {
+                            if uniform {
+                                break;
+                            }
+                            continue;
+                        }
+                        let y_abs = s.section_height + cy;
+                        if e.xflags & X_OVERLAY != 0 {
+                            if top_h == i32::MIN {
+                                top_h = y_abs;
+                            }
+                            let key = e as *const PalEntry as usize;
+                            match cur_ov.as_mut() {
+                                Some(o) if o.entry == key => {
+                                    o.opacity = o.opacity.saturating_add(e.xop).min(15);
+                                }
+                                _ => {
+                                    flush_ov!();
+                                    let mut rgb = entry_rgb(memo, cm, e, || {
+                                        biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min)
+                                    });
+                                    if e.xflags & X_GLOW != 0 {
+                                        let sum = ((rgb >> 16 & 0xFF)
+                                            + (rgb >> 8 & 0xFF)
+                                            + (rgb & 0xFF)) as f32;
+                                        let b = (407.0 / sum).max(1.0);
+                                        let r = ((rgb >> 16 & 0xFF) as f32 * b).min(255.0) as u32;
+                                        let g = ((rgb >> 8 & 0xFF) as f32 * b).min(255.0) as u32;
+                                        let bl = ((rgb & 0xFF) as f32 * b).min(255.0) as u32;
+                                        rgb = r << 16 | g << 8 | bl;
+                                    }
+                                    cur_ov = Some(MergeOverlay {
+                                        entry: key,
+                                        rgb,
+                                        alpha: e.xalpha,
+                                        opacity: e.xop,
+                                    });
+                                }
+                            }
+                            if uniform {
+                                // every remaining level repeats this overlay
+                                if let Some(o) = cur_ov.as_mut() {
+                                    o.opacity =
+                                        o.opacity.saturating_add(e.xop * cy as u8).min(15);
+                                }
+                                break;
+                            }
+                            continue;
+                        }
+                        if e.flags & F_WATERLOGGED != 0 {
+                            // contained fluid renders as a water overlay
+                            // first (Xaero processes fluidState before the
+                            // block itself)
+                            if top_h == i32::MIN {
+                                top_h = y_abs;
+                            }
+                            let key = &water_entry as *const PalEntry as usize;
+                            match cur_ov.as_mut() {
+                                Some(o) if o.entry == key => {
+                                    o.opacity = o.opacity.saturating_add(1).min(15);
+                                }
+                                _ => {
+                                    flush_ov!();
+                                    cur_ov = Some(MergeOverlay {
+                                        entry: key,
+                                        rgb: entry_rgb(memo, cm, &water_entry, || {
+                                            biome_at(
+                                                s,
+                                                chunk_biomes,
+                                                modern,
+                                                format,
+                                                cx,
+                                                cy,
+                                                cz,
+                                                y_min,
+                                            )
+                                        }),
+                                        alpha: water_entry.xalpha,
+                                        opacity: 1,
+                                    });
+                                }
                             }
                         }
-                        if uniform {
-                            // every remaining level repeats this overlay
-                            if let Some(o) = cur_ov.as_mut() {
-                                o.opacity = o.opacity.saturating_add(e.xop * cy as u8).min(15);
-                            }
-                            break;
+                        // surface block — composite the accumulated overlays.
+                        let mut rgb = entry_rgb(memo, cm, e, || {
+                            biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min)
+                        });
+                        flush_ov!();
+                        let glowing = e.xflags & X_GLOW != 0;
+                        if glowing {
+                            let sum =
+                                ((rgb >> 16 & 0xFF) + (rgb >> 8 & 0xFF) + (rgb & 0xFF)) as f32;
+                            let b = (407.0 / sum).max(1.0);
+                            let r = ((rgb >> 16 & 0xFF) as f32 * b).min(255.0) as u32;
+                            let g = ((rgb >> 8 & 0xFF) as f32 * b).min(255.0) as u32;
+                            let bl = ((rgb & 0xFF) as f32 * b).min(255.0) as u32;
+                            rgb = r << 16 | g << 8 | bl;
                         }
-                        continue;
-                    }
-                    if e.flags & F_WATERLOGGED != 0 {
-                        // contained fluid renders as a water overlay first
-                        // (Xaero processes fluidState before the block itself)
+                        out.pixel_buffer[pixel_index] =
+                            (if glowing { 0xFE } else { 0xFF }) << 24 | (rgb & 0xFF_FFFF);
+                        out.terrain_heights[pixel_index] =
+                            (y_abs - if e.xflags & X_SHORT != 0 { 1 } else { 0 }) as i16;
                         if top_h == i32::MIN {
                             top_h = y_abs;
                         }
-                        let key = &water_entry as *const PalEntry as usize;
-                        match cur_ov.as_mut() {
-                            Some(o) if o.entry == key => {
-                                o.opacity = o.opacity.saturating_add(1).min(15);
-                            }
-                            _ => {
-                                flush_ov!();
-                                cur_ov = Some(MergeOverlay {
-                                    entry: key,
-                                    rgb: entry_rgb(&mut memo, cm, &water_entry, || {
-                                        biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min)
-                                    }),
-                                    alpha: water_entry.xalpha,
-                                    opacity: 1,
-                                });
-                            }
+                        if acc_tr < 1.0 {
+                            wp_buf[pixel_index] = ((acc_tr * 255.0) as u32) << 24
+                                | (ov_sum[0].min(255.0) as u32) << 16
+                                | (ov_sum[1].min(255.0) as u32) << 8
+                                | ov_sum[2].min(255.0) as u32;
+                            wh_buf[pixel_index] = ((top_h & 0xFFF) as i16)
+                                | (((sun.max(0) & 0xF) as i16) << 12);
                         }
+                        continue 'zloop;
                     }
-                    // surface block — composite the accumulated overlays.
-                    let mut rgb = entry_rgb(&mut memo, cm, e, || {
-                        biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min)
-                    });
-                    flush_ov!();
-                    let glowing = e.xflags & X_GLOW != 0;
-                    if glowing {
-                        let sum = ((rgb >> 16 & 0xFF) + (rgb >> 8 & 0xFF) + (rgb & 0xFF)) as f32;
-                        let b = (407.0 / sum).max(1.0);
-                        let r = ((rgb >> 16 & 0xFF) as f32 * b).min(255.0) as u32;
-                        let g = ((rgb >> 8 & 0xFF) as f32 * b).min(255.0) as u32;
-                        let bl = ((rgb & 0xFF) as f32 * b).min(255.0) as u32;
-                        rgb = r << 16 | g << 8 | bl;
-                    }
-                    out.pixel_buffer[pixel_index] =
-                        (if glowing { 0xFE } else { 0xFF }) << 24 | (rgb & 0xFF_FFFF);
-                    out.terrain_heights[pixel_index] =
-                        (y_abs - if e.xflags & X_SHORT != 0 { 1 } else { 0 }) as i16;
-                    if top_h == i32::MIN {
-                        top_h = y_abs;
-                    }
-                    if acc_tr < 1.0 {
-                        wp_buf[pixel_index] = ((acc_tr * 255.0) as u32) << 24
-                            | (ov_sum[0].min(255.0) as u32) << 16
-                            | (ov_sum[1].min(255.0) as u32) << 8
-                            | ov_sum[2].min(255.0) as u32;
-                        wh_buf[pixel_index] =
-                            ((top_h & 0xFFF) as i16) | (((sun.max(0) & 0xF) as i16) << 12);
-                    }
-                    continue 'zloop;
                 }
             }
         }
-    }
+    });
 }
-/// carries its state bitset, so (entry address, biome) -> rgb can be memoized
-/// instead of re-running get_state + the string-keyed color lookups.
-#[derive(Default)]
+
+/// (entry address, biome) -> rgb memo for the tinted path — carries the
+/// palette entry's state bitset, so hits skip get_state + the string-keyed
+/// color lookups. Direct-mapped (a slot collision just recomputes — the
+/// result is identical) and generation-stamped: entries are keyed on
+/// chunk-local pointers, so `begin` is bumped once per chunk scan and
+/// stale generations can never hit. Kept in TLS so the table is allocated
+/// once per worker thread, not per chunk.
+const MEMO_SLOTS: usize = 4096;
 struct RgbMemo {
-    map: std::collections::HashMap<(usize, usize), u32, std::hash::BuildHasherDefault<PtrHasher>>,
+    gen: u32,
+    tags: Box<[u32; MEMO_SLOTS]>,
+    keys: Box<[(usize, usize); MEMO_SLOTS]>,
+    vals: Box<[u32; MEMO_SLOTS]>,
 }
 impl RgbMemo {
+    fn new() -> Self {
+        RgbMemo {
+            gen: 0,
+            tags: Box::new([0; MEMO_SLOTS]),
+            keys: Box::new([(0, 0); MEMO_SLOTS]),
+            vals: Box::new([0; MEMO_SLOTS]),
+        }
+    }
+    /// start a new chunk scan: prior entries keyed chunk-local pointers.
+    #[inline]
+    fn begin(&mut self) {
+        self.gen = self.gen.wrapping_add(1);
+        if self.gen == 0 {
+            self.tags.fill(0);
+            self.gen = 1;
+        }
+    }
     #[inline]
     fn get(&mut self, cm: &ColorMap, e: &PalEntry<'_>, cv: &CellVal, bk: BiomeKey) -> u32 {
         let bk_key = match bk {
@@ -1164,13 +1381,35 @@ impl RgbMemo {
             BiomeKey::Idx(i) => (i as usize) << 40 | 1,
         };
         let key = (e as *const PalEntry<'_> as usize, bk_key);
-        if let Some(&c) = self.map.get(&key) {
-            return c;
+        // two multiplies fold both words; the high bits carry the entropy.
+        let h = (key.0 as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(23)
+            ^ (key.1 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        let i = (((h >> 32) ^ h) as usize) & (MEMO_SLOTS - 1);
+        if self.tags[i] == self.gen && self.keys[i] == key {
+            return self.vals[i];
         }
         let c = cm.get_rgb_state(e.name, cv.state.as_ref(), bk);
-        self.map.insert(key, c);
+        self.tags[i] = self.gen;
+        self.keys[i] = key;
+        self.vals[i] = c;
         c
     }
+}
+
+std::thread_local! {
+    static RGB_MEMO: std::cell::RefCell<RgbMemo> = std::cell::RefCell::new(RgbMemo::new());
+}
+
+/// run `f` with the worker thread's memo, bumped to a fresh generation.
+#[inline]
+fn with_memo<R>(f: impl FnOnce(&mut RgbMemo) -> R) -> R {
+    RGB_MEMO.with(|m| {
+        let mut g = m.borrow_mut();
+        g.begin();
+        f(&mut *g)
+    })
 }
 
 /// drawLayer — single Y layer.
@@ -1214,25 +1453,27 @@ pub fn draw_layer(
     };
     let cy = (abs_h & 0xF) as usize;
     let oob = oob_entry();
-    let mut memo = RgbMemo::default();
-    for cx in (0..16usize).step_by(scale as usize) {
-        for cz in (0..16usize).step_by(scale as usize) {
-            let index = chunk::location_to_index(cx, cy, cz);
-            let e = if s.block.bits == 0 {
-                s.entries.first().unwrap_or(&oob)
-            } else {
-                let pi = s.block.get(index) as usize;
-                s.entries.get(pi).unwrap_or(&oob)
-            };
-            if e.flags & F_TRANSPARENT != 0 {
-                continue;
+    with_memo(|memo| {
+        for cx in (0..16usize).step_by(scale as usize) {
+            for cz in (0..16usize).step_by(scale as usize) {
+                let index = chunk::location_to_index(cx, cy, cz);
+                let e = if s.block.bits == 0 {
+                    s.entries.first().unwrap_or(&oob)
+                } else {
+                    let pi = s.block.get(index) as usize;
+                    s.entries.get(pi).unwrap_or(&oob)
+                };
+                if e.flags & F_TRANSPARENT != 0 {
+                    continue;
+                }
+                let pixel_index =
+                    (z + (cz >> scale_bits)) * (512 >> scale_bits) + (x + (cx >> scale_bits));
+                let bk =
+                    || biome_at(&s, chunk_biomes, modern, format, cx, cy as i32, cz, y_min);
+                pixel_buffer[pixel_index] = entry_rgb(memo, cm, e, bk);
             }
-            let pixel_index =
-                (z + (cz >> scale_bits)) * (512 >> scale_bits) + (x + (cx >> scale_bits));
-            let bk = || biome_at(&s, chunk_biomes, modern, format, cx, cy as i32, cz, y_min);
-            pixel_buffer[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
         }
-    }
+    });
 }
 
 /// drawCaves — first opaque non-foliage block below the surface blocks.
@@ -1270,53 +1511,65 @@ pub fn draw_caves(
     };
     let start = ((abs_h >> 4).min(indexed.len() as i32 - 1)).max(0) as usize;
     let oob = oob_entry();
-    let mut memo = RgbMemo::default();
-    for cx in (0..16usize).step_by(scale as usize) {
-        'zloop: for cz in (0..16usize).step_by(scale as usize) {
-            let pixel_index =
-                (z + (cz >> scale_bits)) * (512 >> scale_bits) + (x + (cx >> scale_bits));
-            let mut ignored = 0;
-            let mut done_skipping = false;
-            // same flattened top-down order for every column, no Vec needed.
-            for slot in indexed[..=start].iter().rev().flatten() {
-                let s = slot.get();
-                if s.caves_inert {
-                    continue;
-                }
-                let uniform = s.block.bits == 0;
-                let top_index = chunk::location_to_index(cx, s.start_height as usize, cz);
-                let mut cur = s.block.cursor(top_index, 256);
-                for cy in (0..=s.start_height).rev() {
-                    let e = if uniform {
-                        s.entries.first().unwrap_or(&oob)
-                    } else {
-                        let pi = cur.get() as usize;
-                        if cy > 0 {
-                            cur.prev();
-                        }
-                        s.entries.get(pi).unwrap_or(&oob)
-                    };
-                    if e.flags & (F_TRANSPARENT | F_FOLIAGE) == 0 {
-                        if done_skipping {
-                            let bk =
-                                || biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min);
-                            pixel_buffer[pixel_index] = entry_rgb(&mut memo, cm, e, bk);
-                            terrain_heights[pixel_index] = (s.section_height + cy) as i16;
-                            continue 'zloop;
-                        }
-                        ignored += 1;
-                    } else if ignored > 0 {
-                        done_skipping = true;
+    // top-down sequence of present sections — filtered once per chunk.
+    let mut present = Vec::with_capacity(start + 1);
+    present.extend(indexed[..=start].iter().rev().flatten());
+    with_memo(|memo| {
+        for cx in (0..16usize).step_by(scale as usize) {
+            'zloop: for cz in (0..16usize).step_by(scale as usize) {
+                let pixel_index =
+                    (z + (cz >> scale_bits)) * (512 >> scale_bits) + (x + (cx >> scale_bits));
+                let mut ignored = 0;
+                let mut done_skipping = false;
+                for slot in &present {
+                    let s = slot.get();
+                    if s.caves_inert {
+                        continue;
                     }
-                    if uniform {
-                        // every row holds the same entry — repeated rows can
-                        // only repeat the first row's effect.
-                        break;
+                    let uniform = s.block.bits == 0;
+                    let top_index =
+                        chunk::location_to_index(cx, s.start_height as usize, cz);
+                    let mut cur = col_cursor(s, top_index);
+                    for cy in (0..=s.start_height).rev() {
+                        let e = if uniform {
+                            s.entries.first().unwrap_or(&oob)
+                        } else {
+                            let pi = cur.get() as usize;
+                            if cy > 0 {
+                                cur.prev();
+                            }
+                            // transparent/foliage runs skip on one mask
+                            // test — but only before the first solid block
+                            // (after it they flip done_skipping).
+                            if ignored == 0 && (s.caves_skip >> (pi & 63)) & 1 != 0 {
+                                continue;
+                            }
+                            s.entries.get(pi).unwrap_or(&oob)
+                        };
+                        if e.flags & (F_TRANSPARENT | F_FOLIAGE) == 0 {
+                            if done_skipping {
+                                let bk = || {
+                                    biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min)
+                                };
+                                pixel_buffer[pixel_index] = entry_rgb(memo, cm, e, bk);
+                                terrain_heights[pixel_index] =
+                                    (s.section_height + cy) as i16;
+                                continue 'zloop;
+                            }
+                            ignored += 1;
+                        } else if ignored > 0 {
+                            done_skipping = true;
+                        }
+                        if uniform {
+                            // every row holds the same entry — repeated rows
+                            // can only repeat the first row's effect.
+                            break;
+                        }
                     }
                 }
             }
         }
-    }
+    });
 }
 
 // --- legacy (15w32a, <= 1.12) ------------------------------------------------

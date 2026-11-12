@@ -545,6 +545,14 @@ impl McaFile {
             let nbt_data = decompress_into(compression, &payload, &mut scratch)?;
             let mut reader = SliceReader::new(nbt_data);
             reader.raw_arrays = raw;
+            // raw (render) loads don't need block_entities/tick schedules/
+            // upgrade_data materialized: keep them as raw spans — every
+            // Compound accessor resolves them on first touch, so all
+            // readers still see a complete tree. load(false) parses fully
+            // (mutation/write-back paths need owned tags up front).
+            if raw {
+                reader.lazy_keep = Some(crate::nbt::RENDER_LAZY_KEEP);
+            }
             Ok(reader.read()?)
         })?;
         let mut chunk = Chunk::new(loc);

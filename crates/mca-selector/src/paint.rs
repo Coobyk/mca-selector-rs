@@ -47,6 +47,10 @@ impl MainView {
             self.pan_accum = std::time::Duration::ZERO;
         }
 
+        // held-key pan runs before the update gate so a pan step and the
+        // tile requests for the regions it exposes land in the same frame.
+        self.held_key_pan(dt, window);
+
         // frame-paced tile dispatch: scroll/zoom/view changes arm update_now
         // per input event; running the O(visible-regions) update once here
         // coalesces bursts (scroll wheels can fire many events per frame).
@@ -54,8 +58,6 @@ impl MainView {
             self.map.update();
             self.update_now = false;
         }
-
-        self.held_key_pan(dt, window);
 
         let scale = self.map.scale;
         // read-guard instead of config::world(): world() clones the whole

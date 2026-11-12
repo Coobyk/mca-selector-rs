@@ -1,10 +1,10 @@
 //! Port of version.mapping: color configs (colors_*.json), block-state
 //! bitsets, biome tints and the shared color_properties.json.
 
-use crate::bitset::BitSet;
+use crate::bitset::{BitSet, FxMap, FxSet};
 use crate::nbt::{Compound, Tag};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 pub const TRANSPARENT: u8 = 0b0000_0001;
@@ -26,7 +26,7 @@ pub struct BlockColor {
 pub enum StateColors {
     Single(BlockColor),
     States {
-        states: HashMap<BitSet, BlockColor>,
+        states: FxMap<BitSet, BlockColor>,
         default: BlockColor,
     },
 }
@@ -54,7 +54,7 @@ impl StateColors {
 /// BlockStates: property name -> value -> bit index.
 #[derive(Debug)]
 pub struct BlockStates {
-    states: HashMap<String, HashMap<String, usize>>,
+    states: FxMap<String, FxMap<String, usize>>,
 }
 
 impl BlockStates {
@@ -79,11 +79,11 @@ pub type BiomeTints = [u32; 4];
 
 #[derive(Debug, Default)]
 pub struct BiomeColors {
-    pub biomes: HashMap<String, BiomeTints>,
+    pub biomes: FxMap<String, BiomeTints>,
 }
 
 /// tintCache: block -> biome -> StateColors
-pub type TintCache = HashMap<String, HashMap<String, StateColors>>;
+pub type TintCache = FxMap<String, FxMap<String, StateColors>>;
 
 /// Per-block render metadata emitted by tools/xaero_palette.py — the
 /// equivalents of Xaero's runtime texture/model/light queries.
@@ -134,9 +134,9 @@ impl XaeroMeta {
 
 pub struct ColorConfig {
     pub states: BlockStates,
-    pub colors: HashMap<String, StateColors>,
+    pub colors: FxMap<String, StateColors>,
     pub tint_cache: TintCache,
-    pub xaero_meta: HashMap<String, XaeroMeta>,
+    pub xaero_meta: FxMap<String, XaeroMeta>,
 }
 
 impl ColorConfig {
@@ -182,10 +182,10 @@ pub fn apply_tint(color: u32, tint: u32) -> u32 {
 
 #[derive(Deserialize)]
 struct RawColorConfig {
-    states: HashMap<String, HashMap<String, usize>>,
-    colors: HashMap<String, serde_json::Value>,
-    tints: Option<HashMap<String, Vec<String>>>,
-    xaero_meta: Option<HashMap<String, RawXaeroMeta>>,
+    states: FxMap<String, FxMap<String, usize>>,
+    colors: FxMap<String, serde_json::Value>,
+    tints: Option<FxMap<String, Vec<String>>>,
+    xaero_meta: Option<FxMap<String, RawXaeroMeta>>,
     #[serde(rename = "block_name_to_id")]
     _bnti: Option<serde_json::Value>,
 }
@@ -259,14 +259,14 @@ fn parse_block_color(v: &serde_json::Value) -> BlockColor {
 pub fn load_color_config(json: &str) -> ColorConfig {
     let raw: RawColorConfig = serde_json::from_str(json).expect("invalid color config json");
     let states = BlockStates { states: raw.states };
-    let mut colors: HashMap<String, StateColors> = HashMap::new();
+    let mut colors: FxMap<String, StateColors> = FxMap::default();
     for (name, v) in raw.colors {
         match &v {
             serde_json::Value::String(_) => {
                 colors.insert(name, StateColors::Single(parse_block_color(&v)));
             }
             serde_json::Value::Object(o) if o.contains_key("states") || o.contains_key("default") => {
-                let mut map = HashMap::new();
+                let mut map = FxMap::default();
                 if let Some(st) = o.get("states").and_then(|s| s.as_object()) {
                     for (k, cv) in st {
                         if let Some(bs) = BitSet::from_base64(k) {
@@ -309,8 +309,8 @@ pub fn load_color_config(json: &str) -> ColorConfig {
     }
 }
 
-fn create_tint_cache(colors: &HashMap<String, StateColors>, tints: &BiomeColors) -> TintCache {
-    let mut cache: TintCache = HashMap::new();
+fn create_tint_cache(colors: &FxMap<String, StateColors>, tints: &BiomeColors) -> TintCache {
+    let mut cache: TintCache = FxMap::default();
     for (name, sc) in colors {
         // tint the config's fallback entry as well: iter_entries only yields
         // the state-keyed colors, so without it a runtime state that matches
@@ -345,7 +345,7 @@ fn create_tint_cache(colors: &HashMap<String, StateColors>, tints: &BiomeColors)
                             let e = colored
                                 .entry(biome.clone())
                                 .or_insert_with(|| StateColors::States {
-                                    states: HashMap::new(),
+                                    states: FxMap::default(),
                                     default: BlockColor {
                                         color: apply_tint(cfg_default.color, bt[ti]),
                                         properties: 0,
@@ -366,20 +366,46 @@ fn create_tint_cache(colors: &HashMap<String, StateColors>, tints: &BiomeColors)
 /// color_properties.json — global (not versioned) block property sets.
 #[derive(Deserialize)]
 pub struct ColorProperties {
-    pub air: HashSet<String>,
-    pub transparent: HashSet<String>,
-    pub grass_tint: HashSet<String>,
-    pub foliage_tint: HashSet<String>,
-    pub dry_foliage_tint: HashSet<String>,
-    pub water: HashSet<String>,
-    pub foliage: HashSet<String>,
+    pub air: FxSet<String>,
+    pub transparent: FxSet<String>,
+    pub grass_tint: FxSet<String>,
+    pub foliage_tint: FxSet<String>,
+    pub dry_foliage_tint: FxSet<String>,
+    pub water: FxSet<String>,
+    pub foliage: FxSet<String>,
+    /// name -> aggregated flag byte, folded from the sets above by
+    /// color_properties() — the renderers' per-palette-entry resolution
+    /// becomes a single map probe. Bit positions match version.rs's F_*
+    /// (bit2 is F_WATERLOGGED, which is property-derived, not named) so
+    /// the byte ORs in directly; bit4 marks air names (version.rs X_AIR).
+    #[serde(skip)]
+    pub flags: FxMap<String, u8>,
 }
+
+// flag-byte bits stored in ColorProperties.flags
+pub const FLAG_TRANSPARENT: u8 = 0b0001;
+pub const FLAG_WATER: u8 = 0b0010;
+pub const FLAG_FOLIAGE: u8 = 0b1000;
+pub const FLAG_AIR: u8 = 0b1_0000;
 
 pub fn color_properties() -> &'static ColorProperties {
     static P: OnceLock<ColorProperties> = OnceLock::new();
     P.get_or_init(|| {
-        serde_json::from_str(include_str!("../resources/mapping/color_properties.json"))
-            .expect("color_properties.json")
+        let mut cp: ColorProperties =
+            serde_json::from_str(include_str!("../resources/mapping/color_properties.json"))
+                .expect("color_properties.json");
+        let mut flags = FxMap::default();
+        let mut add = |names: &FxSet<String>, bit: u8| {
+            for n in names {
+                *flags.entry(n.clone()).or_insert(0) |= bit;
+            }
+        };
+        add(&cp.transparent, FLAG_TRANSPARENT);
+        add(&cp.water, FLAG_WATER);
+        add(&cp.foliage, FLAG_FOLIAGE);
+        add(&cp.air, FLAG_AIR);
+        cp.flags = flags;
+        cp
     })
 }
 

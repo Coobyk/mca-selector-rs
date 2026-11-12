@@ -64,6 +64,11 @@ pub struct MainView {
     /// update pass instead of a queue-clear + O(visible) request storm per
     /// zoom-level crossing.
     pub(crate) zoom_settle: Option<std::time::Instant>,
+    /// render-settings debounce: (deadline, render_hash at the last
+    /// invalidation). Slider drags/scroll bursts extend the deadline per
+    /// change; on expiry poll_tick invalidates once if the settings moved —
+    /// see slider::set_render_height.
+    pub(crate) render_settle: Option<(std::time::Instant, i64)>,
 }
 
 impl MainView {
@@ -104,6 +109,7 @@ impl MainView {
             pan_shift: false,
             spin: 0,
             zoom_settle: None,
+            render_settle: None,
         };
         // upstream loads the persisted overlay config (OverlayConfig) globally;
         // restore serialized overlay lines saved by the overlay editor.
@@ -167,6 +173,11 @@ impl MainView {
                 self.zoom_settle = None;
                 self.request_update();
             }
+        }
+        // render-settings debounce: a slider drag/scroll burst flushed here
+        // costs one invalidate at the final height.
+        if matches!(self.render_settle, Some((d, _)) if std::time::Instant::now() >= d) {
+            self.settle_render_height();
         }
         if (self.update_needed || changed) && self.zoom_settle.is_none() {
             self.map.update();
@@ -470,12 +481,7 @@ impl Render for MainView {
                 }
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|v, _e: &MouseUpEvent, _w, _cx| {
-                if v.height_slider_drag {
-                    v.height_slider_drag = false;
-                    if let Some(ws) = config::world() {
-                        ws.cfg.save(&ws.cache_dir);
-                    }
-                }
+                v.finish_height_drag();
             }))
             .child(self.render_menu_bar(cx))
             .child(

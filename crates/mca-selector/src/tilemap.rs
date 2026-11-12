@@ -9,6 +9,7 @@ use mc_core::point::{Point2f, Point2i};
 use mc_core::render;
 use mc_core::selection::Selection;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
@@ -38,6 +39,16 @@ pub const ZOOM_LEVELS: [i32; 6] = [1, 2, 4, 8, 16, 32];
 /// after a spike far past a normal drain — a tick can legitimately see
 /// ~MAX_TILE_REQUESTS results, so that count is no spike bound.
 const MAX_PENDING_RESULTS: usize = 4 * MAX_TILE_REQUESTS;
+/// regions requested beyond the strictly-visible rect: a one-region ring
+/// means a <1-region pan finds the newly exposed tiles already rendered.
+/// Spiral order puts the ring at the tail of the priority range, so it only
+/// ever costs otherwise-idle workers.
+const PREFETCH_MARGIN: i32 = 1;
+/// give up re-rendering a region after this many worker-side failures —
+/// a corrupt/unreadable .mca otherwise re-enqueues a ~200ms load job every
+/// update tick forever, burning a pool worker for a tile that can never
+/// succeed. invalidate_region/obsolete resets the counter.
+const MAX_TILE_FAILURES: u8 = 3;
 
 pub fn get_zoom_level(scale: f32) -> i32 {
     let s = scale as i32;
@@ -65,6 +76,9 @@ pub struct Tile {
     pub render_image: Option<std::sync::Arc<gpui::RenderImage>>,
     /// gpu-ready 32x32 overlay image
     pub overlay_render_image: Option<std::sync::Arc<gpui::RenderImage>>,
+    /// consecutive worker-side render failures — bounds the retry loop for
+    /// regions whose .mca can never load (see MAX_TILE_FAILURES).
+    pub failures: u8,
 }
 
 impl Tile {
@@ -79,6 +93,7 @@ impl Tile {
             structures_checked: false,
             render_image: None,
             overlay_render_image: None,
+            failures: 0,
         }
     }
     pub fn image_zoom_level(&self) -> i32 {
@@ -93,7 +108,7 @@ const RENDER_CACHE_VERSION: i64 = 4;
 
 /// fingerprint of everything that changes a tile's pixels. keyed caches
 /// (disk PNGs, meta) are invalidated by comparing this.
-fn render_hash(cfg: &crate::config::WorldConfig, dim: mc_core::render::DimKind) -> i64 {
+pub(crate) fn render_hash(cfg: &crate::config::WorldConfig, dim: mc_core::render::DimKind) -> i64 {
     ((cfg.render_height.clamp(-64, 2047) + 64) as i64)
         | (dim as i64) << 15
         | (cfg.render_layer_only as i64) << 10
@@ -130,6 +145,13 @@ pub enum TileResult {
         image: Option<TileImage>,
         zoom: i32,
         structures: Option<HashMap<i64, Vec<String>>>,
+        /// render_hash the producing job was enqueued with — results carry
+        /// their own provenance so the UI can drop stale/orphaned images
+        /// even after `loading` was cleared and re-populated.
+        hash: i64,
+        /// the request sequence that produced this result — adopted only
+        /// while `loading` still tracks this exact request.
+        seq: u64,
     },
     /// a batch job rewrote this region on disk: drop the tile's pixels +
     /// in-flight flags so update() re-renders it.
@@ -197,9 +219,21 @@ pub struct TileMapState {
     /// both Arc-shared with tiles so adoptions are refcount bumps)
     pub pool: HashMap<i32, HashMap<i64, PooledImage>>,
     pub pool_order: HashMap<i32, Vec<i64>>, // keys currently in the pool, for trim
-    /// region -> render-settings hash at enqueue; results that land with a
-    /// stale hash are discarded so obsolete renders never resurface.
-    pub loading: HashMap<i64, i64>,
+    /// region -> request sequence of the tracked in-flight render; a
+    /// result only lands while it still IS the tracked request — orphaned
+    /// (loading cleared by invalidate/obsolete) and superseded results
+    /// (a newer request took the slot) are dropped on arrival.
+    pub loading: HashMap<i64, u64>,
+    /// monotonically increasing request id stamped into `loading` and
+    /// echoed back by TileResult::Image — pairs each result with exactly
+    /// the request that produced it.
+    req_seq: u64,
+    /// bumped whenever queued renders become obsolete (render-settings
+    /// change, world switch): workers compare before paying the ~200ms
+    /// .mca load, so an invalidation kills the stale backlog instantly
+    /// instead of letting it drain one render at a time ahead of the
+    /// fresh requests.
+    pub render_epoch: Arc<AtomicU64>,
     /// visible bounds `tile_priorities` was last built for — rebuilding the
     /// map is skipped while the viewport stays put
     prio_bounds: Option<(Point2i, Point2i)>,
@@ -262,6 +296,8 @@ impl TileMapState {
             pool: HashMap::new(),
             pool_order: HashMap::new(),
             loading: HashMap::new(),
+            req_seq: 0,
+            render_epoch: Arc::new(AtomicU64::new(0)),
             prio_bounds: None,
             pool_trim_defer: 0,
             pending_scratch: Vec::new(),
@@ -380,6 +416,16 @@ impl TileMapState {
         changed
     }
 
+    /// bump the render epoch + drop `loading`. Every queued/running render
+    /// job enqueued under the old epoch then either early-exits or sends a
+    /// result that poll_results discards — and clearing `loading` lets the
+    /// next update() re-enqueue every tile immediately instead of waiting
+    /// for doomed in-flight jobs to land first.
+    fn bump_render_epoch(&mut self) {
+        self.render_epoch.fetch_add(1, Ordering::Relaxed);
+        self.loading.clear();
+    }
+
     /// pools().clear_queues() plus the bookkeeping that assumes a result
     /// will arrive: dropped jobs never send one, so `loading`/
     /// `overlay_loading` would stay set forever (update() thinks the tile
@@ -387,7 +433,7 @@ impl TileMapState {
     /// enqueue — after a queue clear the icon fetch never re-runs).
     pub fn cancel_jobs(&mut self) {
         jobs::pools().clear_queues();
-        self.loading.clear();
+        self.bump_render_epoch();
         self.overlay_loading.clear();
         for t in self.tiles.values_mut() {
             t.structures_checked = false;
@@ -580,7 +626,18 @@ impl TileMapState {
         // at max zoom-out a huge screen can see >100k regions; loading all of
         // them exhausts file descriptors, the job queue and the GPU atlas.
         let zoom_level = get_zoom_level(self.scale);
-        let bounds = self.visible_region_bounds(Point2f::ZERO);
+        // one hash for the whole sweep — request_image used to recompute it
+        // (String alloc inside dim_kind) for every candidate region.
+        let hash = render_hash(&ws.cfg, ws.dim_kind());
+        // strictly-visible bounds expanded by PREFETCH_MARGIN: the ring
+        // around the viewport renders ahead of the pan, so sub-region pans
+        // expose tiles that are already done instead of starting a ~200ms
+        // render when they first appear.
+        let (vmin, vmax) = self.visible_region_bounds(Point2f::ZERO);
+        let bounds = (
+            Point2i::new(vmin.x - PREFETCH_MARGIN, vmin.z - PREFETCH_MARGIN),
+            Point2i::new(vmax.x + PREFETCH_MARGIN, vmax.z + PREFETCH_MARGIN),
+        );
         if self.prio_bounds != Some(bounds) {
             // viewport moved: rebuild priorities in spiral order (one pass).
             let visible = (bounds.1.x as i64 - bounds.0.x as i64 + 1)
@@ -601,7 +658,7 @@ impl TileMapState {
         // already current. Steady-state ticks are now alloc-free here.
         // Render-job specs are collected and dispatched by one worker job so
         // the Job/path/closure construction per region leaves the UI thread.
-        let mut renders: Vec<(Point2i, i32, i64)> = Vec::new();
+        let mut renders: Vec<(Point2i, i32, i64, u64)> = Vec::new();
         Self::for_regions_spiral(bounds.0, bounds.1, MAX_TILE_REQUESTS, |region| {
             let key = region.as_long();
             // get_mut before insert: visible tiles almost always already
@@ -618,9 +675,12 @@ impl TileMapState {
                     // a ~1MB CPU rescale and an atlas upload per tile per zoom
                     // boundary. Only an image too coarse for the current zoom
                     // (img_zoom > zoom_level) still needs a finer render; it
-                    // stays on screen until that lands.
-                    let request = !tile.loaded
-                        || (tile.image.is_some() && tile.image_zoom_level() > zoom_level);
+                    // stays on screen until that lands. A region whose mca
+                    // load keeps failing stops being re-requested after
+                    // MAX_TILE_FAILURES attempts (reset on invalidate).
+                    let request = tile.failures < MAX_TILE_FAILURES
+                        && (!tile.loaded
+                            || (tile.image.is_some() && tile.image_zoom_level() > zoom_level));
                     (request, need_overlay)
                 }
                 None => {
@@ -629,7 +689,7 @@ impl TileMapState {
                 }
             };
             if request {
-                self.request_image(&ws, region, zoom_level, &mut renders);
+                self.request_image(&ws, region, zoom_level, hash, &mut renders);
             } else {
                 // ready tile: kick off the one-shot worker-side structures
                 // read unless it already ran for this image.
@@ -648,7 +708,7 @@ impl TileMapState {
     /// on a pool worker: the per-region Job::new, path joins and ws field
     /// clones happen off the UI thread. `loading` entries were inserted at
     /// collect time so a follow-up update() can't double-request.
-    fn dispatch_renders(&mut self, ws: &crate::config::WorldState, specs: Vec<(Point2i, i32, i64)>) {
+    fn dispatch_renders(&mut self, ws: &crate::config::WorldState, specs: Vec<(Point2i, i32, i64, u64)>) {
         let tx = self.result_tx.clone();
         let uuid = ws.uuid.clone();
         let cache_dir = ws.cache_dir.clone();
@@ -666,15 +726,18 @@ impl TileMapState {
         };
         let hash = render_hash(&ws.cfg, ws.dim_kind());
         let corrupted = CORRUPTED.with(|c| *c.borrow());
+        let epoch = self.render_epoch.clone();
+        let enq_epoch = epoch.load(Ordering::Relaxed);
         jobs::pools().add_process(Job::new(
             jobs::PRIORITY_MEDIUM,
             Option::<Box<dyn Fn() -> i64 + Send>>::None,
             move || {
-                for (region, zoom_level, priority) in specs {
+                for (region, zoom_level, priority, seq) in specs {
                     let tx = tx.clone();
                     let uuid = uuid.clone();
                     let cache_dir = cache_dir.clone();
                     let region_dir = region_dir.clone();
+                    let epoch = epoch.clone();
                     jobs::pools().add_process(Job::new(
                         jobs::PRIORITY_LOW,
                         Some(Box::new(move || priority)),
@@ -691,6 +754,9 @@ impl TileMapState {
                                 lod_color,
                                 hash,
                                 corrupted,
+                                epoch,
+                                enq_epoch,
+                                seq,
                             });
                         },
                     ));
@@ -853,10 +919,16 @@ impl TileMapState {
         self.overlay_loading.clear();
     }
 
+    /// next request sequence for `loading`/result pairing (UI thread only).
+    fn next_seq(&mut self) -> u64 {
+        self.req_seq += 1;
+        self.req_seq
+    }
+
     /// ImagePool.requestImage. On a full miss the job isn't built here —
-    /// a (region, zoom_level, priority) spec is pushed onto `renders` and
-    /// dispatch_renders constructs + enqueues the Jobs on a pool worker.
-    fn request_image(&mut self, ws: &crate::config::WorldState, region: Point2i, zoom_level: i32, renders: &mut Vec<(Point2i, i32, i64)>) {
+    /// a (region, zoom_level, priority, seq) spec is pushed onto `renders`
+    /// and dispatch_renders constructs + enqueues the Jobs on a pool worker.
+    fn request_image(&mut self, ws: &crate::config::WorldState, region: Point2i, zoom_level: i32, hash: i64, renders: &mut Vec<(Point2i, i32, i64, u64)>) {
         let key = region.as_long();
         if !self.regions.contains(&key) {
             if let Some(t) = self.tiles.get_mut(&key) {
@@ -870,8 +942,6 @@ impl TileMapState {
         if self.loading.len() >= MAX_IN_FLIGHT_LOADS {
             return;
         }
-        let hash = render_hash(&ws.cfg, ws.dim_kind());
-
         if let Some(p) = self.pool.get(&zoom_level).and_then(|m| m.get(&key)) {
             // exact pool hit: pixels + gpu image are already Arc'd — adopt
             // with refcount bumps, no per-tile BGRA repack on the UI thread.
@@ -896,7 +966,8 @@ impl TileMapState {
                     // scaled pixels inherit the source render's settings —
                     // and the landing pushes the pool entry once).
                     let argb = p.argb.clone();
-                    self.loading.insert(key, hash);
+                    let seq = self.next_seq();
+                    self.loading.insert(key, seq);
                     let tx = self.result_tx.clone();
                     let uuid = ws.uuid.clone();
                     let priority = self.tile_priority(region);
@@ -916,6 +987,8 @@ impl TileMapState {
                                 }),
                                 zoom: zoom_level,
                                 structures: cache::get_structures(&uuid, region),
+                                hash,
+                                seq,
                             });
                         },
                     ));
@@ -948,9 +1021,10 @@ impl TileMapState {
         // deletes, png decode, nbt render and cache writes are all file IO +
         // CPU work that must not stall the UI thread — and neither does the
         // Job construction itself, which the dispatcher now batches.
-        self.loading.insert(key, hash);
+        let seq = self.next_seq();
+        self.loading.insert(key, seq);
         let priority = self.tile_priority(region);
-        renders.push((region, zoom_level, priority));
+        renders.push((region, zoom_level, priority, seq));
     }
 
     /// structures-cache lookup for a ready tile: one-shot worker job (was a
@@ -1062,6 +1136,7 @@ impl TileMapState {
                 t.structures = None;
             }
             t.structures_checked = false;
+            t.failures = 0;
         }
         if disk {
             if let Some(ws) = crate::config::world() {
@@ -1085,10 +1160,12 @@ impl TileMapState {
             t.overlay_render_image = None;
             t.structures = None;
             t.structures_checked = false;
+            t.failures = 0;
         }
         self.pool.clear();
         self.pool_order.clear();
         self.overlay_loading.clear();
+        self.bump_render_epoch();
     }
 
     /// Drain async tile results (call every UI tick).
@@ -1106,6 +1183,8 @@ impl TileMapState {
         // world lookup hoisted: it takes a lock + clones strings, and used to
         // run 2-3x per drained result.
         let ws = crate::config::world();
+        // same for the current-settings hash — dim_kind() allocates per call.
+        let cur_hash = ws.as_ref().map(|w| render_hash(&w.cfg, w.dim_kind()));
         for res in pending.drain(..) {
             changed = true;
             match res {
@@ -1114,27 +1193,37 @@ impl TileMapState {
                     image,
                     zoom,
                     structures,
+                    hash,
+                    seq,
                 } => {
                     let key = region.as_long();
-                    let enq = self.loading.remove(&key);
+                    // adopt only the currently tracked request: `loading`
+                    // cleared by an invalidate/obsolete means this result is
+                    // an orphan (its pixels predate a forced re-render), and
+                    // a different seq means a newer request owns the slot —
+                    // consuming it here would leave the newer job untracked.
+                    if self.loading.get(&key).copied() != Some(seq) {
+                        continue;
+                    }
+                    self.loading.remove(&key);
                     // a result rendered (or a cached png loaded) under old
                     // render settings must not land — keep it unloaded so the
                     // next update re-renders under current settings.
-                    if let (Some(h), Some(ws)) = (enq, &ws) {
-                        if h != render_hash(&ws.cfg, ws.dim_kind()) {
-                            if let Some(t) = self.tiles.get_mut(&key) {
-                                t.loaded = false;
-                            }
-                            continue;
+                    if cur_hash != Some(hash) {
+                        if let Some(t) = self.tiles.get_mut(&key) {
+                            t.loaded = false;
                         }
+                        continue;
                     }
                     let Some(ti) = image else {
                         // worker-side render failure: leave the tile unloaded
-                        // so update() re-requests. This arm used to set
-                        // loaded=true because it doubled as the batch-op
-                        // invalidation signal (now TileResult::Invalidate).
+                        // so update() re-requests (bounded by
+                        // MAX_TILE_FAILURES). This arm used to set loaded=true
+                        // because it doubled as the batch-op invalidation
+                        // signal (now TileResult::Invalidate).
                         if let Some(t) = self.tiles.get_mut(&key) {
                             t.loaded = false;
+                            t.failures = t.failures.saturating_add(1);
                         }
                         continue;
                     };
@@ -1224,6 +1313,7 @@ impl TileMapState {
                         t.overlay_data = None;
                         t.overlay_loaded = false;
                         t.overlay_render_image = None;
+                        t.failures = 0;
                     }
                 }
                 TileResult::JobInfo(msg) => {
@@ -1254,7 +1344,12 @@ impl TileMapState {
                     }
                 }
                 TileResult::Overlay { region, image, data } => {
-                    self.overlay_loading.remove(&region.as_long());
+                    // orphaned result (overlay switched/cleared while the
+                    // job was in flight): applying it would re-arm
+                    // overlay_loaded with data for the wrong overlay.
+                    if !self.overlay_loading.remove(&region.as_long()) {
+                        continue;
+                    }
                     if let Some(t) = self.tiles.get_mut(&region.as_long()) {
                         if let Some(img) = image {
                             if self.overlay.is_some() {
@@ -1335,6 +1430,13 @@ struct ProbeArgs {
     lod_color: u32,
     hash: i64,
     corrupted: [u32; 256],
+    /// shared render epoch + the value at enqueue: a mismatch means the
+    /// render settings (or world) changed since this job was queued and its
+    /// result would be discarded anyway — skip the ~200ms mca load entirely.
+    epoch: Arc<AtomicU64>,
+    enq_epoch: u64,
+    /// request sequence echoed back in TileResult::Image.
+    seq: u64,
 }
 
 /// decode a cached png (+ downscale to target zoom) and build the gpu image
@@ -1365,6 +1467,13 @@ fn decode_png_scaled(
 /// mca render itself, and all cache writes. Sends at most one Image result
 /// (plus an optional Presence placeholder for far zoom).
 fn worker_probe_and_render(a: ProbeArgs) {
+    // superseded while queued: the tile map re-requested under new settings
+    // and cleared `loading`, so this job owes no result. Bailing before the
+    // file probe + mca load is what makes a settings change actually cheap —
+    // the stale backlog evaporates instead of draining at ~200ms per tile.
+    if a.epoch.load(Ordering::Relaxed) != a.enq_epoch {
+        return;
+    }
     let region = a.region;
     let key_path = a.region_dir.join(files::mca_file_name(region));
     let mt = std::fs::metadata(&key_path)
@@ -1402,6 +1511,8 @@ fn worker_probe_and_render(a: ProbeArgs) {
                     }),
                     zoom: (TILE_SIZE / size) as i32,
                     structures: cache::get_structures(&a.uuid, region),
+                    hash: a.hash,
+                    seq: a.seq,
                 });
                 return;
             }
@@ -1417,6 +1528,8 @@ fn worker_probe_and_render(a: ProbeArgs) {
                         }),
                         zoom: a.zoom_level,
                         structures: cache::get_structures(&a.uuid, region),
+                        hash: a.hash,
+                        seq: a.seq,
                     });
                     return;
                 }
@@ -1437,6 +1550,8 @@ fn worker_probe_and_render(a: ProbeArgs) {
                             }),
                             zoom: a.zoom_level,
                             structures: cache::get_structures(&a.uuid, region),
+                            hash: a.hash,
+                            seq: a.seq,
                         });
                         return;
                     }
@@ -1462,6 +1577,8 @@ fn worker_probe_and_render(a: ProbeArgs) {
                         image: img,
                         zoom: zl,
                         structures: cache::get_structures(&a.uuid, region),
+                        hash: a.hash,
+                        seq: a.seq,
                     });
                     break;
                 }
@@ -1484,6 +1601,8 @@ fn worker_probe_and_render(a: ProbeArgs) {
             image: None,
             zoom: a.zoom_level,
             structures: None,
+            hash: a.hash,
+            seq: a.seq,
         });
     };
     let mut m = match McaFile::new(key_path.clone()) {
@@ -1523,5 +1642,7 @@ fn worker_probe_and_render(a: ProbeArgs) {
         }),
         zoom: a.zoom_level,
         structures: Some(structures),
+        hash: a.hash,
+        seq: a.seq,
     });
 }
