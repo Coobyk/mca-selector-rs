@@ -5,7 +5,7 @@
 use crate::tilemap::CHUNK_GRID_SCALE;
 use crate::view::MainView;
 use gpui::*;
-use mc_core::point::{Point2f, Point2i};
+use mc_core::point::Point2f;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Drag {
@@ -75,6 +75,7 @@ impl MainView {
         }
         eprintln!("[mca] canvas mousedown {:?} -> map interaction", event.button);
         self.focus.focus(window);
+        self.map.mark_prev = None;
         let pos = self.map.canvas_pos(f32::from(event.position.x), f32::from(event.position.y));
         let meta = event.modifiers.platform;
         match event.button {
@@ -193,76 +194,9 @@ impl MainView {
             if let Some(mark) = self.drag.mark() {
                 // upstream: paintMode = SHIFT held (other keys ignored)
                 let paint_mode = event.modifiers.shift;
-                // mark() only touches regions in the drag rect — hash their
-                // effective selection before/after and repaint only when the
-                // painted overlay would differ (selected_chunks alone can't
-                // see no-op drags over already-marked territory, or the rare
-                // Some(full-set) -> whole-region color swap).
-                let (a, b) = if self.map.scale > CHUNK_GRID_SCALE {
-                    let mouse = self.map.mouse_region(pos.x, pos.z);
-                    let first = if paint_mode {
-                        mouse
-                    } else {
-                        self.map.mouse_region(self.first.x, self.first.z)
-                    };
-                    (mouse, first)
-                } else {
-                    let mouse = self.map.mouse_chunk(pos.x, pos.z).chunk_to_region();
-                    let first = if paint_mode {
-                        mouse
-                    } else {
-                        self.map.mouse_chunk(self.first.x, self.first.z).chunk_to_region()
-                    };
-                    (mouse, first)
-                };
-                let (rx0, rx1) = (a.x.min(b.x), a.x.max(b.x));
-                let (rz0, rz1) = (a.z.min(b.z), a.z.max(b.z));
-                let rect_area = (rx1 - rx0 + 1) as i64 * (rz1 - rz0 + 1) as i64;
-                if rect_area > 64 {
-                    // hashing every affected region costs more than the
-                    // repaint it would save — mark() on a rect this big is
-                    // already the dominant cost.
-                    self.map.mark(pos.x, pos.z, mark, self.first, paint_mode);
+                if self.map.mark(pos.x, pos.z, mark, self.first, paint_mode) {
                     self.map.selection_version += 1;
                     dirty = true;
-                } else {
-                    // FNV-1a over what the selection overlay paints per region:
-                    // region_selected flag + effective chunk bitmask.
-                    let sel_hash = |sel: &mc_core::selection::Selection| -> u64 {
-                        let mut h = 0xcbf29ce484222325u64;
-                        for x in rx0..=rx1 {
-                            for z in rz0..=rz1 {
-                                let p = Point2i::new(x, z);
-                                let l = p.as_long();
-                                h = (h ^ l as u64).wrapping_mul(0x100000001b3);
-                                h = (h ^ sel.is_region_selected(l) as u64).wrapping_mul(0x100000001b3);
-                                match sel.selected_chunks(p) {
-                                    None => h = (h ^ 0xff).wrapping_mul(0x100000001b3),
-                                    Some(None) => h = (h ^ 0xaa).wrapping_mul(0x100000001b3),
-                                    Some(Some(cs)) => {
-                                        for i in cs.iter() {
-                                            h = (h ^ i as u64).wrapping_mul(0x100000001b3);
-                                        }
-                                        h = (h ^ 0xbb).wrapping_mul(0x100000001b3);
-                                    }
-                                }
-                            }
-                        }
-                        h
-                    };
-                    let sel_state = (
-                        sel_hash(&self.map.selection),
-                        self.map.selected_chunks,
-                        self.map.unsaved_selection,
-                    );
-                    self.map.mark(pos.x, pos.z, mark, self.first, paint_mode);
-                    self.map.selection_version += 1;
-                    dirty |= sel_state
-                        != (
-                            sel_hash(&self.map.selection),
-                            self.map.selected_chunks,
-                            self.map.unsaved_selection,
-                        );
                 }
             }
         }
@@ -278,6 +212,7 @@ impl MainView {
             p.first_mouse = None;
         }
         self.drag = Drag::None;
+        self.map.mark_prev = None;
         self.request_update();
         cx.notify();
     }

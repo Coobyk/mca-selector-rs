@@ -1,8 +1,8 @@
 //! Port of selection.ChunkSet + selection.Selection.
 
+use crate::bitset::FxMap as HashMap;
 use crate::point::Point2i;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// 1024-bit set of chunk indexes inside a region.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -154,6 +154,7 @@ impl MainView {
         if let Some(sel) = self.map.filter_result.take() {
             let n = sel.count();
             self.map.selection = sel;
+            self.map.mark_prev = None;
             self.map.selected_chunks = n as i64;
             self.map.unsaved_selection = true;
             self.map.selection_version += 1;

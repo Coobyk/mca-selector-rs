@@ -88,6 +88,7 @@ impl MainView {
                         match mc_core::selection::Selection::read_csv(&p) {
                             Ok(sel) => {
                                 v.map.selection.merge(&sel);
+                                v.map.mark_prev = None;
                                 v.map.selected_chunks = v.map.selection.count() as i64;
                                 v.map.unsaved_selection = true;
                                 v.map.selection_version += 1;

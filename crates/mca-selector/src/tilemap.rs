@@ -207,6 +207,12 @@ pub struct TileMapState {
     pub unsaved_selection: bool,
     /// bumped by every selection mutation; overlay caches key on it.
     pub selection_version: u64,
+    /// rect the previous mark() of the current drag covered — lets a drag
+    /// touch only cells newly entering its rect instead of reprocessing the
+    /// whole area every mousemove. Cleared on mouse down/up and by every
+    /// wholesale selection mutation (mark ops are idempotent, so a stale
+    /// entry would wrongly skip cells whose state changed underneath).
+    pub mark_prev: Option<MarkDelta>,
     pub show_chunk_grid: bool,
     pub show_region_grid: bool,
     pub show_coordinates: bool,
@@ -281,6 +287,7 @@ impl TileMapState {
             selected_chunks: 0,
             unsaved_selection: false,
             selection_version: 0,
+            mark_prev: None,
             show_chunk_grid: g.show_chunk_grid,
             show_region_grid: g.show_region_grid,
             show_coordinates: g.show_coordinates,
@@ -442,57 +449,130 @@ impl TileMapState {
 
     // -- marking (selection) ---------------------------------------------------
 
-    pub fn mark(&mut self, mouse_x: f32, mouse_y: f32, mark: bool, first: Point2f, paint_mode: bool) {
-        let mut first = first;
-        if paint_mode {
-            first = Point2f::new(mouse_x, mouse_y);
-        }
-        let selected_before = self.selected_chunks;
-        if self.scale > CHUNK_GRID_SCALE {
-            let mut mouse_region = self.mouse_region(mouse_x, mouse_y);
-            let mut first_region = if paint_mode {
-                mouse_region
-            } else {
-                self.mouse_region(first.x, first.z)
-            };
-            sort_points(&mut first_region, &mut mouse_region);
-            for x in first_region.x..=mouse_region.x {
-                for z in first_region.z..=mouse_region.z {
-                    let region = Point2i::new(x, z);
-                    if mark {
-                        let diff = self.selection.add_region(region.as_long()) as i64;
-                        self.selected_chunks += if self.selection.is_inverted() { -diff } else { diff };
-                    } else {
-                        let diff = self.selection.remove_region(region.as_long()) as i64;
-                        self.selected_chunks += if self.selection.is_inverted() { diff } else { -diff };
-                    }
-                }
-            }
+    /// returns whether the selection actually changed — callers can skip
+    /// repaints and cache invalidation for mousemoves that only re-cover
+    /// already-marked cells.
+    pub fn mark(&mut self, mouse_x: f32, mouse_y: f32, mark: bool, first: Point2f, paint_mode: bool) -> bool {
+        let first = if paint_mode {
+            Point2f::new(mouse_x, mouse_y)
         } else {
-            let mut mouse_chunk = self.mouse_chunk(mouse_x, mouse_y);
-            let mut first_chunk = if paint_mode {
-                mouse_chunk
-            } else {
-                self.mouse_chunk(first.x, first.z)
-            };
-            sort_points(&mut first_chunk, &mut mouse_chunk);
-            for x in first_chunk.x..=mouse_chunk.x {
-                for z in first_chunk.z..=mouse_chunk.z {
-                    let chunk = Point2i::new(x, z);
-                    if mark {
-                        if !self.selection.is_chunk_selected(chunk) {
-                            self.selection.add_chunk(chunk);
-                            self.selected_chunks += if self.selection.is_inverted() { -1 } else { 1 };
+            first
+        };
+        let selected_before = self.selected_chunks;
+        // region coords zoomed out, chunk coords zoomed in (the grid's
+        // CHUNK_GRID_SCALE split).
+        let chunk_space = self.scale <= CHUNK_GRID_SCALE;
+        let (mut lo, mut hi) = if chunk_space {
+            (
+                self.mouse_chunk(first.x, first.z),
+                self.mouse_chunk(mouse_x, mouse_y),
+            )
+        } else {
+            (
+                self.mouse_region(first.x, first.z),
+                self.mouse_region(mouse_x, mouse_y),
+            )
+        };
+        sort_points(&mut lo, &mut hi);
+        let new_rect = (lo.x, lo.z, hi.x, hi.z);
+        // a drag re-marks its whole rect every mousemove, but every cell op
+        // is idempotent — cells an earlier move already covered are no-ops —
+        // so only cells newly entering the rect need work. The rect minus
+        // the previous rect decomposes into at most 4 bands.
+        let prev = self.mark_prev.filter(|p| {
+            p.chunk_space == chunk_space
+                && p.mark == mark
+                && p.inverted == self.selection.inverted
+                && p.first == first
+        });
+        self.mark_prev = Some(MarkDelta {
+            chunk_space,
+            mark,
+            inverted: self.selection.inverted,
+            first,
+            rect: new_rect,
+        });
+        let mut bands = [(0, 0, -1, -1); 4];
+        let mut nb = 0usize;
+        match prev {
+            Some(o) => {
+                let (ox0, oz0, ox1, oz1) = o.rect;
+                let ix0 = lo.x.max(ox0);
+                let iz0 = lo.z.max(oz0);
+                let ix1 = hi.x.min(ox1);
+                let iz1 = hi.z.min(oz1);
+                if ix0 > ix1 || iz0 > iz1 {
+                    bands[0] = new_rect;
+                    nb = 1;
+                } else {
+                    if iz0 > lo.z {
+                        bands[nb] = (lo.x, lo.z, hi.x, iz0 - 1);
+                        nb += 1;
+                    }
+                    if iz1 < hi.z {
+                        bands[nb] = (lo.x, iz1 + 1, hi.x, hi.z);
+                        nb += 1;
+                    }
+                    if ix0 > lo.x {
+                        bands[nb] = (lo.x, iz0, ix0 - 1, iz1);
+                        nb += 1;
+                    }
+                    if ix1 < hi.x {
+                        bands[nb] = (ix1 + 1, iz0, hi.x, iz1);
+                        nb += 1;
+                    }
+                }
+            }
+            None => {
+                bands[0] = new_rect;
+                nb = 1;
+            }
+        }
+        let mut changed = false;
+        for &(x0, z0, x1, z1) in &bands[..nb] {
+            if chunk_space {
+                for x in x0..=x1 {
+                    for z in z0..=z1 {
+                        let chunk = Point2i::new(x, z);
+                        if mark {
+                            if !self.selection.is_chunk_selected(chunk) {
+                                self.selection.add_chunk(chunk);
+                                self.selected_chunks +=
+                                    if self.selection.is_inverted() { -1 } else { 1 };
+                                changed = true;
+                            }
+                        } else if self.selection.is_chunk_selected(chunk) {
+                            self.selection.remove_chunk(chunk);
+                            self.selected_chunks +=
+                                if self.selection.is_inverted() { 1 } else { -1 };
+                            changed = true;
                         }
-                    } else if self.selection.is_chunk_selected(chunk) {
-                        self.selection.remove_chunk(chunk);
-                        self.selected_chunks += if self.selection.is_inverted() { 1 } else { -1 };
+                    }
+                }
+            } else {
+                for x in x0..=x1 {
+                    for z in z0..=z1 {
+                        let region = Point2i::new(x, z).as_long();
+                        let diff = if mark {
+                            self.selection.add_region(region) as i64
+                        } else {
+                            self.selection.remove_region(region) as i64
+                        };
+                        changed |= diff != 0;
+                        self.selected_chunks += if self.selection.is_inverted() {
+                            -diff
+                        } else {
+                            diff
+                        } * if mark { 1 } else { -1 };
                     }
                 }
             }
         }
-        self.unsaved_selection = !self.selection.is_empty()
+        let unsaved = !self.selection.is_empty()
             || (selected_before == self.selected_chunks && self.unsaved_selection);
+        changed |= unsaved != self.unsaved_selection;
+        self.unsaved_selection = unsaved;
+        changed
     }
 
     pub fn mouse_block(&self, x: f32, z: f32) -> Point2i {
@@ -557,16 +637,19 @@ impl TileMapState {
         self.selected_chunks = 0;
         self.unsaved_selection = false;
         self.selection_version += 1;
+        self.mark_prev = None;
     }
 
     pub fn invert_selection(&mut self) {
         self.selection.inverted = !self.selection.inverted;
         self.selection_version += 1;
+        self.mark_prev = None;
     }
 
     pub fn invert_regions_with_selection(&mut self) {
         self.selection.invert_all();
         self.selection_version += 1;
+        self.mark_prev = None;
         self.selected_chunks = self.selection.count() as i64;
         self.unsaved_selection = true;
     }
@@ -1368,6 +1451,20 @@ impl TileMapState {
     }
 }
 
+/// the last mark() application of an ongoing drag — see
+/// TileMapState::mark_prev.
+#[derive(Clone, Copy)]
+pub struct MarkDelta {
+    /// chunk coords zoomed in, region coords zoomed out — the space
+    /// mark() iterated in.
+    chunk_space: bool,
+    mark: bool,
+    inverted: bool,
+    first: Point2f,
+    /// sorted (x0, z0, x1, z1) in mark-space.
+    rect: (i32, i32, i32, i32),
+}
+
 fn sort_points(a: &mut Point2i, b: &mut Point2i) {
     let aa = *a;
     a.x = a.x.min(b.x);
@@ -1686,4 +1783,152 @@ fn worker_probe_and_render(a: ProbeArgs) {
         hash: a.hash,
         seq: a.seq,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// identical selection state on both arms?
+    fn sel_eq(a: &TileMapState, b: &TileMapState) -> bool {
+        a.selection.inverted == b.selection.inverted
+            && a.selected_chunks == b.selected_chunks
+            && a.unsaved_selection == b.unsaved_selection
+            && a.selection.selection == b.selection.selection
+    }
+
+    /// run a drag (same `first`, `mark`, `paint_mode` — a drag can't change
+    /// those mid-flight) over a sequence of mouse positions. `delta=false`
+    /// clears mark_prev before every call, reproducing the pre-delta
+    /// whole-rect sweep exactly.
+    fn drag(
+        scale: f32,
+        inverted: bool,
+        seed: &dyn Fn(&mut TileMapState),
+        first: Point2i,
+        steps: &[Point2i],
+        mark: bool,
+        paint: bool,
+        delta: bool,
+    ) -> TileMapState {
+        let mut m = TileMapState::new();
+        m.scale = scale;
+        m.selection.inverted = inverted;
+        seed(&mut m);
+        m.selected_chunks = m.selection.count() as i64;
+        let px = |p: Point2i| -> Point2f {
+            if scale <= CHUNK_GRID_SCALE {
+                // scale 1: px == blocks; chunk c covers px c*16..c*16+15
+                Point2f::new(p.x as f32 * 16.0 + 8.0, p.z as f32 * 16.0 + 8.0)
+            } else {
+                // scale 16: px*16 == blocks; region r covers px r*32..r*32+31
+                Point2f::new(p.x as f32 * 32.0 + 16.0, p.z as f32 * 32.0 + 16.0)
+            }
+        };
+        let f = px(first);
+        for &s in steps {
+            if !delta {
+                m.mark_prev = None;
+            }
+            let p = px(s);
+            m.mark(p.x, p.z, mark, f, paint);
+        }
+        m
+    }
+
+    #[test]
+    fn mark_delta_matches_full_sweep() {
+        // grow, shrink, reverse past the anchor, jump
+        let seq: &[Point2i] = &[
+            Point2i::new(0, 0),
+            Point2i::new(3, 0),
+            Point2i::new(3, 4),
+            Point2i::new(-1, 4),
+            Point2i::new(-1, -2),
+            Point2i::new(5, -2),
+            Point2i::new(2, 2),
+            Point2i::new(2, 2),
+            Point2i::new(-4, 6),
+        ];
+        // seed: partial chunk selection in one region the drag crosses,
+        // a fully-selected region, and chunks inside it
+        let seed = |m: &mut TileMapState| {
+            let base = Point2i::new(1, 0).region_to_chunk();
+            for i in 0..5 {
+                m.selection.add_chunk(base.add(i, i));
+            }
+            m.selection.add_region(Point2i::new(2, 1).as_long());
+            let b2 = Point2i::new(-1, -1).region_to_chunk();
+            m.selection.add_chunk(b2.add(3, 3));
+            m.selection.add_chunk(b2.add(4, 3));
+        };
+        for &(scale, inverted, mark, paint) in &[
+            (16.0, false, true, false),
+            (16.0, false, false, false),
+            (16.0, true, true, false),
+            (16.0, true, false, false),
+            (16.0, false, true, true),
+            (1.0, false, true, false),
+            (1.0, false, false, false),
+            (1.0, true, true, false),
+            (1.0, true, false, false),
+            (1.0, false, true, true),
+        ] {
+            let first = seq[0];
+            let a = drag(scale, inverted, &seed, first, seq, mark, paint, true);
+            let b = drag(scale, inverted, &seed, first, seq, mark, paint, false);
+            assert!(
+                sel_eq(&a, &b),
+                "delta diverged: scale={scale} inverted={inverted} mark={mark} paint={paint} \
+                 counts {} vs {}",
+                a.selected_chunks, b.selected_chunks
+            );
+        }
+    }
+
+    /// a second drag re-covering the same rect after the selection was
+    /// cleared underneath must re-mark everything — no stale delta.
+    #[test]
+    fn mark_delta_reset_on_clear() {
+        let px = |p: Point2i| Point2f::new(p.x as f32 * 32.0 + 16.0, p.z as f32 * 32.0 + 16.0);
+        let mut m = TileMapState::new();
+        m.scale = 16.0;
+        let f = px(Point2i::new(0, 0));
+        let e = px(Point2i::new(4, 4));
+        m.mark(e.x, e.z, true, f, false);
+        assert_eq!(m.selected_chunks, 25 * 1024);
+        m.clear_selection();
+        // mouse down/up clear mark_prev — same rect re-marks fully
+        m.mark_prev = None;
+        m.mark(e.x, e.z, true, f, false);
+        assert_eq!(m.selected_chunks, 25 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn mark_bench() {
+        // 40x40 region rect, 60 mousemove steps growing the rect
+        let px = |p: Point2i| Point2f::new(p.x as f32 * 32.0 + 16.0, p.z as f32 * 32.0 + 16.0);
+        let mut steps = Vec::new();
+        for i in 0..=60i32 {
+            steps.push(Point2i::new(i * 40 / 60, i * 40 / 60));
+        }
+        for &delta in &[false, true] {
+            let t0 = Instant::now();
+            let mut m = TileMapState::new();
+            m.scale = 16.0;
+            let f = px(Point2i::new(0, 0));
+            for &s in &steps {
+                if !delta { m.mark_prev = None; }
+                let p = px(s);
+                m.mark(p.x, p.z, true, f, false);
+            }
+            eprintln!("[bench] delta={delta}: {:?} ({} regions)", t0.elapsed(), m.selection.selection.len());
+        }
+    }
 }
