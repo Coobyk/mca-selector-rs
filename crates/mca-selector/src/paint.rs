@@ -11,6 +11,13 @@ use mc_core::point::{Point2f, Point2i};
 use mc_core::selection::ChunkSet;
 use std::sync::Arc;
 
+/// color constants and config colors follow upstream's AARRGGBB convention;
+/// gpui's rgba() reads RRGGBBAA, which would leave the alpha byte zero.
+fn argb(hex: u32) -> Rgba {
+    let [a, r, g, b] = hex.to_be_bytes().map(|b| (b as f32) / 255.0);
+    Rgba { r, g, b, a }
+}
+
 /// cache key for shaped coordinate labels: edge labels hold a single axis
 /// value, grid labels an (x, z) block-coord pair. Shaped lines are
 /// position-independent, so one entry serves every frame.
@@ -61,7 +68,7 @@ impl MainView {
         // opaque and covers the same bounds, so the black clear is only
         // needed when the empty-tile fill is off.
         if show_empty {
-            window.paint_quad(fill(bounds, rgba(EMPTY_COLOR)));
+            window.paint_quad(fill(bounds, argb(EMPTY_COLOR)));
         } else {
             window.paint_quad(fill(bounds, rgba(0x000000ff)));
         }
@@ -171,10 +178,10 @@ impl MainView {
                         let key = Point2i::new(rx, rz).as_long();
                         if !map.tiles.contains_key(&key) {
                             if sel.is_inverted() {
-                                window.paint_quad(fill(b, rgba(region_color)));
+                                window.paint_quad(fill(b, argb(region_color)));
                             }
                         } else if sel.is_region_selected(key) {
-                            window.paint_quad(fill(b, rgba(region_color)));
+                            window.paint_quad(fill(b, argb(region_color)));
                         } else if sel.is_any_chunk_in_region_selected(key) {
                             if let Some(ov) =
                                 marked_chunks_image(Point2i::new(rx, rz), sel, map.selection_version)
@@ -278,7 +285,7 @@ impl MainView {
                     style: FontStyle::Normal,
                     fallbacks: None,
                 },
-                color: rgba(COORDINATES_COLOR).into(),
+                color: argb(COORDINATES_COLOR).into(),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
@@ -424,7 +431,7 @@ impl MainView {
                     if sx >= px(0.) && sx <= bounds.size.width {
                         window.paint_quad(fill(
                             Bounds { origin: point(sx + bounds.origin.x, bounds.origin.y), size: size(px(GRID_LINE_WIDTH), bounds.size.height) },
-                            rgba(CHUNK_GRID_COLOR),
+                            argb(CHUNK_GRID_COLOR),
                         ));
                     }
                 }
@@ -435,7 +442,7 @@ impl MainView {
                     if sz >= px(0.) && sz <= bounds.size.height {
                         window.paint_quad(fill(
                             Bounds { origin: point(bounds.origin.x, sz + bounds.origin.y), size: size(bounds.size.width, px(GRID_LINE_WIDTH)) },
-                            rgba(CHUNK_GRID_COLOR),
+                            argb(CHUNK_GRID_COLOR),
                         ));
                     }
                 }
@@ -447,7 +454,7 @@ impl MainView {
                 if sx >= px(0.) && sx <= bounds.size.width {
                     window.paint_quad(fill(
                         Bounds { origin: point(sx + bounds.origin.x, bounds.origin.y), size: size(px(GRID_LINE_WIDTH), bounds.size.height) },
-                        rgba(REGION_GRID_COLOR),
+                        argb(REGION_GRID_COLOR),
                     ));
                 }
             }
@@ -456,7 +463,7 @@ impl MainView {
                 if sz >= px(0.) && sz <= bounds.size.height {
                     window.paint_quad(fill(
                         Bounds { origin: point(bounds.origin.x, sz + bounds.origin.y), size: size(bounds.size.width, px(GRID_LINE_WIDTH)) },
-                        rgba(REGION_GRID_COLOR),
+                        argb(REGION_GRID_COLOR),
                     ));
                 }
             }
