@@ -1228,12 +1228,14 @@ fn draw_chunk_xaero(
                 macro_rules! flush_ov {
                     () => {
                         if let Some(o) = cur_ov.take() {
-                            // water coverage follows the column depth —
-                            // upstream ratio = 0.5 - 0.5/40 * depth scaled
-                            // up: the floor keeps ~59% of the mix at the
-                            // surface and coverage completes at depth 48.
+                            // water coverage follows column depth as an
+                            // exponential: shallow keeps a clear water tint
+                            // (floor ~46%) and the share decays toward a
+                            // permanent ~15% — deep water never goes fully
+                            // opaque, so the seabed always faintly shows.
                             let tr = if o.water {
-                                (0.4 + o.depth as f32 / 80.0).min(1.0)
+                                (0.85 - 0.33 * (-(o.depth as f32) / 12.0).exp())
+                                    .min(1.0)
                             } else {
                                 o.alpha as f32 / 255.0
                             };
@@ -1244,7 +1246,11 @@ fn draw_chunk_xaero(
                             ov_sum[0] += (o.rgb >> 16 & 0xFF) as f32 * inten;
                             ov_sum[1] += (o.rgb >> 8 & 0xFF) as f32 * inten;
                             ov_sum[2] += (o.rgb & 0xFF) as f32 * inten;
-                            sun = (sun - o.opacity as i32).max(0);
+                            // submerged terrain keeps a little skylight so
+                            // deep water shading doesn't go black — floor
+                            // the sun loss at 5 for water columns.
+                            sun = (sun - o.opacity as i32)
+                                .max(if o.water { sun.min(5) } else { 0 });
                             acc_tr *= 1.0 - tr;
                         }
                     };
