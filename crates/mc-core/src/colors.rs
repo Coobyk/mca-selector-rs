@@ -100,6 +100,10 @@ pub struct XaeroMeta {
     /// translucent render layer -> the block stacks as an overlay, never
     /// a surface (water, ice, stained glass, ...).
     pub overlay: bool,
+    /// fluid overlay tinted as water — coverage scales with column depth
+    /// instead of the fixed texture alpha (water, bubble_column, and any
+    /// contained fluid).
+    pub water: bool,
     /// Xaero renders nothing for this block (torches, small plants, glass,
     /// decorations with no map color).
     pub invis: bool,
@@ -196,6 +200,7 @@ struct RawXaeroMeta {
     op: Option<u8>,
     glow: Option<bool>,
     ov: Option<serde_json::Value>,
+    tint: Option<String>,
     invis: Option<bool>,
     short: Option<bool>,
     short_layers: Option<u8>,
@@ -219,7 +224,9 @@ impl From<RawXaeroMeta> for XaeroMeta {
             alpha: r.a.unwrap_or(255),
             opacity: r.op.unwrap_or(0),
             glow: r.glow.unwrap_or(false),
-            overlay: r.ov.map(|v| !v.is_null()).unwrap_or(false),
+            overlay: r.ov.as_ref().map(|v| !v.is_null()).unwrap_or(false),
+            water: r.ov.as_ref().and_then(|v| v.as_str()) == Some("f")
+                && r.tint.as_deref() == Some("water"),
             invis: r.invis.unwrap_or(false),
             short: r.short.unwrap_or(false),
             short_if: r

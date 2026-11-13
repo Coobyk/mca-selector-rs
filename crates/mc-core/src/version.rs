@@ -254,6 +254,7 @@ const X_OVERLAY: u8 = 0b0010;
 const X_GLOW: u8 = 0b0100;
 const X_SHORT: u8 = 0b1000;
 const X_AIR: u8 = 0b1_0000;
+const X_WATER: u8 = 0b10_0000;
 
 struct PalEntry<'a> {
     name: &'a str,
@@ -312,6 +313,9 @@ fn resolve_entry<'a>(
             }
             if m.overlay {
                 xflags |= X_OVERLAY;
+            }
+            if m.water {
+                xflags |= X_WATER;
             }
             if m.glow {
                 xflags |= X_GLOW;
@@ -1074,6 +1078,12 @@ struct MergeOverlay {
     rgb: u32,
     alpha: u8,
     opacity: u8,
+    /// merged column depth — drives the water coverage curve
+    /// (upstream: ratio = 0.5 - 0.5/40 * depth).
+    depth: u16,
+    /// water-family fluid (water/bubble/contained fluid): the whole
+    /// column merges into one overlay whose coverage scales with depth.
+    water: bool,
 }
 
 /// Xaero's MapWriter.loadPixel: translucent blocks (water/ice/stained
@@ -1148,7 +1158,15 @@ fn draw_chunk_xaero(
                 macro_rules! flush_ov {
                     () => {
                         if let Some(o) = cur_ov.take() {
-                            let tr = o.alpha as f32 / 255.0;
+                            // water coverage follows the column depth —
+                            // upstream ratio = 0.5 - 0.5/40 * depth leaves
+                            // the floor share at ~0.49 for a single level
+                            // and reaches full coverage at depth 40.
+                            let tr = if o.water {
+                                (0.5 + o.depth as f32 / 80.0).min(1.0)
+                            } else {
+                                o.alpha as f32 / 255.0
+                            };
                             // daylight render: max(sun, light) = 15 ->
                             // brightness is 1, so the overlay contributes
                             // rgb*tr*rem.
@@ -1235,10 +1253,19 @@ fn draw_chunk_xaero(
                             if top_h == i32::MIN {
                                 top_h = y_abs;
                             }
-                            let key = e as *const PalEntry as usize;
+                            let water_ov = e.xflags & X_WATER != 0;
+                            // water variants merge into the shared fluid
+                            // overlay — depth must cover the whole column
+                            // for the coverage curve to see it.
+                            let key = if water_ov {
+                                &water_entry as *const PalEntry as usize
+                            } else {
+                                e as *const PalEntry as usize
+                            };
                             match cur_ov.as_mut() {
                                 Some(o) if o.entry == key => {
                                     o.opacity = o.opacity.saturating_add(e.xop).min(15);
+                                    o.depth = o.depth.saturating_add(1);
                                 }
                                 _ => {
                                     flush_ov!();
@@ -1260,6 +1287,8 @@ fn draw_chunk_xaero(
                                         rgb,
                                         alpha: e.xalpha,
                                         opacity: e.xop,
+                                        depth: 1,
+                                        water: water_ov,
                                     });
                                 }
                             }
@@ -1268,6 +1297,7 @@ fn draw_chunk_xaero(
                                 if let Some(o) = cur_ov.as_mut() {
                                     o.opacity =
                                         o.opacity.saturating_add(e.xop * cy as u8).min(15);
+                                    o.depth = o.depth.saturating_add(cy as u16);
                                 }
                                 break;
                             }
@@ -1284,6 +1314,7 @@ fn draw_chunk_xaero(
                             match cur_ov.as_mut() {
                                 Some(o) if o.entry == key => {
                                     o.opacity = o.opacity.saturating_add(1).min(15);
+                                    o.depth = o.depth.saturating_add(1);
                                 }
                                 _ => {
                                     flush_ov!();
@@ -1303,6 +1334,8 @@ fn draw_chunk_xaero(
                                         }),
                                         alpha: water_entry.xalpha,
                                         opacity: 1,
+                                        depth: 1,
+                                        water: true,
                                     });
                                 }
                             }
