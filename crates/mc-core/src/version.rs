@@ -600,6 +600,76 @@ fn entry_rgb<'a>(
     }
 }
 
+/// tinted rgb bilinearly blended across the 4 surrounding 4x4x4 biome
+/// cells — vanilla's BiomeColors smoothing: cell centers sit at +1.5
+/// inside each cell, so block positions blend toward the neighboring
+/// cell instead of switching tint at the cell boundary (the 4x4-block
+/// tint grid otherwise visible in tinted water/grass).
+/// `cy` is the block's y within the section — blending is horizontal
+/// only; the block's own y cell is used for every corner sample.
+#[allow(clippy::too_many_arguments)]
+fn entry_rgb_blended<'a>(
+    memo: &mut RgbMemo,
+    cm: &ColorMap,
+    e: &PalEntry<'_>,
+    s: &IndexedSection<'a>,
+    chunk_biomes: Option<&[u8]>,
+    modern: bool,
+    format: ChunkFormat,
+    cx: usize,
+    cy: i32,
+    cz: usize,
+    y_min: i32,
+) -> u32 {
+    let cv = e.cell.get_or_init(|| resolve_color(cm, e.name, e.props));
+    if !cv.tinted {
+        return cv.rgb;
+    }
+    let mut cell = |qx: usize, qz: usize| {
+        memo.get(cm, e, cv, biome_at(
+            s,
+            chunk_biomes,
+            modern,
+            format,
+            (qx << 2).min(15),
+            cy,
+            (qz << 2).min(15),
+            y_min,
+        ))
+    };
+    let (qx, qz) = (cx >> 2, cz >> 2);
+    let (fx, fz) = ((cx & 3) as f32, (cz & 3) as f32);
+    // weight of the neighboring cell toward the nearer boundary
+    let (nx, wx) = if fx < 1.5 {
+        (qx.saturating_sub(1), (1.5 - fx) / 4.0)
+    } else {
+        ((qx + 1).min(3), (fx - 1.5) / 4.0)
+    };
+    let (nz, wz) = if fz < 1.5 {
+        (qz.saturating_sub(1), (1.5 - fz) / 4.0)
+    } else {
+        ((qz + 1).min(3), (fz - 1.5) / 4.0)
+    };
+    let c00 = cell(qx, qz);
+    if wx == 0.0 && wz == 0.0 {
+        return c00;
+    }
+    let c10 = cell(nx, qz);
+    let c01 = cell(qx, nz);
+    let c11 = cell(nx, nz);
+    let ch = |c: u32, w: f32, r: &mut f32, g: &mut f32, b: &mut f32| {
+        *r += (c >> 16 & 0xFF) as f32 * w;
+        *g += (c >> 8 & 0xFF) as f32 * w;
+        *b += (c & 0xFF) as f32 * w;
+    };
+    let (mut r, mut g, mut b) = (0f32, 0f32, 0f32);
+    ch(c00, (1.0 - wx) * (1.0 - wz), &mut r, &mut g, &mut b);
+    ch(c10, wx * (1.0 - wz), &mut r, &mut g, &mut b);
+    ch(c01, (1.0 - wx) * wz, &mut r, &mut g, &mut b);
+    ch(c11, wx * wz, &mut r, &mut g, &mut b);
+    0xFF00_0000 | (r as u32) << 16 | (g as u32) << 8 | b as u32
+}
+
 fn biome_id_to_name(id: i32) -> &'static str {
     static M: std::sync::OnceLock<std::collections::HashMap<i32, &'static str>> =
         std::sync::OnceLock::new();
@@ -1159,11 +1229,11 @@ fn draw_chunk_xaero(
                     () => {
                         if let Some(o) = cur_ov.take() {
                             // water coverage follows the column depth —
-                            // upstream ratio = 0.5 - 0.5/40 * depth leaves
-                            // the floor share at ~0.49 for a single level
-                            // and reaches full coverage at depth 40.
+                            // upstream ratio = 0.5 - 0.5/40 * depth scaled
+                            // up: the floor keeps ~59% of the mix at the
+                            // surface and coverage completes at depth 48.
                             let tr = if o.water {
-                                (0.5 + o.depth as f32 / 80.0).min(1.0)
+                                (0.4 + o.depth as f32 / 80.0).min(1.0)
                             } else {
                                 o.alpha as f32 / 255.0
                             };
@@ -1269,9 +1339,10 @@ fn draw_chunk_xaero(
                                 }
                                 _ => {
                                     flush_ov!();
-                                    let mut rgb = entry_rgb(memo, cm, e, || {
-                                        biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min)
-                                    });
+                                    let mut rgb = entry_rgb_blended(
+                                        memo, cm, e, s, chunk_biomes, modern,
+                                        format, cx, cy, cz, y_min,
+                                    );
                                     if e.xflags & X_GLOW != 0 {
                                         let sum = ((rgb >> 16 & 0xFF)
                                             + (rgb >> 8 & 0xFF)
@@ -1320,18 +1391,11 @@ fn draw_chunk_xaero(
                                     flush_ov!();
                                     cur_ov = Some(MergeOverlay {
                                         entry: key,
-                                        rgb: entry_rgb(memo, cm, &water_entry, || {
-                                            biome_at(
-                                                s,
-                                                chunk_biomes,
-                                                modern,
-                                                format,
-                                                cx,
-                                                cy,
-                                                cz,
-                                                y_min,
-                                            )
-                                        }),
+                                        rgb: entry_rgb_blended(
+                                            memo, cm, &water_entry, s,
+                                            chunk_biomes, modern, format,
+                                            cx, cy, cz, y_min,
+                                        ),
                                         alpha: water_entry.xalpha,
                                         opacity: 1,
                                         depth: 1,
@@ -1341,9 +1405,10 @@ fn draw_chunk_xaero(
                             }
                         }
                         // surface block — composite the accumulated overlays.
-                        let mut rgb = entry_rgb(memo, cm, e, || {
-                            biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min)
-                        });
+                        let mut rgb = entry_rgb_blended(
+                            memo, cm, e, s, chunk_biomes, modern, format,
+                            cx, cy, cz, y_min,
+                        );
                         flush_ov!();
                         let glowing = e.xflags & X_GLOW != 0;
                         if glowing {
