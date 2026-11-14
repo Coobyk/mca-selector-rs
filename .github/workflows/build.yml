@@ -142,9 +142,17 @@ jobs:
         run: |
           git config --global user.name "mca-selector-rs-ci"
           git config --global user.email "mail@coobyk.com"
+          retry_ssh() {
+            for i in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "attempt $i failed, retrying in $((i * 20))s"
+              sleep $((i * 20))
+            done
+            return 1
+          }
           publish() {
             pkg="$1"; srcdir="$2"
-            git clone "ssh://aur@aur.archlinux.org/${pkg}.git" "/tmp/aur-${pkg}"
+            retry_ssh git clone "ssh://aur@aur.archlinux.org/${pkg}.git" "/tmp/aur-${pkg}"
             cp "${srcdir}/PKGBUILD" "${srcdir}/.SRCINFO" "/tmp/aur-${pkg}/"
             cd "/tmp/aur-${pkg}"
             git add PKGBUILD .SRCINFO
@@ -152,7 +160,7 @@ jobs:
               echo "$pkg already up to date"
             else
               git commit -m "Update to ${GITHUB_SHA:0:7}"
-              git push
+              retry_ssh git push
             fi
             cd "$GITHUB_WORKSPACE"
           }
