@@ -1,0 +1,86 @@
+# Deutsch
+menu.file=Datei
+menu.view=Ansicht
+menu.selection=Auswahl
+menu.tools=Werkzeuge
+menu.about=Über
+
+menu.file.open_world=Welt öffnen
+menu.file.open_dimension=Dimension öffnen
+menu.file.open_recent=Zuletzt geöffnete Welt
+menu.file.settings=Einstellungen
+menu.file.render_settings=Render-Einstellungen
+menu.file.quit=Beenden
+
+menu.view.reload=Neu laden
+menu.view.chunk_grid=Chunk-Raster
+menu.view.region_grid=Regionen-Raster
+menu.view.coordinates=Koordinaten
+menu.view.coord_style=Koordinatenstil
+menu.view.coord_dynamic=DYNAMISCH
+menu.view.coord_edge=KANTE
+menu.view.coord_grid=RASTER
+menu.view.structures=Bauwerke
+menu.view.select_structures=Bauwerke auswählen
+menu.view.goto=Gehe zu
+menu.view.find_structure=Bauwerk finden
+menu.view.reset_zoom=Zoom zurücksetzen
+menu.view.save_screenshot=Screenshot speichern
+menu.view.clear_cache=Cache leeren
+menu.view.clear_all_cache=Gesamten Cache leeren
+
+menu.selection.clear=Leeren
+menu.selection.invert=Invertieren
+menu.selection.invert_regions=Markierte Regionen invertieren
+menu.selection.copy_chunks=Chunks kopieren
+menu.selection.paste_chunks=Chunks einfügen
+menu.selection.defragment=Markierte Regionen defragmentieren
+menu.selection.export_chunks=Markierte Chunks exportieren
+menu.selection.delete_chunks=Markierte Chunks löschen
+menu.selection.import_selection=Auswahl aus .csv importieren
+menu.selection.export_selection=Auswahl als .csv exportieren
+menu.selection.export_image=Als Bild exportieren
+menu.selection.clear_cache=Cache leeren
+
+menu.tools.restore_backup=Letztes Backup wiederherstellen
+menu.tools.import_chunks=Chunks importieren
+menu.tools.filter_chunks=Chunks filtern
+menu.tools.change_fields=Felder ändern
+menu.tools.relight=Chunks neu beleuchten
+menu.tools.edit_chunk=Chunk bearbeiten
+menu.tools.swap_chunks=Chunks tauschen
+menu.tools.edit_overlays=Overlays bearbeiten
+menu.tools.next_overlay=Nächstes Overlay
+menu.tools.next_overlay_type=Nächster Overlay-Typ
+menu.tools.sum_selection=Auswahl summieren
+
+menu.about.about=Über MCA Selector
+
+dialog.ok=OK
+dialog.cancel=Abbrechen
+dialog.close=Schließen
+dialog.save=Speichern
+dialog.yes=Ja
+dialog.no=Nein
+dialog.copy=Kopieren
+dialog.go_to=Gehe zu
+dialog.import=Importieren
+dialog.add_overlay=Overlay hinzufügen
+
+dialog.title.settings=Einstellungen
+dialog.title.render_settings=Render-Einstellungen
+dialog.title.goto=Gehe zu
+dialog.title.find_structure=Bauwerk finden
+dialog.title.import_chunks=Chunks importieren
+dialog.title.filter_chunks=Chunks filtern
+dialog.title.change_fields=NBT ändern
+dialog.title.error=Fehler
+dialog.title.about=Über MCA Selector
+dialog.title.select_dimension=Dimension auswählen
+dialog.title.are_you_sure=Sind Sie sicher?
+dialog.title.edit_overlays=Overlays bearbeiten
+dialog.title.progress=Arbeite…
+
+status.no_world=keine Welt geladen — Datei > Welt öffnen
+
+settings.language=Sprache

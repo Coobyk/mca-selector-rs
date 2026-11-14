@@ -1,0 +1,86 @@
+# 日本語
+menu.file=ファイル
+menu.view=表示
+menu.selection=選択
+menu.tools=ツール
+menu.about=情報
+
+menu.file.open_world=ワールドを開く
+menu.file.open_dimension=ディメンションを開く
+menu.file.open_recent=最近開いたワールド
+menu.file.settings=設定
+menu.file.render_settings=レンダリング設定
+menu.file.quit=終了
+
+menu.view.reload=再読み込み
+menu.view.chunk_grid=チャンクグリッド
+menu.view.region_grid=リージョングリッド
+menu.view.coordinates=座標
+menu.view.coord_style=座標スタイル
+menu.view.coord_dynamic=動的
+menu.view.coord_edge=エッジ
+menu.view.coord_grid=グリッド
+menu.view.structures=構造物
+menu.view.select_structures=構造物を選択
+menu.view.goto=移動
+menu.view.find_structure=構造物を検索
+menu.view.reset_zoom=ズームをリセット
+menu.view.save_screenshot=スクリーンショットを保存
+menu.view.clear_cache=キャッシュをクリア
+menu.view.clear_all_cache=すべてのキャッシュをクリア
+
+menu.selection.clear=クリア
+menu.selection.invert=反転
+menu.selection.invert_regions=選択リージョンを反転
+menu.selection.copy_chunks=チャンクをコピー
+menu.selection.paste_chunks=チャンクを貼り付け
+menu.selection.defragment=選択リージョンをデフラグ
+menu.selection.export_chunks=選択チャンクをエクスポート
+menu.selection.delete_chunks=選択チャンクを削除
+menu.selection.import_selection=選択を .csv からインポート
+menu.selection.export_selection=選択を .csv としてエクスポート
+menu.selection.export_image=画像としてエクスポート
+menu.selection.clear_cache=キャッシュをクリア
+
+menu.tools.restore_backup=最後のバックアップを復元
+menu.tools.import_chunks=チャンクをインポート
+menu.tools.filter_chunks=チャンクをフィルター
+menu.tools.change_fields=フィールドを変更
+menu.tools.relight=チャンクを再照明
+menu.tools.edit_chunk=チャンクを編集
+menu.tools.swap_chunks=チャンクを入れ替え
+menu.tools.edit_overlays=オーバーレイを編集
+menu.tools.next_overlay=次のオーバーレイ
+menu.tools.next_overlay_type=次のオーバーレイタイプ
+menu.tools.sum_selection=選択を集計
+
+menu.about.about=MCA Selector について
+
+dialog.ok=OK
+dialog.cancel=キャンセル
+dialog.close=閉じる
+dialog.save=保存
+dialog.yes=はい
+dialog.no=いいえ
+dialog.copy=コピー
+dialog.go_to=移動
+dialog.import=インポート
+dialog.add_overlay=オーバーレイを追加
+
+dialog.title.settings=設定
+dialog.title.render_settings=レンダリング設定
+dialog.title.goto=移動
+dialog.title.find_structure=構造物を検索
+dialog.title.import_chunks=チャンクをインポート
+dialog.title.filter_chunks=チャンクをフィルター
+dialog.title.change_fields=NBT を変更
+dialog.title.error=エラー
+dialog.title.about=MCA Selector について
+dialog.title.select_dimension=ディメンションを選択
+dialog.title.are_you_sure=よろしいですか？
+dialog.title.edit_overlays=オーバーレイを編集
+dialog.title.progress=処理中…
+
+status.no_world=ワールド未読み込み — ファイル > ワールドを開く
+
+settings.language=言語

@@ -56,6 +56,8 @@ pub struct GlobalConfig {
     pub show_structure_icons: bool,
 
     pub coordinate_style: String,
+    /// UI language code — see lang::LANGS (upstream Settings.languageCode)
+    pub language: String,
     pub debug: bool,
     /// upstream FilterChunksDialog keeps the last filter query for the session;
     /// we persist it (GlobalConfig has no dedicated filter file).
@@ -86,6 +88,7 @@ impl Default for GlobalConfig {
             show_coordinates: false,
             show_structure_icons: false,
             coordinate_style: "DYNAMIC".into(),
+            language: "en".into(),
             debug: false,
             filter_query: String::new(),
             overlays: Vec::new(),

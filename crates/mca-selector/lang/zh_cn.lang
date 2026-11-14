@@ -1,0 +1,86 @@
+# 简体中文
+menu.file=文件
+menu.view=视图
+menu.selection=选区
+menu.tools=工具
+menu.about=关于
+
+menu.file.open_world=打开世界
+menu.file.open_dimension=打开维度
+menu.file.open_recent=最近打开的世界
+menu.file.settings=设置
+menu.file.render_settings=渲染设置
+menu.file.quit=退出
+
+menu.view.reload=重新加载
+menu.view.chunk_grid=区块网格
+menu.view.region_grid=区域网格
+menu.view.coordinates=坐标
+menu.view.coord_style=坐标样式
+menu.view.coord_dynamic=动态
+menu.view.coord_edge=边缘
+menu.view.coord_grid=网格
+menu.view.structures=结构
+menu.view.select_structures=选择结构
+menu.view.goto=跳转
+menu.view.find_structure=查找结构
+menu.view.reset_zoom=重置缩放
+menu.view.save_screenshot=保存截图
+menu.view.clear_cache=清除缓存
+menu.view.clear_all_cache=清除所有缓存
+
+menu.selection.clear=清除
+menu.selection.invert=反选
+menu.selection.invert_regions=反选已选区域
+menu.selection.copy_chunks=复制区块
+menu.selection.paste_chunks=粘贴区块
+menu.selection.defragment=整理已选区域
+menu.selection.export_chunks=导出已选区块
+menu.selection.delete_chunks=删除已选区块
+menu.selection.import_selection=从 .csv 导入选区
+menu.selection.export_selection=导出选区为 .csv
+menu.selection.export_image=导出为图像
+menu.selection.clear_cache=清除缓存
+
+menu.tools.restore_backup=恢复最新备份
+menu.tools.import_chunks=导入区块
+menu.tools.filter_chunks=过滤区块
+menu.tools.change_fields=修改字段
+menu.tools.relight=重新照明区块
+menu.tools.edit_chunk=编辑区块
+menu.tools.swap_chunks=交换区块
+menu.tools.edit_overlays=编辑叠加层
+menu.tools.next_overlay=下一个叠加层
+menu.tools.next_overlay_type=下一种叠加类型
+menu.tools.sum_selection=统计选区
+
+menu.about.about=关于 MCA Selector
+
+dialog.ok=确定
+dialog.cancel=取消
+dialog.close=关闭
+dialog.save=保存
+dialog.yes=是
+dialog.no=否
+dialog.copy=复制
+dialog.go_to=跳转
+dialog.import=导入
+dialog.add_overlay=添加叠加层
+
+dialog.title.settings=设置
+dialog.title.render_settings=渲染设置
+dialog.title.goto=跳转
+dialog.title.find_structure=查找结构
+dialog.title.import_chunks=导入区块
+dialog.title.filter_chunks=过滤区块
+dialog.title.change_fields=修改 NBT
+dialog.title.error=错误
+dialog.title.about=关于 MCA Selector
+dialog.title.select_dimension=选择维度
+dialog.title.are_you_sure=确定吗？
+dialog.title.edit_overlays=编辑叠加层
+dialog.title.progress=处理中…
+
+status.no_world=未加载世界 — 文件 > 打开世界
+
+settings.language=语言

@@ -1,0 +1,86 @@
+# Français
+menu.file=Fichier
+menu.view=Vue
+menu.selection=Sélection
+menu.tools=Outils
+menu.about=À propos
+
+menu.file.open_world=Ouvrir un monde
+menu.file.open_dimension=Ouvrir une dimension
+menu.file.open_recent=Mondes récents
+menu.file.settings=Paramètres
+menu.file.render_settings=Paramètres de rendu
+menu.file.quit=Quitter
+
+menu.view.reload=Recharger
+menu.view.chunk_grid=Grille des chunks
+menu.view.region_grid=Grille des régions
+menu.view.coordinates=Coordonnées
+menu.view.coord_style=Style des coordonnées
+menu.view.coord_dynamic=DYNAMIQUE
+menu.view.coord_edge=BORD
+menu.view.coord_grid=GRILLE
+menu.view.structures=Structures
+menu.view.select_structures=Sélectionner les structures
+menu.view.goto=Aller à
+menu.view.find_structure=Trouver une structure
+menu.view.reset_zoom=Réinitialiser le zoom
+menu.view.save_screenshot=Enregistrer une capture
+menu.view.clear_cache=Vider le cache
+menu.view.clear_all_cache=Vider tout le cache
+
+menu.selection.clear=Effacer
+menu.selection.invert=Inverser
+menu.selection.invert_regions=Inverser les régions sélectionnées
+menu.selection.copy_chunks=Copier les chunks
+menu.selection.paste_chunks=Coller les chunks
+menu.selection.defragment=Défragmenter les régions sélectionnées
+menu.selection.export_chunks=Exporter les chunks sélectionnés
+menu.selection.delete_chunks=Supprimer les chunks sélectionnés
+menu.selection.import_selection=Importer une sélection (.csv)
+menu.selection.export_selection=Exporter la sélection (.csv)
+menu.selection.export_image=Exporter en image
+menu.selection.clear_cache=Vider le cache
+
+menu.tools.restore_backup=Restaurer la dernière sauvegarde
+menu.tools.import_chunks=Importer des chunks
+menu.tools.filter_chunks=Filtrer les chunks
+menu.tools.change_fields=Modifier les champs
+menu.tools.relight=Rééclairer les chunks
+menu.tools.edit_chunk=Modifier le chunk
+menu.tools.swap_chunks=Échanger les chunks
+menu.tools.edit_overlays=Modifier les calques
+menu.tools.next_overlay=Calque suivant
+menu.tools.next_overlay_type=Type de calque suivant
+menu.tools.sum_selection=Somme de la sélection
+
+menu.about.about=À propos de MCA Selector
+
+dialog.ok=OK
+dialog.cancel=Annuler
+dialog.close=Fermer
+dialog.save=Enregistrer
+dialog.yes=Oui
+dialog.no=Non
+dialog.copy=Copier
+dialog.go_to=Aller à
+dialog.import=Importer
+dialog.add_overlay=Ajouter un calque
+
+dialog.title.settings=Paramètres
+dialog.title.render_settings=Paramètres de rendu
+dialog.title.goto=Aller à
+dialog.title.find_structure=Trouver une structure
+dialog.title.import_chunks=Importer des chunks
+dialog.title.filter_chunks=Filtrer les chunks
+dialog.title.change_fields=Modifier le NBT
+dialog.title.error=Erreur
+dialog.title.about=À propos de MCA Selector
+dialog.title.select_dimension=Sélectionner une dimension
+dialog.title.are_you_sure=Êtes-vous sûr ?
+dialog.title.edit_overlays=Modifier les calques
+dialog.title.progress=Traitement…
+
+status.no_world=aucun monde chargé — Fichier > Ouvrir un monde
+
+settings.language=Langue

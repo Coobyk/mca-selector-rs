@@ -2,6 +2,7 @@ mod actions;
 mod config;
 mod dialogs;
 mod input;
+mod lang;
 mod menubar;
 mod nbt_editor;
 mod ops;
@@ -57,54 +58,55 @@ fn menus(cx: &App) -> Vec<Menu> {
         .unwrap_or_default();
     let dim_item = if dims.len() > 1 {
         MenuItem::submenu(Menu {
-            name: "Open Dimension".into(),
+            name: lang::t("menu.file.open_dimension").into(),
             items: dims,
         })
     } else {
-        MenuItem::action("Open Dimension", OpenDimensionAction)
+        MenuItem::action(lang::t("menu.file.open_dimension"), OpenDimensionAction)
     };
+    use lang::t;
     let mut file_items = vec![
-        MenuItem::action("Open World", OpenWorldAction),
+        MenuItem::action(t("menu.file.open_world"), OpenWorldAction),
         dim_item,
         MenuItem::submenu(Menu {
-            name: "Open recent World".into(),
+            name: t("menu.file.open_recent").into(),
             items: if recent.is_empty() {
-                vec![MenuItem::action("Open World", OpenWorldAction)]
+                vec![MenuItem::action(t("menu.file.open_world"), OpenWorldAction)]
             } else {
                 recent
             },
         }),
         MenuItem::separator(),
-        MenuItem::action("Settings", SettingsAction),
-        MenuItem::action("Render Settings", RenderSettingsAction),
+        MenuItem::action(t("menu.file.settings"), SettingsAction),
+        MenuItem::action(t("menu.file.render_settings"), RenderSettingsAction),
         MenuItem::separator(),
-        MenuItem::action("Quit", QuitAction),
+        MenuItem::action(t("menu.file.quit"), QuitAction),
     ];
     let _ = &mut file_items;
     vec![
         Menu {
-            name: "File".into(),
+            name: t("menu.file").into(),
             items: file_items,
         },
         Menu {
-            name: "View".into(),
+            name: t("menu.view").into(),
             items: vec![
-                MenuItem::action("Reload", ReloadAction),
+                MenuItem::action(t("menu.view.reload"), ReloadAction),
                 MenuItem::separator(),
-                MenuItem::action(format!("{}Chunk Grid", on(g.show_chunk_grid)), ChunkGridAction),
-                MenuItem::action(format!("{}Region Grid", on(g.show_region_grid)), RegionGridAction),
-                MenuItem::action(format!("{}Coordinates", on(g.show_coordinates)), CoordinatesAction),
+                MenuItem::action(format!("{}{}", on(g.show_chunk_grid), t("menu.view.chunk_grid")), ChunkGridAction),
+                MenuItem::action(format!("{}{}", on(g.show_region_grid), t("menu.view.region_grid")), RegionGridAction),
+                MenuItem::action(format!("{}{}", on(g.show_coordinates), t("menu.view.coordinates")), CoordinatesAction),
                 MenuItem::submenu(Menu {
-                    name: "Coordinate Style".into(),
+                    name: t("menu.view.coord_style").into(),
                     items: vec![
-                        MenuItem::action(format!("{}Dynamic", on(style == "DYNAMIC")), CoordStyleDynamicAction),
-                        MenuItem::action(format!("{}Edge", on(style == "EDGE")), CoordStyleEdgeAction),
-                        MenuItem::action(format!("{}Grid", on(style == "GRID")), CoordStyleGridAction),
+                        MenuItem::action(format!("{}{}", on(style == "DYNAMIC"), t("menu.view.coord_dynamic")), CoordStyleDynamicAction),
+                        MenuItem::action(format!("{}{}", on(style == "EDGE"), t("menu.view.coord_edge")), CoordStyleEdgeAction),
+                        MenuItem::action(format!("{}{}", on(style == "GRID"), t("menu.view.coord_grid")), CoordStyleGridAction),
                     ],
                 }),
-                MenuItem::action(format!("{}Structures", on(g.show_structure_icons)), StructureIconsAction),
+                MenuItem::action(format!("{}{}", on(g.show_structure_icons), t("menu.view.structures")), StructureIconsAction),
                 MenuItem::submenu(Menu {
-                    name: "Select Structures".into(),
+                    name: t("menu.view.select_structures").into(),
                     items: mc_core::structures::structures()
                         .display_names
                         .iter()
@@ -115,56 +117,60 @@ fn menus(cx: &App) -> Vec<Menu> {
                         .collect(),
                 }),
                 MenuItem::separator(),
-                MenuItem::action("Goto", GotoAction),
-                MenuItem::action("Reset zoom", ResetZoomAction),
+                MenuItem::action(t("menu.view.goto"), GotoAction),
+                MenuItem::action(t("menu.view.find_structure"), FindStructureAction),
+                MenuItem::action(t("menu.view.reset_zoom"), ResetZoomAction),
                 MenuItem::separator(),
-                MenuItem::action("Save screenshot", SaveScreenshotAction),
+                MenuItem::action(t("menu.view.save_screenshot"), SaveScreenshotAction),
                 MenuItem::separator(),
-                MenuItem::action("Clear cache", ClearViewCacheAction),
-                MenuItem::action("Clear all cache", ClearAllCacheAction),
+                MenuItem::action(t("menu.view.clear_cache"), ClearViewCacheAction),
+                MenuItem::action(t("menu.view.clear_all_cache"), ClearAllCacheAction),
             ],
         },
         Menu {
-            name: "Selection".into(),
+            name: t("menu.selection").into(),
             items: vec![
-                MenuItem::action("Clear", ClearSelectionAction),
-                MenuItem::action("Invert", InvertSelectionAction),
-                MenuItem::action("Invert selected regions", InvertRegionsAction),
+                MenuItem::action(t("menu.selection.clear"), ClearSelectionAction),
+                MenuItem::action(t("menu.selection.invert"), InvertSelectionAction),
+                MenuItem::action(t("menu.selection.invert_regions"), InvertRegionsAction),
                 MenuItem::separator(),
-                MenuItem::action("Copy chunks", CopyChunksAction),
-                MenuItem::action("Paste chunks", PasteChunksAction),
+                MenuItem::action(t("menu.selection.copy_chunks"), CopyChunksAction),
+                MenuItem::action(t("menu.selection.paste_chunks"), PasteChunksAction),
                 MenuItem::separator(),
-                MenuItem::action("Defragment selected regions", DefragmentAction),
-                MenuItem::action("Export selected chunks", ExportChunksAction),
-                MenuItem::action("Delete selected chunks", DeleteChunksAction),
+                MenuItem::action(t("menu.selection.defragment"), DefragmentAction),
+                MenuItem::action(t("menu.selection.export_chunks"), ExportChunksAction),
+                MenuItem::action(t("menu.selection.delete_chunks"), DeleteChunksAction),
                 MenuItem::separator(),
-                MenuItem::action("Import selection from .csv", ImportSelectionAction),
-                MenuItem::action("Export selection as .csv", ExportSelectionAction),
+                MenuItem::action(t("menu.selection.import_selection"), ImportSelectionAction),
+                MenuItem::action(t("menu.selection.export_selection"), ExportSelectionAction),
                 MenuItem::separator(),
-                MenuItem::action("Export as image", ExportImageAction),
+                MenuItem::action(t("menu.selection.export_image"), ExportImageAction),
                 MenuItem::separator(),
-                MenuItem::action("Clear cache", ClearSelectionCacheAction),
+                MenuItem::action(t("menu.selection.clear_cache"), ClearSelectionCacheAction),
             ],
         },
         Menu {
-            name: "Tools".into(),
+            name: t("menu.tools").into(),
             items: vec![
-                MenuItem::action("Import chunks", ImportChunksAction),
-                MenuItem::action("Filter chunks", FilterChunksAction),
-                MenuItem::action("Change fields", ChangeFieldsAction),
-                MenuItem::action("Edit chunk", EditNBTAction),
+                MenuItem::action(t("menu.tools.restore_backup"), RestoreBackupAction),
                 MenuItem::separator(),
-                MenuItem::action("Swap chunks", SwapChunksAction),
+                MenuItem::action(t("menu.tools.import_chunks"), ImportChunksAction),
+                MenuItem::action(t("menu.tools.filter_chunks"), FilterChunksAction),
+                MenuItem::action(t("menu.tools.change_fields"), ChangeFieldsAction),
+                MenuItem::action(t("menu.tools.relight"), RelightAction),
+                MenuItem::action(t("menu.tools.edit_chunk"), EditNBTAction),
                 MenuItem::separator(),
-                MenuItem::action("Edit overlays", EditOverlaysAction),
-                MenuItem::action("Next overlay", NextOverlayAction),
-                MenuItem::action("Next overlay type", NextOverlayTypeAction),
-                MenuItem::action("Sum selection", SumSelectionAction),
+                MenuItem::action(t("menu.tools.swap_chunks"), SwapChunksAction),
+                MenuItem::separator(),
+                MenuItem::action(t("menu.tools.edit_overlays"), EditOverlaysAction),
+                MenuItem::action(t("menu.tools.next_overlay"), NextOverlayAction),
+                MenuItem::action(t("menu.tools.next_overlay_type"), NextOverlayTypeAction),
+                MenuItem::action(t("menu.tools.sum_selection"), SumSelectionAction),
             ],
         },
         Menu {
-            name: "About".into(),
-            items: vec![MenuItem::action("About MCA Selector", AboutAction)],
+            name: t("menu.about").into(),
+            items: vec![MenuItem::action(t("menu.about.about"), AboutAction)],
         },
     ]
 }
@@ -181,6 +187,7 @@ fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-z", CoordinatesAction, None),
         KeyBinding::new("ctrl-y", StructureIconsAction, None),
         KeyBinding::new("ctrl-g", GotoAction, None),
+        KeyBinding::new("ctrl-shift-g", FindStructureAction, None),
         KeyBinding::new("ctrl-0", ResetZoomAction, None),
         KeyBinding::new("ctrl-p", SaveScreenshotAction, None),
         KeyBinding::new("ctrl-shift-k", ClearAllCacheAction, None),
@@ -209,6 +216,7 @@ fn bindings() -> Vec<KeyBinding> {
 fn main() {
     env_logger::init();
     config::set_global(config::GlobalConfig::load());
+    lang::init(&config::global().language);
     mc_core::jobs::set_process_threads(config::global().process_threads as usize);
     Application::new().run(|cx: &mut App| {
         cx.set_menus(menus(cx));

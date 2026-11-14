@@ -1,0 +1,86 @@
+# English (source of truth — fallback for missing keys)
+menu.file=File
+menu.view=View
+menu.selection=Selection
+menu.tools=Tools
+menu.about=About
+
+menu.file.open_world=Open World
+menu.file.open_dimension=Open Dimension
+menu.file.open_recent=Open recent World
+menu.file.settings=Settings
+menu.file.render_settings=Render Settings
+menu.file.quit=Quit
+
+menu.view.reload=Reload
+menu.view.chunk_grid=Chunk Grid
+menu.view.region_grid=Region Grid
+menu.view.coordinates=Coordinates
+menu.view.coord_style=Coordinate Style
+menu.view.coord_dynamic=DYNAMIC
+menu.view.coord_edge=EDGE
+menu.view.coord_grid=GRID
+menu.view.structures=Structures
+menu.view.select_structures=Select Structures
+menu.view.goto=Goto
+menu.view.find_structure=Find structure
+menu.view.reset_zoom=Reset zoom
+menu.view.save_screenshot=Save screenshot
+menu.view.clear_cache=Clear cache
+menu.view.clear_all_cache=Clear all cache
+
+menu.selection.clear=Clear
+menu.selection.invert=Invert
+menu.selection.invert_regions=Invert selected regions
+menu.selection.copy_chunks=Copy chunks
+menu.selection.paste_chunks=Paste chunks
+menu.selection.defragment=Defragment selected regions
+menu.selection.export_chunks=Export selected chunks
+menu.selection.delete_chunks=Delete selected chunks
+menu.selection.import_selection=Import selection from .csv
+menu.selection.export_selection=Export selection as .csv
+menu.selection.export_image=Export as image
+menu.selection.clear_cache=Clear cache
+
+menu.tools.restore_backup=Restore last backup
+menu.tools.import_chunks=Import chunks
+menu.tools.filter_chunks=Filter chunks
+menu.tools.change_fields=Change fields
+menu.tools.relight=Relight chunks
+menu.tools.edit_chunk=Edit chunk
+menu.tools.swap_chunks=Swap chunks
+menu.tools.edit_overlays=Edit overlays
+menu.tools.next_overlay=Next overlay
+menu.tools.next_overlay_type=Next overlay type
+menu.tools.sum_selection=Sum selection
+
+menu.about.about=About MCA Selector
+
+dialog.ok=OK
+dialog.cancel=Cancel
+dialog.close=Close
+dialog.save=Save
+dialog.yes=Yes
+dialog.no=No
+dialog.copy=Copy
+dialog.go_to=Go to
+dialog.import=Import
+dialog.add_overlay=Add overlay
+
+dialog.title.settings=Settings
+dialog.title.render_settings=Render settings
+dialog.title.goto=Goto
+dialog.title.find_structure=Find structure
+dialog.title.import_chunks=Import chunks
+dialog.title.filter_chunks=Filter chunks
+dialog.title.change_fields=Change NBT
+dialog.title.error=Error
+dialog.title.about=About MCA Selector
+dialog.title.select_dimension=Select dimension
+dialog.title.are_you_sure=Are you sure?
+dialog.title.edit_overlays=Edit overlays
+dialog.title.progress=Working…
+
+status.no_world=no world loaded — File > Open World
+
+settings.language=Language

@@ -83,6 +83,10 @@ impl MainView {
     /// deferred+anchored so they land above the map canvas; positions are
     /// window coordinates, so the bar height is part of the y offset.
     pub(crate) fn render_menu_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        // macOS menus live on the OS bar — no in-window dropdown panels
+        if cfg!(target_os = "macos") {
+            return vec![];
+        }
         let Some(open) = self.open_menu else {
             return vec![];
         };

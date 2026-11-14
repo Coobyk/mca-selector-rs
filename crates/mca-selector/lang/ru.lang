@@ -1,0 +1,86 @@
+# Русский
+menu.file=Файл
+menu.view=Вид
+menu.selection=Выделение
+menu.tools=Инструменты
+menu.about=О программе
+
+menu.file.open_world=Открыть мир
+menu.file.open_dimension=Открыть измерение
+menu.file.open_recent=Недавние миры
+menu.file.settings=Настройки
+menu.file.render_settings=Настройки рендера
+menu.file.quit=Выход
+
+menu.view.reload=Перезагрузить
+menu.view.chunk_grid=Сетка чанков
+menu.view.region_grid=Сетка регионов
+menu.view.coordinates=Координаты
+menu.view.coord_style=Стиль координат
+menu.view.coord_dynamic=ДИНАМИЧЕСКИЙ
+menu.view.coord_edge=КРАЙ
+menu.view.coord_grid=СЕТКА
+menu.view.structures=Структуры
+menu.view.select_structures=Выбрать структуры
+menu.view.goto=Перейти
+menu.view.find_structure=Найти структуру
+menu.view.reset_zoom=Сбросить масштаб
+menu.view.save_screenshot=Сохранить скриншот
+menu.view.clear_cache=Очистить кэш
+menu.view.clear_all_cache=Очистить весь кэш
+
+menu.selection.clear=Очистить
+menu.selection.invert=Инвертировать
+menu.selection.invert_regions=Инвертировать выделенные регионы
+menu.selection.copy_chunks=Копировать чанки
+menu.selection.paste_chunks=Вставить чанки
+menu.selection.defragment=Дефрагментировать выделенные регионы
+menu.selection.export_chunks=Экспорт выделенных чанков
+menu.selection.delete_chunks=Удалить выделенные чанки
+menu.selection.import_selection=Импорт выделения из .csv
+menu.selection.export_selection=Экспорт выделения в .csv
+menu.selection.export_image=Экспорт как изображение
+menu.selection.clear_cache=Очистить кэш
+
+menu.tools.restore_backup=Восстановить последнюю резервную копию
+menu.tools.import_chunks=Импорт чанков
+menu.tools.filter_chunks=Фильтр чанков
+menu.tools.change_fields=Изменить поля
+menu.tools.relight=Переосветить чанки
+menu.tools.edit_chunk=Править чанк
+menu.tools.swap_chunks=Поменять чанки местами
+menu.tools.edit_overlays=Править оверлеи
+menu.tools.next_overlay=Следующий оверлей
+menu.tools.next_overlay_type=Следующий тип оверлея
+menu.tools.sum_selection=Сумма выделения
+
+menu.about.about=О MCA Selector
+
+dialog.ok=ОК
+dialog.cancel=Отмена
+dialog.close=Закрыть
+dialog.save=Сохранить
+dialog.yes=Да
+dialog.no=Нет
+dialog.copy=Копировать
+dialog.go_to=Перейти
+dialog.import=Импорт
+dialog.add_overlay=Добавить оверлей
+
+dialog.title.settings=Настройки
+dialog.title.render_settings=Настройки рендера
+dialog.title.goto=Перейти
+dialog.title.find_structure=Найти структуру
+dialog.title.import_chunks=Импорт чанков
+dialog.title.filter_chunks=Фильтр чанков
+dialog.title.change_fields=Изменить NBT
+dialog.title.error=Ошибка
+dialog.title.about=О MCA Selector
+dialog.title.select_dimension=Выбрать измерение
+dialog.title.are_you_sure=Вы уверены?
+dialog.title.edit_overlays=Править оверлеи
+dialog.title.progress=Работаем…
+
+status.no_world=мир не загружен — Файл > Открыть мир
+
+settings.language=Язык

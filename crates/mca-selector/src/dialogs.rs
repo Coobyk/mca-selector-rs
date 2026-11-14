@@ -132,6 +132,14 @@ pub enum Dialog {
         rows: Vec<OverlayRow>,
         focus: Option<(usize, OverlayField)>,
     },
+    /// Find-structure locator: background scan batches stream into
+    /// `entries` as (canonical name, chunk-as-long) while `scanning`.
+    StructureLocator {
+        entries: Vec<(String, i64)>,
+        scanning: bool,
+        sel: usize,
+        filter: String,
+    },
 }
 
 impl Dialog {
@@ -154,8 +162,40 @@ impl Dialog {
             Dialog::ChangeFields { .. } => "ChangeFields",
             Dialog::Import { .. } => "Import",
             Dialog::OverlayEditor { .. } => "OverlayEditor",
+            Dialog::StructureLocator { .. } => "StructureLocator",
         }
     }
+}
+
+/// locator list model: (display name, canonical name, chunk, block dist)
+/// sorted by distance from the view center and name-filtered.
+fn locator_rows(
+    entries: &[(String, i64)],
+    filter: &str,
+    center: Point2i,
+) -> Vec<(String, String, Point2i, f32)> {
+    let reg = mc_core::structures::structures();
+    let f = filter.to_lowercase();
+    let mut rows: Vec<_> = entries
+        .iter()
+        .filter_map(|(name, long)| {
+            let c = Point2i::from_long(*long);
+            let disp = reg
+                .icons
+                .get(name)
+                .map(|d| d.display.clone())
+                .unwrap_or_else(|| name.clone());
+            if !f.is_empty() && !disp.to_lowercase().contains(&f) && !name.to_lowercase().contains(&f)
+            {
+                return None;
+            }
+            let dx = c.x * 16 + 8 - center.x;
+            let dz = c.z * 16 + 8 - center.z;
+            Some((disp, name.clone(), c, (dx * dx + dz * dz) as f32))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+    rows
 }
 
 // -- keyboard ---------------------------------------------------------------
@@ -431,6 +471,53 @@ impl MainView {
             cx.notify();
             return;
         }
+        if let Some(Dialog::StructureLocator { entries, sel, filter, .. }) = &mut self.dialog {
+            let center = self.map.center_block();
+            match k {
+                "escape" => self.dialog = None,
+                "up" => *sel = sel.saturating_sub(1),
+                "down" => {
+                    let n = locator_rows(entries, filter, center).len();
+                    *sel = (*sel + 1).min(n.saturating_sub(1));
+                }
+                "pageup" => *sel = sel.saturating_sub(20),
+                "pagedown" => {
+                    let n = locator_rows(entries, filter, center).len();
+                    *sel = (*sel + 20).min(n.saturating_sub(1));
+                }
+                "backspace" => {
+                    filter.pop();
+                    *sel = 0;
+                }
+                "enter" => {
+                    if let Some(Dialog::StructureLocator { entries, sel, filter, .. }) = &self.dialog {
+                        let rows = locator_rows(entries, filter, center);
+                        if let Some((_, _, c, _)) = rows.get(*sel) {
+                            let (bx, bz) = (c.x * 16 + 8, c.z * 16 + 8);
+                            self.map.go_to(bx, bz);
+                            self.request_update();
+                            self.dialog = None;
+                        }
+                    }
+                }
+                _ => {
+                    let c = &event.keystroke.key_char;
+                    if let Some(c) = c {
+                        for ch in c.chars() {
+                            if !ch.is_control() {
+                                filter.push(ch);
+                            }
+                        }
+                        *sel = 0;
+                    } else if k == "space" {
+                        filter.push(' ');
+                        *sel = 0;
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
         // Info/Error/About all have a single default OK/Close button upstream
         if matches!(self.dialog, Some(Dialog::Info { .. }) | Some(Dialog::Error { .. }) | Some(Dialog::About)) {
             if k == "enter" || k == "escape" {
@@ -485,7 +572,7 @@ impl MainView {
                 let inv = *invalid;
                 panel(
                     v_flex().gap_2()
-                        .child(text_el("Goto", 16.))
+                        .child(text_el(crate::lang::t("dialog.title.goto"), 16.))
                         .child(
                             h_flex().gap_2()
                                 .child(
@@ -514,7 +601,7 @@ impl MainView {
                         })
                         .child(
                             h_flex().gap_2()
-                                .child(button("Go to", cx, |v, _w, cx| {
+                                .child(button(crate::lang::t("dialog.go_to"), cx, |v, _w, cx| {
                                     let mut ok = false;
                                     if let Some(Dialog::Goto { x, z, invalid, .. }) = &mut v.dialog {
                                         if let (Ok(xi), Ok(zi)) = (x.parse::<i32>(), z.parse::<i32>()) {
@@ -530,7 +617,7 @@ impl MainView {
                                     }
                                     cx.notify();
                                 }))
-                                .child(button("Cancel", cx, |v, _w, cx| {
+                                .child(button(crate::lang::t("dialog.cancel"), cx, |v, _w, cx| {
                                     v.dialog = None;
                                     cx.notify();
                                 })),
@@ -539,28 +626,28 @@ impl MainView {
             }
             Dialog::About => panel(
                 v_flex().gap_2()
-                    .child(text_el("About MCA Selector", 16.))
+                    .child(text_el(crate::lang::t("dialog.title.about"), 16.))
                     .child(text_el(concat!("Version: ", env!("CARGO_PKG_VERSION"), " (Rust + GPUI port)"), 12.))
                     .child(text_el("License: MIT", 12.))
                     .child(text_el("Copyright: © Querz", 12.))
                     .child(text_el("Source: https://github.com/Querz/mcaselector", 12.))
                     .child(text_el("NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.", 10.))
-                    .child(button("Close", cx, |v, _w, cx| {
+                    .child(button(crate::lang::t("dialog.close"), cx, |v, _w, cx| {
                         v.dialog = None;
                         cx.notify();
                     })),
             ),
             Dialog::Error { msg } => panel(
                 v_flex().gap_2()
-                    .child(text_el("Error", 16.))
+                    .child(text_el(crate::lang::t("dialog.title.error"), 16.))
                     .child(text_el(msg.clone(), 12.))
                     .child(
                         h_flex().gap_2()
-                            .child(button("OK", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.ok"), cx, |v, _w, cx| {
                                 v.dialog = None;
                                 cx.notify();
                             }))
-                            .child(button("Copy", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.copy"), cx, |v, _w, cx| {
                                 if let Some(Dialog::Error { msg }) = &v.dialog {
                                     cx.write_to_clipboard(ClipboardItem::new_string(msg.clone()));
                                 }
@@ -575,13 +662,13 @@ impl MainView {
                     .child(text_el("(offset = dragged position; enter to import)", 10.))
                     .child(
                         h_flex().gap_2()
-                            .child(button("Import", cx, |v, w, cx| {
+                            .child(button(crate::lang::t("dialog.import"), cx, |v, w, cx| {
                                 if let Some(Dialog::PasteConfirm { ox, oz, overwrite, sel_only, .. }) = v.dialog.take() {
                                     v.do_paste_import(ox, oz, overwrite, sel_only, cx);
                                 }
                                 let _ = w;
                             }))
-                            .child(button("Cancel", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.cancel"), cx, |v, _w, cx| {
                                 v.dialog = None;
                                 cx.notify();
                             })),
@@ -592,13 +679,13 @@ impl MainView {
                     .child(text_el(msg.clone(), 13.))
                     .child(
                         h_flex().gap_2()
-                            .child(button("Yes", cx, |v, w, cx| {
+                            .child(button(crate::lang::t("dialog.yes"), cx, |v, w, cx| {
                                 if let Some(Dialog::Confirm { action, .. }) = v.dialog.take() {
                                     (action)(v, w, cx);
                                 }
                                 cx.notify();
                             }))
-                            .child(button("No", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.no"), cx, |v, _w, cx| {
                                 v.dialog = None;
                                 cx.notify();
                             })),
@@ -606,7 +693,7 @@ impl MainView {
             ),
             Dialog::Settings { draft } => panel(
                 v_flex().gap_1()
-                    .child(text_el("Settings", 16.))
+                    .child(text_el(crate::lang::t("dialog.title.settings"), 16.))
                     .child(text_el(format!("Region selection color: rgba({:.2},{:.2},{:.2},{:.2})", draft.region_selection_color.r, draft.region_selection_color.g, draft.region_selection_color.b, draft.region_selection_color.a), 12.))
                     .child(text_el(format!("Chunk selection color: rgba({:.2},{:.2},{:.2},{:.2})", draft.chunk_selection_color.r, draft.chunk_selection_color.g, draft.chunk_selection_color.b, draft.chunk_selection_color.a), 12.))
                     .child(text_el(format!("Paste chunks color: rgba({:.2},{:.2},{:.2},{:.2})", draft.paste_chunks_color.r, draft.paste_chunks_color.g, draft.paste_chunks_color.b, draft.paste_chunks_color.a), 12.))
@@ -620,10 +707,34 @@ impl MainView {
                             .child(self.toggle_global("Debug", draft.debug, |d| &mut d.debug, cx)),
                     )
                     .child(
+                        h_flex().gap_1()
+                            .child(text_el(format!("{}:", crate::lang::t("settings.language")), 12.))
+                            .child(
+                                div()
+                                    .id("gs-language")
+                                    .px_2().py_1()
+                                    .bg(rgb(0x3c3f41))
+                                    .border_1().border_color(rgb(0x555555))
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_size(px(12.))
+                                    .child(crate::lang::display_name(&draft.language))
+                                    .on_click(cx.listener(|v, _, _w, cx| {
+                                        if let Some(Dialog::Settings { draft }) = &mut v.dialog {
+                                            draft.language = crate::lang::next_code(&draft.language).to_string();
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    )
+                    .child(
                         h_flex().gap_2()
-                            .child(button("Save", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.save"), cx, |v, _w, cx| {
                                 if let Some(Dialog::Settings { draft }) = v.dialog.take() {
+                                    let lang = draft.language.clone();
                                     config::set_global(draft);
+                                    crate::lang::init(&lang);
+                                    cx.set_menus(crate::menus(cx));
                                     v.map.mark_all_tiles_obsolete();
                                     // mark_all_tiles_obsolete alone does not
                                     // schedule a re-render — request_update
@@ -633,7 +744,7 @@ impl MainView {
                                 }
                                 cx.notify();
                             }))
-                            .child(button("Cancel", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.cancel"), cx, |v, _w, cx| {
                                 v.dialog = None;
                                 cx.notify();
                             })),
@@ -641,7 +752,7 @@ impl MainView {
             ),
             Dialog::RenderSettings { draft } => panel(
                 v_flex().gap_1()
-                    .child(text_el("Render settings", 16.))
+                    .child(text_el(crate::lang::t("dialog.title.render_settings"), 16.))
                     .child(text_el(format!("Render height: {}", draft.render_height), 12.))
                     .child(
                         h_flex().gap_1().flex_wrap()
@@ -663,7 +774,7 @@ impl MainView {
                     .child(text_el(format!("Header-only zoom: {}", draft.render_header_only_zoom_level), 12.))
                     .child(
                         h_flex().gap_2()
-                            .child(button("Save", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.save"), cx, |v, _w, cx| {
                                 if let Some(Dialog::RenderSettings { draft }) = v.dialog.take() {
                                     if let Some(mut ws) = config::world() {
                                         ws.cfg = draft;
@@ -674,14 +785,14 @@ impl MainView {
                                 }
                                 cx.notify();
                             }))
-                            .child(button("Cancel", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.cancel"), cx, |v, _w, cx| {
                                 v.dialog = None;
                                 cx.notify();
                             })),
                     ),
             ),
             Dialog::SelectDimension { dims } => {
-                let mut list = v_flex().gap_1().child(text_el("Select dimension", 16.));
+                let mut list = v_flex().gap_1().child(text_el(crate::lang::t("dialog.title.select_dimension"), 16.));
                 let all_dims = dims.clone();
                 for d in dims {
                     // upstream FileNameListCell shows file.getName(), not the path
@@ -718,7 +829,7 @@ impl MainView {
                             })),
                     );
                 }
-                panel(list.child(button("Cancel", cx, |v, _w, cx| {
+                panel(list.child(button(crate::lang::t("dialog.cancel"), cx, |v, _w, cx| {
                     v.dialog = None;
                     cx.notify();
                 })))
@@ -848,8 +959,8 @@ impl MainView {
                     .child(text_el(status.clone(), 10.))
                     .child(
                         h_flex().gap_2()
-                            .child(button("Save", cx, |v, _w, cx| v.nbt_editor_save(cx)))
-                            .child(button("Close", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.save"), cx, |v, _w, cx| v.nbt_editor_save(cx)))
+                            .child(button(crate::lang::t("dialog.close"), cx, |v, _w, cx| {
                                 v.dialog = None;
                                 cx.notify();
                             })),
@@ -860,11 +971,11 @@ impl MainView {
                     .child(text_el(msg.clone(), 14.))
                     .child(
                         h_flex().gap_2()
-                            .child(button("OK", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.ok"), cx, |v, _w, cx| {
                                 v.dialog = None;
                                 cx.notify();
                             }))
-                            .child(button("Copy", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.copy"), cx, |v, _w, cx| {
                                 if let Some(Dialog::Info { msg }) = &v.dialog {
                                     cx.write_to_clipboard(ClipboardItem::new_string(msg.clone()));
                                 }
@@ -890,7 +1001,7 @@ impl MainView {
                                 .child(div().w(px(fill_w)).h_full().bg(rgb(0x3a7bd5)))
                         )
                         .child(text_el(cur, 10.))
-                        .child(button("Cancel", cx, |v, _w, cx| {
+                        .child(button(crate::lang::t("dialog.cancel"), cx, |v, _w, cx| {
                             mc_core::jobs::cancel_progress();
                             v.dialog = None;
                             cx.notify();
@@ -904,13 +1015,13 @@ impl MainView {
                     .child(input_box("input", text, true))
                     .child(
                         h_flex().gap_2()
-                            .child(button("OK", cx, |v, w, cx| {
+                            .child(button(crate::lang::t("dialog.ok"), cx, |v, w, cx| {
                                 if let Some(Dialog::TextInput { text, on_done, .. }) = v.dialog.take() {
                                     (on_done)(v, w, cx, text);
                                 }
                                 cx.notify();
                             }))
-                            .child(button("Cancel", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.cancel"), cx, |v, _w, cx| {
                                 v.dialog = None;
                                 cx.notify();
                             })),
@@ -997,7 +1108,7 @@ impl MainView {
                         })
                         .child(
                             h_flex().gap_2()
-                                .child(button("OK", cx, move |v, w, cx| {
+                                .child(button(crate::lang::t("dialog.ok"), cx, move |v, w, cx| {
                                     // upstream disables OK on an invalid filter
                                     if ok_enabled {
                                         if let Some(Dialog::Filter { query, action, apply, radius, sel_only, .. }) = v.dialog.take() {
@@ -1006,7 +1117,7 @@ impl MainView {
                                     }
                                     cx.notify();
                                 }))
-                                .child(button("Cancel", cx, |v, _w, cx| {
+                                .child(button(crate::lang::t("dialog.cancel"), cx, |v, _w, cx| {
                                     v.dialog = None;
                                     cx.notify();
                                 })),
@@ -1051,7 +1162,7 @@ impl MainView {
                         .child(if parse.is_err() { warn_el(status, 10.) } else { text_el(status, 10.) })
                         .child(
                             h_flex().gap_2()
-                                .child(button("OK", cx, move |v, _w, cx| {
+                                .child(button(crate::lang::t("dialog.ok"), cx, move |v, _w, cx| {
                                     // upstream disables OK on invalid input
                                     if ok_enabled {
                                         if let Some(Dialog::ChangeFields { text, force, sel_only, .. }) = v.dialog.take() {
@@ -1060,7 +1171,7 @@ impl MainView {
                                     }
                                     cx.notify();
                                 }))
-                                .child(button("Cancel", cx, |v, _w, cx| {
+                                .child(button(crate::lang::t("dialog.cancel"), cx, |v, _w, cx| {
                                     v.dialog = None;
                                     cx.notify();
                                 })),
@@ -1110,7 +1221,7 @@ impl MainView {
                         })
                         .child(
                             h_flex().gap_2()
-                                .child(button("Import", cx, |v, _w, cx| {
+                                .child(button(crate::lang::t("dialog.import"), cx, |v, _w, cx| {
                                     let mut done = false;
                                     if let Some(Dialog::Import { ox, oz, invalid, .. }) = &mut v.dialog {
                                         if ox.trim().parse::<i32>().is_ok() && oz.trim().parse::<i32>().is_ok() {
@@ -1126,7 +1237,7 @@ impl MainView {
                                     }
                                     cx.notify();
                                 }))
-                                .child(button("Cancel", cx, |v, _w, cx| {
+                                .child(button(crate::lang::t("dialog.cancel"), cx, |v, _w, cx| {
                                     v.dialog = None;
                                     cx.notify();
                                 })),
@@ -1217,23 +1328,80 @@ impl MainView {
                     .child(list)
                     .child(
                         h_flex().gap_2()
-                            .child(button("Add overlay", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.add_overlay"), cx, |v, _w, cx| {
                                 if let Some(Dialog::OverlayEditor { rows, .. }) = &mut v.dialog {
                                     rows.push(default_overlay_row());
                                 }
                                 cx.notify();
                             }))
-                            .child(button("OK", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.ok"), cx, |v, _w, cx| {
                                 if let Some(Dialog::OverlayEditor { rows, .. }) = v.dialog.take() {
                                     v.apply_overlay_editor(rows, cx);
                                 }
                                 cx.notify();
                             }))
-                            .child(button("Cancel", cx, |v, _w, cx| {
+                            .child(button(crate::lang::t("dialog.cancel"), cx, |v, _w, cx| {
                                 v.dialog = None;
                                 cx.notify();
                             })),
                     )
+            }
+            Dialog::StructureLocator { entries, scanning, sel, filter } => {
+                let center = self.map.center_block();
+                let rows = locator_rows(entries, filter, center);
+                let n = rows.len();
+                let sel = (*sel).min(n.saturating_sub(1));
+                const VIS: usize = 18;
+                let start = if sel >= VIS { sel + 1 - VIS } else { 0 };
+                let mut list = v_flex().h(px(VIS as f32 * 22. + 8.)).overflow_hidden().gap_0p5();
+                for (i, (disp, _canon, c, dist2)) in rows.iter().enumerate().skip(start).take(VIS) {
+                    let (bx, bz) = (c.x * 16 + 8, c.z * 16 + 8);
+                    let label = format!(
+                        "{}   {},{}   ({} blocks)",
+                        disp,
+                        bx,
+                        bz,
+                        (*dist2).sqrt() as i32,
+                    );
+                    let selected = i == sel;
+                    let mut row = div()
+                        .id(SharedString::from(format!("loc-{i}")))
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(if selected { rgb(0x3d5a99) } else { rgba(0x00000000) });
+                    if !selected {
+                        row = row.hover(|s| s.bg(rgb(0x3a3a3a)));
+                    }
+                    list = list.child(
+                        row.child(text_el(label, 12.))
+                            .on_click(cx.listener(move |v, _, _w, cx| {
+                                v.map.go_to(bx, bz);
+                                v.request_update();
+                                v.dialog = None;
+                                cx.notify();
+                            })),
+                    );
+                }
+                panel(
+                    v_flex()
+                        .gap_2()
+                        .child(text_el("Find structure", 16.))
+                        .child(text_el(
+                            format!(
+                                "filter: {filter}_   —   {} found{}",
+                                n,
+                                if *scanning { ", scanning…" } else { "" },
+                            ),
+                            11.,
+                        ))
+                        .child(list)
+                        .child(text_el("↑/↓/pgup/pgdn navigate, enter jumps, type to filter", 9.))
+                        .child(h_flex().gap_2().child(button(crate::lang::t("dialog.close"), cx, |v, _w, cx| {
+                            v.dialog = None;
+                            cx.notify();
+                        }))),
+                )
             }
         };
         let overlay = overlay
@@ -1349,6 +1517,60 @@ impl MainView {
         // cycling with N activates it
         self.map.set_overlay(None);
         self.request_update();
+        cx.notify();
+    }
+
+    /// open the structure locator and kick off a background scan of every
+    /// region file — cached structure data is reused, uncached regions are
+    /// parsed once and backfill the cache (which also speeds up icons).
+    pub(crate) fn find_structure(&mut self, cx: &mut Context<Self>) {
+        let Some(ws) = config::world() else { return };
+        self.dialog = Some(Dialog::StructureLocator {
+            entries: Vec::new(),
+            scanning: true,
+            sel: 0,
+            filter: String::new(),
+        });
+        let regions: Vec<i64> = self.map.regions.iter().copied().collect();
+        let dir = ws.region_dir().to_path_buf();
+        let uuid = ws.uuid.clone();
+        let tx = self.map.result_tx.clone();
+        mc_core::jobs::pools().add_process(mc_core::jobs::Job::new(
+            mc_core::jobs::PRIORITY_LOW,
+            None,
+            move || {
+                let mut batch: Vec<(String, i64)> = Vec::new();
+                for (i, key) in regions.iter().enumerate() {
+                    let r = Point2i::from_long(*key);
+                    let found = mc_core::cache::get_structures(&uuid, r).or_else(|| {
+                        let path = dir.join(mc_core::files::mca_file_name(r));
+                        let mut m = mc_core::mca::McaFile::new(path).ok()?;
+                        m.load(true).ok()?;
+                        let s = m.structures();
+                        mc_core::cache::set_structures(&uuid, r, &s);
+                        Some(s)
+                    });
+                    if let Some(map) = found {
+                        for (chunk_long, names) in map {
+                            for name in names {
+                                batch.push((name, chunk_long));
+                            }
+                        }
+                    }
+                    // stream every ~8 regions so the dialog fills live
+                    if i % 8 == 7 {
+                        let _ = tx.send(crate::tilemap::TileResult::StructureScan {
+                            entries: std::mem::take(&mut batch),
+                            done: false,
+                        });
+                    }
+                }
+                let _ = tx.send(crate::tilemap::TileResult::StructureScan {
+                    entries: batch,
+                    done: true,
+                });
+            },
+        ));
         cx.notify();
     }
 }
