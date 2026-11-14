@@ -94,6 +94,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "AUR already up to date"
           else
-            git commit -m "Update to $(git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD)"
+            git commit -m "Update to ${GITHUB_SHA:0:7}"
             git push
           fi
