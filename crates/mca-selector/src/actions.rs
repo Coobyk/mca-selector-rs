@@ -17,6 +17,7 @@ actions!(
         CoordStyleGridAction,
         StructureIconsAction,
         GotoAction,
+        FindStructureAction,
         ResetZoomAction,
         SaveScreenshotAction,
         ClearViewCacheAction,
@@ -42,6 +43,8 @@ actions!(
         NextOverlayAction,
         NextOverlayTypeAction,
         SumSelectionAction,
+        RestoreBackupAction,
+        RelightAction,
         AboutAction,
     ]
 );

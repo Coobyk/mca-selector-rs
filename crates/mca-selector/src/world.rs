@@ -43,6 +43,38 @@ impl MainView {
         .detach();
     }
 
+    /// drag & drop entry: resolve whatever was dropped (world folder,
+    /// dimension folder, `region/`, an .mca file, level.dat) to the dir
+    /// open_world_at expects.
+    pub fn open_dropped_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let Some(candidate) = paths.iter().find_map(|p| {
+            if p.is_dir() {
+                // a dropped `region/` dir opens its dimension parent
+                if p.file_name().is_some_and(|n| n == "region") {
+                    p.parent().map(PathBuf::from)
+                } else {
+                    Some(p.clone())
+                }
+            } else if p.is_file() {
+                if files::parse_mca_file_name(
+                    p.file_name().unwrap_or_default().to_str().unwrap_or(""),
+                )
+                .is_some()
+                {
+                    // r.x.z.mca -> region dir -> dimension root
+                    p.parent().and_then(|d| d.parent()).map(PathBuf::from)
+                } else {
+                    p.parent().map(PathBuf::from)
+                }
+            } else {
+                None
+            }
+        }) else {
+            return;
+        };
+        self.open_world_at(candidate, cx);
+    }
+
     pub fn open_world_at(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         eprintln!("[mca] open_world_at {}", dir.display());
         // upstream: confirm before discarding an unsaved selection

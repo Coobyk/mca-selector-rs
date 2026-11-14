@@ -165,6 +165,20 @@ impl MainView {
         if let Some(m) = info {
             self.dialog = Some(Dialog::Info { msg: m });
         }
+        // structure-locator batches stream into the open dialog; results
+        // landing after it closed are discarded.
+        if let Some((entries, done)) = self.map.structure_scan.take() {
+            if let Some(Dialog::StructureLocator { entries: e, scanning, sel, .. }) = &mut self.dialog {
+                e.extend(entries);
+                *scanning = !done;
+                *sel = (*sel).min(e.len().saturating_sub(1));
+            }
+        }
+        // live file watch: a worker rescans mtimes ~1x/sec; changed
+        // regions come back as WatchScan results and self-invalidate.
+        if let Some(ws) = config::world() {
+            self.map.watch_scan_tick(&ws);
+        }
         let changed = self.map.poll_results();
         // zoom debounce: while a zoom is unsettled, don't run update() at
         // all — even when results keep landing (changed). The settled pass
@@ -216,7 +230,7 @@ impl Render for MainView {
         let status: SharedString = if show_bar {
             self.status_text()
         } else {
-            "no world loaded — File > Open World".into()
+            crate::lang::t("status.no_world").into()
         };
         self.focus.focus(window);
         let view = cx.entity();
@@ -264,6 +278,15 @@ impl Render for MainView {
                 } else {
                     cx.quit();
                 }
+            }))
+            .can_drop(|drag, _w, _cx| {
+                // accept drags carrying external file paths (a dropped
+                // world folder); the platform delivers them as ExternalPaths
+                drag.downcast_ref::<gpui::ExternalPaths>()
+                    .is_some_and(|p| !p.paths().is_empty())
+            })
+            .on_drop(cx.listener(|v, paths: &gpui::ExternalPaths, _w, cx| {
+                v.open_dropped_paths(paths.paths(), cx);
             }))
             .on_action(cx.listener(|v, _: &OpenWorldAction, w, cx| v.open_world_dialog(w, cx)))
             .on_action(cx.listener(|v, a: &OpenRecentWorld, _w, cx| {
@@ -372,6 +395,7 @@ impl Render for MainView {
                 Self::rebuild_menus(cx);
                 cx.notify();
             }))
+            .on_action(cx.listener(|v, _: &FindStructureAction, _w, cx| v.find_structure(cx)))
             .on_action(cx.listener(|v, _: &GotoAction, _w, cx| {
                 v.dialog = Some(Dialog::Goto { x: String::new(), z: String::new(), focus_x: true, invalid: false });
                 cx.notify();
@@ -441,6 +465,8 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &CopyChunksAction, _w, cx| v.copy_chunks(cx)))
             .on_action(cx.listener(|v, _: &PasteChunksAction, w, cx| v.paste_chunks(w, cx)))
             .on_action(cx.listener(|v, _: &SumSelectionAction, _w, cx| v.sum_selection(cx)))
+            .on_action(cx.listener(|v, _: &RestoreBackupAction, _w, cx| v.restore_last_backup(cx)))
+            .on_action(cx.listener(|v, _: &RelightAction, _w, cx| v.relight(cx)))
             .on_action(cx.listener(|v, _: &SwapChunksAction, _w, cx| v.swap_chunks(cx)))
             .on_action(cx.listener(|v, _: &FilterChunksAction, _w, cx| v.filter_chunks(cx)))
             .on_action(cx.listener(|v, _: &EditNBTAction, _w, cx| v.edit_nbt(cx)))
@@ -484,7 +510,14 @@ impl Render for MainView {
             .on_mouse_up(MouseButton::Left, cx.listener(|v, _e: &MouseUpEvent, _w, _cx| {
                 v.finish_height_drag();
             }))
-            .child(self.render_menu_bar(cx))
+            // macOS gets the native OS menu bar via cx.set_menus — the
+            // in-window bar would duplicate it (upstream Swing puts its
+            // MenuBar on the frame's native bar there too).
+            .child(if cfg!(target_os = "macos") {
+                Empty.into_any_element()
+            } else {
+                self.render_menu_bar(cx).into_any_element()
+            })
             .child(
                 div()
                     .flex_grow()

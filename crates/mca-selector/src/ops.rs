@@ -297,6 +297,9 @@ impl MainView {
                     Some(None) => {
                         // whole region: copy the file verbatim
                         if let Some(m) = files.region.as_ref() {
+                            if let Some(st) = &files.backup_stamp {
+                                files::backup_file(&dst, st);
+                            }
                             if let Err(e) = std::fs::copy(&m.file, &dst) {
                                 errs.push(format!("{}: {e}", dst.display()));
                             }
@@ -309,6 +312,9 @@ impl MainView {
                         let Some(m) = files.region.as_mut() else { return };
                         // keep only selected chunks
                         m.delete_chunks(&cs.flip());
+                        if let Some(st) = &files.backup_stamp {
+                            files::backup_file(&dst, st);
+                        }
                         if let Err(e) = m.save_with_temp_file(&dst) {
                             errs.push(format!("{}: {e}", dst.display()));
                         }
@@ -353,6 +359,9 @@ impl MainView {
                 match ctx.selection.selected_chunks(ctx.region) {
                     Some(None) => {
                         if let Some(m) = files.region.as_ref() {
+                            if let Some(st) = &files.backup_stamp {
+                                files::backup_file(&dst, st);
+                            }
                             if let Err(e) = std::fs::copy(&m.file, &dst) {
                                 errs.push(format!("{}: {e}", dst.display()));
                             }
@@ -364,6 +373,9 @@ impl MainView {
                         }
                         let Some(m) = files.region.as_mut() else { return };
                         m.delete_chunks(&cs.flip());
+                        if let Some(st) = &files.backup_stamp {
+                            files::backup_file(&dst, st);
+                        }
                         if let Err(e) = m.save_with_temp_file(&dst) {
                             errs.push(format!("{}: {e}", dst.display()));
                         }
@@ -637,6 +649,43 @@ impl MainView {
         cx.notify();
     }
 
+    /// Tools > Restore last backup: copy the newest mca-selector-backups
+    /// stamp set back over the world. The live file watch picks up the
+    /// changed mtimes within ~1s and re-renders; no manual reload needed.
+    pub(crate) fn restore_last_backup(&mut self, cx: &mut Context<Self>) {
+        let Some(ws) = config::world() else { return };
+        let Some(dim) = ws.region_dir().parent().map(|d| d.to_path_buf()) else {
+            return;
+        };
+        let Some(dir) = files::list_backups(&dim).into_iter().last() else {
+            self.dialog = Some(Dialog::Info {
+                msg: "No backups found.\n\nBackups are created automatically before delete/import/\nchange-fields/swap/paste operations.".into(),
+            });
+            cx.notify();
+            return;
+        };
+        let stamp = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+        self.dialog = Some(Dialog::Confirm {
+            msg: format!(
+                "Restore backup {stamp}?\nThis overwrites the region files it snapshot and deletes\nfiles created by that operation."
+            ),
+            action: Box::new(move |v, _w, cx| {
+                let tx = v.map.result_tx.clone();
+                jobs::pools().add_process(Job::new(jobs::PRIORITY_LOW, None, move || {
+                    match files::restore_backup(&dir) {
+                        Ok((r, d)) => job_info(&tx, format!(
+                            "Backup {stamp} restored: {r} files copied back, {d} created files removed"
+                        )),
+                        Err(e) => job_info(&tx, format!("restore failed: {e}")),
+                    }
+                }));
+                v.dialog = None;
+                cx.notify();
+            }),
+        });
+        cx.notify();
+    }
+
     pub(crate) fn swap_chunks(&mut self, cx: &mut Context<Self>) {
         // swap the two selected chunks (upstream dialog asks for the pair;
         // we swap the first two chunks in selection order)
@@ -698,6 +747,9 @@ impl MainView {
                         m2.chunks[i2] = c1;
                         m1.chunks[i1] = c2;
                         _p.inc();
+                        let stamp = files::backup_stamp();
+                        files::backup_file(&p1, &stamp);
+                        files::backup_file(&p2, &stamp);
                         if let Err(e) = m1.save_with_temp_file(&p1) { return fail(&e.to_string()); }
                         if let Err(e) = m2.save_with_temp_file(&p2) { return fail(&e.to_string()); }
                         let _ = tx.send(TileResult::Invalidate {
@@ -784,6 +836,45 @@ impl MainView {
                             let _ = tx.send(TileResult::Invalidate { region });
                         }
                     }));
+                v.dialog = None;
+                cx.notify();
+            }),
+        });
+        cx.notify();
+    }
+
+    /// Tools > Relight: mark chunks isLightOn = 0 so Minecraft recomputes
+    /// sky/block lighting on the next world load (the game's own light
+    /// engine, rather than a partial reimplementation). Applies to the
+    /// selection when one exists, otherwise the whole dimension.
+    pub(crate) fn relight(&mut self, cx: &mut Context<Self>) {
+        let sel = self.map.selection.clone();
+        let (sel_opt, scope) = if sel.is_empty() {
+            (None, "all chunks in this dimension".to_string())
+        } else {
+            (Some(sel), format!("{} selected chunks", self.map.selected_chunks))
+        };
+        let tx = self.map.result_tx.clone();
+        self.dialog = Some(Dialog::Confirm {
+            msg: format!(
+                "Mark {scope} for relighting?\nMinecraft will recompute sky and block lighting\nwhen the world is next loaded."
+            ),
+            action: Box::new(move |v, _w, cx| {
+                let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
+                jobs::pools().add_process(Job::new(jobs::PRIORITY_LOW, None, move || {
+                    let __p = Progress::new("Relighting", -1);
+                    let fields = mc_core::changer::parse_fields("LightPopulated = 0")
+                        .unwrap_or_default();
+                    // force: write the flag even on chunks missing it —
+                    // otherwise untouched chunks keep stale light forever.
+                    match mc_core::filter_ops::run_change_fields(&fields, true, &dirs, sel_opt.as_ref()) {
+                        Ok(r) => job_info(&tx, format!(
+                            "marked {} chunks for relighting ({} files written, {} errors)\nMinecraft will relight them on next load.",
+                            r.chunks_matched, r.files_written, r.errors
+                        )),
+                        Err(e) => job_info(&tx, format!("relight failed: {e}")),
+                    }
+                }));
                 v.dialog = None;
                 cx.notify();
             }),
@@ -974,6 +1065,8 @@ fn import_mca_dir(
             };
             let files: Vec<_> = rd.flatten().collect();
             let mut errs: Vec<String> = Vec::new();
+            // `files` above shadows the module inside this job — qualify.
+            let import_stamp = mc_core::files::backup_stamp();
             let __p = Progress::new("Importing chunks", files.len() as i64);
             for e in files {
                 let __g = __p.inc_guard();
@@ -1034,6 +1127,7 @@ fn import_mca_dir(
                         }
                     }
                     if changed {
+                        mc_core::files::backup_file(&dst, &import_stamp);
                         if let Err(e) = d.save_with_temp_file(&dst) {
                             errs.push(format!("{}: {e}", dst.display()));
                         }

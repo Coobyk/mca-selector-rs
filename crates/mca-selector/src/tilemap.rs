@@ -179,6 +179,19 @@ pub enum TileResult {
         image: Option<Vec<u32>>,
         data: Option<std::sync::Arc<[i32; 1024]>>,
     },
+    /// result of the once-a-second file watch: the region files that
+    /// currently exist and each one's mtime (None = stat failed). The UI
+    /// diffs this against `region_mtimes` to invalidate changed regions.
+    WatchScan {
+        present: HashSet<i64>,
+        mtimes: HashMap<i64, Option<std::time::SystemTime>>,
+    },
+    /// batched structure-locator scan results: (canonical structure name,
+    /// chunk-as-long). `done` marks the last batch of a scan pass.
+    StructureScan {
+        entries: Vec<(String, i64)>,
+        done: bool,
+    },
 }
 
 
@@ -256,11 +269,19 @@ pub struct TileMapState {
     /// pending selection from a finished filter job
     /// (TileResult::FilterResult), consumed by the view's poll tick.
     pub filter_result: Option<Selection>,
+    /// pending structure-locator batch (TileResult::StructureScan),
+    /// consumed by the view's poll tick.
+    pub structure_scan: Option<(Vec<(String, i64)>, bool)>,
     /// active overlay parser (overlayPool.parser)
     pub overlay: Option<mc_core::overlay::Overlay>,
     /// configured overlays, sorted by type, terminated by None (overlay list)
     pub overlays: Vec<Option<mc_core::overlay::Overlay>>,
     pub overlay_loading: HashSet<i64>,
+    /// live-watch state: last-seen mtime per region file (None = missing),
+    /// whether a background stat scan is in flight, and when it started.
+    pub region_mtimes: HashMap<i64, Option<std::time::SystemTime>>,
+    watch_running: bool,
+    watch_scan: std::time::Instant,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -312,9 +333,13 @@ impl TileMapState {
             result_tx: tx,
             job_info: None,
             filter_result: None,
+            structure_scan: None,
             overlay: None,
             overlays: vec![None],
             overlay_loading: HashSet::new(),
+            region_mtimes: HashMap::new(),
+            watch_running: false,
+            watch_scan: std::time::Instant::now(),
         }
     }
 
@@ -395,6 +420,14 @@ impl TileMapState {
             x as f32 - self.width * self.scale / 2.0,
             z as f32 - self.height * self.scale / 2.0,
         );
+    }
+
+    /// block coords at the middle of the viewport.
+    pub fn center_block(&self) -> Point2i {
+        Point2i::new(
+            (self.offset.x + self.width * self.scale / 2.0) as i32,
+            (self.offset.z + self.height * self.scale / 2.0) as i32,
+        )
     }
 
     /// updateScale(oldScale, center) — anchor zoom at `center` (screen px).
@@ -667,6 +700,7 @@ impl TileMapState {
         self.tile_priorities.clear();
         self.prio_bounds = None;
         self.regions.clear();
+        self.region_mtimes.clear();
         self.pasted = None;
         self.hovered_block = None;
         self.clear_selection();
@@ -1230,6 +1264,49 @@ impl TileMapState {
         }
     }
 
+    /// live file watch: once a second, a worker rescans the region dir and
+    /// stats every .mca's mtime. Changes land as TileResult::WatchScan —
+    /// poll_results invalidates the affected regions so update() re-renders
+    /// them without a manual View -> Reload.
+    pub fn watch_scan_tick(&mut self, ws: &crate::config::WorldState) {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        if self.watch_running || self.watch_scan.elapsed() < INTERVAL {
+            return;
+        }
+        self.watch_scan = std::time::Instant::now();
+        self.watch_running = true;
+        let dir = ws.region_dir().to_path_buf();
+        // stat the union of known+still-present files so a deleted file is
+        // caught as a None-mtime diff too
+        let mut candidates: HashSet<i64> = self.regions.clone();
+        for &k in self.region_mtimes.keys() {
+            candidates.insert(k);
+        }
+        for &k in self.tiles.keys() {
+            candidates.insert(k);
+        }
+        let tx = self.result_tx.clone();
+        jobs::pools().add_process(Job::new(
+            jobs::PRIORITY_LOW,
+            None,
+            move || {
+                let present = files::scan_region_files(&dir);
+                let mut all = candidates;
+                all.extend(present.iter().copied());
+                let mut mtimes: HashMap<i64, Option<std::time::SystemTime>> =
+                    HashMap::with_capacity(all.len());
+                for key in all {
+                    let r = Point2i::from_long(key);
+                    let mtime = std::fs::metadata(dir.join(files::mca_file_name(r)))
+                        .and_then(|m| m.modified())
+                        .ok();
+                    mtimes.insert(key, mtime);
+                }
+                let _ = tx.send(TileResult::WatchScan { present, mtimes });
+            },
+        ));
+    }
+
     /// upstream CacheHelper.clearAllCaches -> TileMap.clearCache: images,
     /// overlays AND structure icons all come from caches — everything must be
     /// re-fetched after a clear (overlay_loaded/structures_checked would
@@ -1424,6 +1501,34 @@ impl TileMapState {
                             t.image = Some((Arc::new(image), (TILE_SIZE / 32) as i32));
                         }
                     }
+                }
+                TileResult::WatchScan { present, mtimes } => {
+                    self.watch_running = false;
+                    // vanished region files: drop their tiles entirely so
+                    // they stop drawing (and stop requesting) like upstream
+                    // after a rescan removes them from the region set.
+                    let removed: Vec<i64> =
+                        self.regions.difference(&present).copied().collect();
+                    self.regions = present;
+                    for k in &removed {
+                        self.tiles.remove(k);
+                    }
+                    for (key, new_mt) in mtimes {
+                        let prev = self.region_mtimes.insert(key, new_mt);
+                        // first scan of a file only establishes the baseline;
+                        // an actual diff invalidates the region so it fully
+                        // re-renders (memory + disk caches + overlays).
+                        if prev.is_some() && prev != Some(new_mt) {
+                            self.invalidate_region(Point2i::from_long(key), true);
+                        }
+                    }
+                }
+                TileResult::StructureScan { entries, done } => {
+                    // routed to the dialog via the pending field — poll_tick
+                    // merges batches so the list grows while scanning.
+                    let slot = self.structure_scan.get_or_insert_with(|| (Vec::new(), false));
+                    slot.0.extend(entries);
+                    slot.1 |= done;
                 }
                 TileResult::Overlay { region, image, data } => {
                     // orphaned result (overlay switched/cleared while the
