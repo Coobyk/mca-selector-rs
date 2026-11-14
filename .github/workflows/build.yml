@@ -135,7 +135,7 @@ jobs:
           mkdir -p /tmp/bin-pkg
           sed -e "s/__PKGVER__/$PKGVER/" -e "s/__SHA256__/$SHA256/" \
               aur/bin/PKGBUILD.template > /tmp/bin-pkg/PKGBUILD
-          chmod -R a+rX /tmp/bin-pkg
+          chown -R builder:builder /tmp/bin-pkg
           su builder -c 'cd /tmp/bin-pkg && makepkg --printsrcinfo' > /tmp/bin-pkg/.SRCINFO
 
       - name: Publish to AUR
