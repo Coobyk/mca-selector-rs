@@ -19,6 +19,9 @@ pub enum OverlayType {
     BlockAmount,
     Path,
     Script,
+    SlimeChunks,
+    SkyLight,
+    BlockLight,
 }
 
 impl OverlayType {
@@ -35,14 +38,19 @@ impl OverlayType {
             Self::BlockAmount => "#Blocks",
             Self::Path => "Path",
             Self::Script => "Script",
+            Self::SlimeChunks => "SlimeChunks",
+            Self::SkyLight => "SkyLight",
+            Self::BlockLight => "BlockLight",
         }
     }
 
-    /// all overlay types in upstream OverlayType.values() order.
-    pub const VALUES: [OverlayType; 10] = [
+    /// all overlay types in upstream OverlayType.values() order
+    /// (SlimeChunks/SkyLight/BlockLight are extensions past upstream's 10).
+    pub const VALUES: [OverlayType; 13] = [
         Self::InhabitedTime, Self::Timestamp, Self::LastUpdate,
         Self::EntityAmount, Self::TileEntityAmount, Self::DataVersion,
         Self::AverageHeight, Self::BlockAmount, Self::Path, Self::Script,
+        Self::SlimeChunks, Self::SkyLight, Self::BlockLight,
     ];
 
     pub fn by_name(name: &str) -> Option<Self> {
@@ -241,6 +249,10 @@ impl Overlay {
                 self.path_value(d)
             }
             OverlayType::Script => 0,
+            // handled in region_overlay_data — needs chunk coords + world seed
+            OverlayType::SlimeChunks => 0,
+            OverlayType::SkyLight => surface_light(data, dv, false),
+            OverlayType::BlockLight => surface_light(data, dv, true),
         }
     }
 
@@ -293,14 +305,22 @@ impl Overlay {
 }
 
 /// OverlayPool: parse one value per chunk of a loaded region.
+/// `seed` is the world seed — needed only by SlimeChunks.
 pub fn region_overlay_data(
     m: &crate::mca::McaFile,
     ov: &Overlay,
     poi: Option<&crate::mca::McaFile>,
     entities: Option<&crate::mca::McaFile>,
+    seed: Option<i64>,
 ) -> [i32; 1024] {
     let mut out = [0i32; 1024];
     for (i, c) in m.chunks.iter().enumerate() {
+        if ov.typ == OverlayType::SlimeChunks {
+            let cx = m.location.x * 32 + (i % 32) as i32;
+            let cz = m.location.z * 32 + (i / 32) as i32;
+            out[i] = seed.map_or(0, |s| slime_chunk(s, cx, cz) as i32);
+            continue;
+        }
         let Some(c) = c else { continue };
         let Some(d) = &c.data else { continue };
         let pd = poi.and_then(|f| f.chunks[i].as_ref()).and_then(|ch| ch.data.as_ref());
@@ -311,10 +331,82 @@ pub fn region_overlay_data(
     out
 }
 
+/// Java's ChunkGenerator.isSlimeChunk: per-chunk LCG seeded from world
+/// seed + coords, `nextInt(10) == 0`.
+pub fn slime_chunk(world_seed: i64, cx: i32, cz: i32) -> bool {
+    let s = world_seed
+        .wrapping_add(cx.wrapping_mul(cx).wrapping_mul(4987142) as i64)
+        .wrapping_add(cx.wrapping_mul(5947611) as i64)
+        .wrapping_add((cz.wrapping_mul(cz) as i64).wrapping_mul(4392871))
+        .wrapping_add(cz.wrapping_mul(389711) as i64)
+        ^ 987234911i64;
+    let mut seed = (s ^ 0x5DEECE66D) & ((1i64 << 48) - 1);
+    let next31 = |seed: &mut i64| {
+        *seed = (seed.wrapping_mul(0x5DEECE66D).wrapping_add(0xB)) & ((1i64 << 48) - 1);
+        (*seed >> 17) as i32
+    };
+    // java.util.Random.nextInt(10): r = next(31), u = r % 10, rare reroll
+    let mut u = next31(&mut seed);
+    let mut r = u % 10;
+    while u - r + 9 < 0 {
+        u = next31(&mut seed);
+        r = u % 10;
+    }
+    r == 0
+}
+
+/// average light level (0..15) sampled at the air block just above each
+/// column's top non-air block — what mobs experience at the surface.
+fn surface_light(data: &Compound, dv: i32, block: bool) -> i32 {
+    let mut secs = sections_of(data, dv);
+    if secs.is_empty() {
+        return 0;
+    }
+    secs.sort_by(|a, b| b.y.cmp(&a.y));
+    let key = if block { "BlockLight" } else { "SkyLight" };
+    let nibble = |s: &Sec, idx: usize| -> i32 {
+        s.light(key)
+            .map(|a| ((a[idx >> 1] >> ((idx & 1) << 2)) & 0xF) as i32)
+            .unwrap_or(0)
+    };
+    let mut total = 0i64;
+    for cx in 0..16 {
+        'col: for cz in 0..16 {
+            for (si, s) in secs.iter().enumerate() {
+                for cy in (0..16).rev() {
+                    if !chunk::is_air_name(block_at(s, chunk::location_to_index(cx, cy, cz))) {
+                        if cy < 15 {
+                            total += nibble(s, chunk::location_to_index(cx, cy + 1, cz)) as i64;
+                        } else if let Some(above) = secs[..si].iter().find(|a| a.y == s.y + 1) {
+                            total += nibble(above, chunk::location_to_index(cx, 0, cz)) as i64;
+                        } else {
+                            // nothing above the topmost section: open sky or dark
+                            total += if block { 0 } else { 15 };
+                        }
+                        break 'col;
+                    }
+                }
+            }
+        }
+    }
+    (total / 256) as i32
+}
+
 struct Sec<'a> {
     y: i32,
     palette: Vec<&'a str>,
     data: PackedData<'a>,
+    sky_light: Option<&'a [u8]>,
+    block_light: Option<&'a [u8]>,
+}
+
+impl Sec<'_> {
+    fn light(&self, key: &str) -> Option<&[u8]> {
+        match key {
+            "SkyLight" => self.sky_light,
+            _ => self.block_light,
+        }
+    }
 }
 
 fn sections_of<'a>(data: &'a Compound, dv: i32) -> Vec<Sec<'a>> {
@@ -339,6 +431,8 @@ fn sections_of<'a>(data: &'a Compound, dv: i32) -> Vec<Sec<'a>> {
             y: s.get("Y").and_then(Tag::as_i64).map(|v| v as i32).unwrap_or(-1),
             palette,
             data: PackedData::block_states(PackedSrc::Raw(d), dv),
+            sky_light: s.get("SkyLight").and_then(Tag::as_bytes),
+            block_light: s.get("BlockLight").and_then(Tag::as_bytes),
         });
     }
     out
@@ -623,5 +717,45 @@ mod tests {
     fn invalid_min_max_rejected() {
         assert!(parse_overlay_line("DataVersion 100 0").is_err());
         assert!(parse_overlay_line("Bogus 0 10").is_err());
+    }
+
+    #[test]
+    fn slime_chunk_math() {
+        // deterministic + ~10% density per Java's ChunkGenerator.isSlimeChunk
+        let hits: usize = (0..200)
+            .flat_map(|x| (0..200).map(move |z| (x, z)))
+            .filter(|&(x, z)| slime_chunk(12345, x, z))
+            .count();
+        assert!((hits as f32 / 40000.0 - 0.1).abs() < 0.02, "density {hits}/40000");
+        // same inputs, same output; seed changes the pattern
+        assert_eq!(slime_chunk(0, 5, 5), slime_chunk(0, 5, 5));
+        assert_ne!(
+            (0..100).filter(|&x| slime_chunk(1, x, 0)).count(),
+            (0..100).filter(|&x| slime_chunk(2, x, 0)).count()
+        );
+        // far-away chunks work (Java int overflow semantics preserved)
+        let _ = slime_chunk(0, 30_000_000, -30_000_000);
+    }
+
+    #[test]
+    fn slime_chunk_config_roundtrip() {
+        let line = serialize_overlay_line(&{
+            let mut o = Overlay::new(OverlayType::SlimeChunks);
+            o.set_min_str("0");
+            o.set_max_str("1");
+            o.active = true;
+            o
+        });
+        let o = parse_config_line(&line).unwrap();
+        assert_eq!(o.typ, OverlayType::SlimeChunks);
+        assert_eq!((o.min, o.max), (Some(0), Some(1)));
+        assert!(o.active);
+    }
+
+    #[test]
+    fn light_overlay_names() {
+        assert_eq!(OverlayType::by_name("SlimeChunks"), Some(OverlayType::SlimeChunks));
+        assert_eq!(OverlayType::by_name("SkyLight"), Some(OverlayType::SkyLight));
+        assert_eq!(OverlayType::by_name("BlockLight"), Some(OverlayType::BlockLight));
     }
 }

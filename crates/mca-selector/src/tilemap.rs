@@ -873,6 +873,7 @@ impl TileMapState {
         let name = files::mca_file_name(region);
         let poi_path = ws.dirs.poi.clone().map(|d| d.join(&name));
         let ent_path = ws.dirs.entities.clone().map(|d| d.join(&name));
+        let seed = ws.seed;
         jobs::pools().add_process(Job::new(
             jobs::PRIORITY_MEDIUM,
             Some(Box::new(move || priority)),
@@ -890,7 +891,7 @@ impl TileMapState {
                         let poi = if ov.path_root == "poi" { load(poi_path) } else { None };
                         let ent = if ov.path_root == "entities" { load(ent_path) } else { None };
                         std::sync::Arc::new(mc_core::overlay::region_overlay_data(
-                            &m, &ov, poi.as_ref(), ent.as_ref(),
+                            &m, &ov, poi.as_ref(), ent.as_ref(), seed,
                         ))
                     });
                 let image = data.as_deref().map(|d| ov.image(d));

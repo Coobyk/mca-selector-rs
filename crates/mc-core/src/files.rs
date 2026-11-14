@@ -1,6 +1,7 @@
 //! Port of io.FileHelper + config directory resolution (Config.BASE_*).
 
 use crate::mca::WorldDirectories;
+use crate::nbt::{self, Tag};
 use crate::point::Point2i;
 use std::path::{Path, PathBuf};
 
@@ -194,6 +195,31 @@ fn detect_datapack_dimensions(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) 
             detect_datapack_dimensions(&p, depth + 1, out);
         }
     }
+}
+
+/// World seed from the nearest level.dat (walk up from the region dir —
+/// dim dirs sit at world/dimensions/ns/name, plain saves at world/).
+/// Modern layout: Data.WorldGenSettings.seed; pre-1.16: Data.RandomSeed.
+pub fn world_seed(region_dir: &Path) -> Option<i64> {
+    for dir in region_dir.ancestors().take(6) {
+        let p = dir.join("level.dat");
+        if !p.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(&p).ok()?;
+        let root = nbt::read_compressed(&bytes)?;
+        let data = root.get("Data").and_then(Tag::as_compound);
+        if let Some(wgs) = data
+            .and_then(|d| d.get("WorldGenSettings"))
+            .and_then(Tag::as_compound)
+        {
+            if let Some(s) = wgs.get("seed").and_then(Tag::as_i64) {
+                return Some(s);
+            }
+        }
+        return data.and_then(|d| d.get("RandomSeed")).and_then(Tag::as_i64);
+    }
+    None
 }
 
 /// scan region dir for r.*.mca files > header size -> region coords set.

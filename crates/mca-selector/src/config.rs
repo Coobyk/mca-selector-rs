@@ -224,6 +224,8 @@ pub struct WorldState {
     pub uuid: String,
     pub cache_dir: PathBuf,
     pub cfg: WorldConfig,
+    /// level.dat world seed — needed by the SlimeChunks overlay.
+    pub seed: Option<i64>,
 }
 
 impl WorldState {
@@ -281,12 +283,14 @@ pub fn open_world(dirs: mc_core::mca::WorldDirectories, dimensions: Vec<PathBuf>
     let cache_dir = files::world_cache_dir(&region_dir);
     let uuid = files::world_uuid(&region_dir);
     let cfg = WorldConfig::load(&cache_dir);
+    let seed = files::world_seed(&region_dir);
     let ws = WorldState {
         dirs,
         dimensions,
         uuid,
         cache_dir,
         cfg,
+        seed,
     };
     set_world(Some(ws.clone()));
     ws
