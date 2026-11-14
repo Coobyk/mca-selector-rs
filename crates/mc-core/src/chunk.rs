@@ -221,6 +221,60 @@ pub fn structure_starts(data: &Compound) -> Vec<String> {
     names
 }
 
+/// Structure starts with bounding boxes: `structures.starts.<id>.BB`
+/// (modern) and `Level.Structures.Starts.<id>.BB` (legacy) — an IntArray of
+/// [minX, minY, minZ, maxX, maxY, maxZ] in absolute block coords. Returns
+/// (structure name, BB) pairs; a start lives in exactly one chunk, so
+/// collecting per-region yields each box once.
+pub fn structure_boxes(data: &Compound) -> Vec<(String, [i32; 6])> {
+    fn bb(c: &Compound) -> Option<[i32; 6]> {
+        let Tag::IntArray(a) = c.get("BB")? else { return None };
+        if a.len() == 6 {
+            Some([a[0], a[1], a[2], a[3], a[4], a[5]])
+        } else {
+            None
+        }
+    }
+    let mut out: Vec<(String, [i32; 6])> = Vec::new();
+    if let Some(starts) = data
+        .get("structures")
+        .and_then(Tag::as_compound)
+        .and_then(|st| st.get("starts"))
+        .and_then(Tag::as_compound)
+    {
+        for (name, tag) in starts {
+            let Some(b) = tag.as_compound().and_then(bb) else { continue };
+            let name = name.strip_prefix("minecraft:").unwrap_or(name);
+            out.push((name.to_string(), b));
+        }
+    }
+    let level = data
+        .get("Level")
+        .or_else(|| data.get("region"))
+        .and_then(Tag::as_compound)
+        .or(Some(data));
+    if let Some(starts) = level
+        .and_then(|l| l.get("Structures"))
+        .and_then(Tag::as_compound)
+        .and_then(|st| st.get("Starts"))
+        .and_then(Tag::as_compound)
+    {
+        for c in starts.values().filter_map(Tag::as_compound) {
+            if c.len() <= 1 {
+                continue;
+            }
+            let (Some(id), Some(b)) = (c.get("id").and_then(Tag::as_string), bb(c)) else {
+                continue;
+            };
+            let id = id.trim_start_matches("minecraft:");
+            if !out.iter().any(|(n, _)| n == id) {
+                out.push((id.to_string(), b));
+            }
+        }
+    }
+    out
+}
+
 // ---- palette entry names --------------------------------------------
 
 /// Palette-entry block name: `""` then `"id"` for the 26.3 layout

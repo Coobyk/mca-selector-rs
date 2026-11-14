@@ -425,6 +425,47 @@ impl MainView {
         }
     }
 
+    /// double-click / enter on a row: containers toggle, leaves open the
+    /// value editor (same semantics as the "enter"/"e" key path).
+    pub(crate) fn nbt_row_activate(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(Dialog::NbtEditor { tab, tabs, editing, buf, .. }) = &mut self.dialog else {
+            return;
+        };
+        let t = &mut tabs[*tab];
+        let Some(root) = t.root.as_mut() else { return };
+        let rows = flatten(root, &t.expanded);
+        t.sel = idx.min(rows.len().saturating_sub(1));
+        let Some(r) = rows.get(t.sel) else { return };
+        if r.container {
+            if r.expanded {
+                t.expanded.remove(&r.path);
+            } else {
+                t.expanded.insert(r.path.clone());
+            }
+        } else {
+            *editing = NbtEdit::Value;
+            *buf = mc_core::nbt::path_get(root, &r.path)
+                .map(tag_edit_text)
+                .unwrap_or_default();
+        }
+        cx.notify();
+    }
+
+    /// wheel-scroll inside the row list — moves the viewport, not the
+    /// selection (JScrollPane semantics).
+    pub(crate) fn nbt_scroll(&mut self, delta_rows: i64, cx: &mut Context<Self>) {
+        let Some(Dialog::NbtEditor { tab, tabs, .. }) = &mut self.dialog else {
+            return;
+        };
+        let t = &mut tabs[*tab];
+        let n = t.root.as_ref()
+            .map(|r| flatten(r, &t.expanded).len())
+            .unwrap_or(0);
+        let max = n.saturating_sub(22) as i64;
+        t.scroll = (t.scroll as i64 + delta_rows).clamp(0, max.max(0)) as usize;
+        cx.notify();
+    }
+
     /// Tools > Edit chunk (upstream editNBT): needs exactly 1 selected chunk.
     pub(crate) fn edit_nbt(&mut self, cx: &mut Context<Self>) {
         let sel = &self.map.selection;
@@ -478,7 +519,7 @@ impl MainView {
                     for k in d.keys() {
                         expanded.insert(k.clone());
                     }
-                    NbtTab { root: Some(d), expanded, sel: 0, dirty: false, note: None }
+                    NbtTab { root: Some(d), expanded, sel: 0, scroll: 0, dirty: false, note: None }
                 }
                 None => match dir {
                     None => NbtTab::missing("no region file"),
@@ -498,7 +539,7 @@ impl MainView {
                                 for k in d.keys() {
                                     expanded.insert(k.clone());
                                 }
-                                NbtTab { root: Some(d), expanded, sel: 0, dirty: false, note: None }
+                                NbtTab { root: Some(d), expanded, sel: 0, scroll: 0, dirty: false, note: None }
                             }
                             None if p.exists() => NbtTab::missing("no chunk data found"),
                             _ => NbtTab::missing("region file does not exist"),

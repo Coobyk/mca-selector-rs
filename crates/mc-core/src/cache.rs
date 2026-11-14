@@ -76,14 +76,25 @@ pub fn set_chunks(world_uuid: &str, r: Point2i, cs: &ChunkSet) {
     let _ = write(&meta_path(world_uuid, "chunks", r), &cs.to_bytes());
 }
 
-// -- structures (chunk-asLong -> structure names) --------------------------------
+// -- structures (chunk-asLong -> structure names, plus bounding boxes) ----------
 
-pub fn get_structures(world_uuid: &str, r: Point2i) -> Option<HashMap<i64, Vec<String>>> {
+/// per-region structure data: `chunks` maps chunk-asLong -> start names for
+/// the icon pass; `boxes` carries each start's BB for the box overlay and
+/// the find-structure locator. Old caches (bare chunk map) fail to parse —
+/// treated as a miss and re-derived.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct StructuresData {
+    pub chunks: HashMap<i64, Vec<String>>,
+    /// (structure name, [minX, minY, minZ, maxX, maxY, maxZ] block coords)
+    pub boxes: Vec<(String, [i32; 6])>,
+}
+
+pub fn get_structures(world_uuid: &str, r: Point2i) -> Option<StructuresData> {
     let text = std::fs::read_to_string(meta_path(world_uuid, "structures", r)).ok()?;
     serde_json::from_str(&text).ok()
 }
 
-pub fn set_structures(world_uuid: &str, r: Point2i, s: &HashMap<i64, Vec<String>>) {
+pub fn set_structures(world_uuid: &str, r: Point2i, s: &StructuresData) {
     if let Ok(j) = serde_json::to_string(s) {
         let _ = write(&meta_path(world_uuid, "structures", r), j.as_bytes());
     }

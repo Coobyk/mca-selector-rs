@@ -69,7 +69,7 @@ pub struct Tile {
     pub loaded: bool,
     pub overlay_data: Option<std::sync::Arc<[i32; 1024]>>,
     pub overlay_loaded: bool,
-    pub structures: Option<HashMap<i64, Vec<String>>>,
+    pub structures: Option<cache::StructuresData>,
     /// structure disk-cache lookup was already attempted for this image
     pub structures_checked: bool,
     /// gpu-ready image, built when the argb result lands
@@ -104,7 +104,7 @@ impl Tile {
 /// Async results channel: worker -> UI.
 /// bump when the renderer's pixel output changes — forces every cached
 /// PNG/LOD image to be treated as stale and re-rendered once.
-const RENDER_CACHE_VERSION: i64 = 9;
+const RENDER_CACHE_VERSION: i64 = 10;
 
 /// fingerprint of everything that changes a tile's pixels. keyed caches
 /// (disk PNGs, meta) are invalidated by comparing this.
@@ -144,7 +144,7 @@ pub enum TileResult {
         /// only sent on a worker-side render failure (bad mca file).
         image: Option<TileImage>,
         zoom: i32,
-        structures: Option<HashMap<i64, Vec<String>>>,
+        structures: Option<cache::StructuresData>,
         /// render_hash the producing job was enqueued with — results carry
         /// their own provenance so the UI can drop stale/orphaned images
         /// even after `loading` was cleared and re-populated.
@@ -166,7 +166,7 @@ pub enum TileResult {
     /// image (was a UI-side file read per tile per invalidation).
     Structures {
         region: Point2i,
-        structures: Option<HashMap<i64, Vec<String>>>,
+        structures: Option<cache::StructuresData>,
     },
     /// far-zoom chunk-presence placeholder (sent before the real render)
     Presence {

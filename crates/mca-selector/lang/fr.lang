@@ -54,7 +54,7 @@ menu.tools.next_overlay=Calque suivant
 menu.tools.next_overlay_type=Type de calque suivant
 menu.tools.sum_selection=Somme de la sélection
 
-menu.about.about=À propos de MCA Selector
+menu.about.about=À propos de mca-selector-rs
 
 dialog.ok=OK
 dialog.cancel=Annuler
@@ -75,7 +75,7 @@ dialog.title.import_chunks=Importer des chunks
 dialog.title.filter_chunks=Filtrer les chunks
 dialog.title.change_fields=Modifier le NBT
 dialog.title.error=Erreur
-dialog.title.about=À propos de MCA Selector
+dialog.title.about=À propos de mca-selector-rs
 dialog.title.select_dimension=Sélectionner une dimension
 dialog.title.are_you_sure=Êtes-vous sûr ?
 dialog.title.edit_overlays=Modifier les calques

@@ -54,7 +54,7 @@ menu.tools.next_overlay=次のオーバーレイ
 menu.tools.next_overlay_type=次のオーバーレイタイプ
 menu.tools.sum_selection=選択を集計
 
-menu.about.about=MCA Selector について
+menu.about.about=mca-selector-rs について
 
 dialog.ok=OK
 dialog.cancel=キャンセル
@@ -75,7 +75,7 @@ dialog.title.import_chunks=チャンクをインポート
 dialog.title.filter_chunks=チャンクをフィルター
 dialog.title.change_fields=NBT を変更
 dialog.title.error=エラー
-dialog.title.about=MCA Selector について
+dialog.title.about=mca-selector-rs について
 dialog.title.select_dimension=ディメンションを選択
 dialog.title.are_you_sure=よろしいですか？
 dialog.title.edit_overlays=オーバーレイを編集

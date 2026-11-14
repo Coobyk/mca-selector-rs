@@ -54,7 +54,7 @@ menu.tools.next_overlay=下一个叠加层
 menu.tools.next_overlay_type=下一种叠加类型
 menu.tools.sum_selection=统计选区
 
-menu.about.about=关于 MCA Selector
+menu.about.about=关于 mca-selector-rs
 
 dialog.ok=确定
 dialog.cancel=取消
@@ -75,7 +75,7 @@ dialog.title.import_chunks=导入区块
 dialog.title.filter_chunks=过滤区块
 dialog.title.change_fields=修改 NBT
 dialog.title.error=错误
-dialog.title.about=关于 MCA Selector
+dialog.title.about=关于 mca-selector-rs
 dialog.title.select_dimension=选择维度
 dialog.title.are_you_sure=确定吗？
 dialog.title.edit_overlays=编辑叠加层

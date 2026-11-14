@@ -54,7 +54,7 @@ menu.tools.next_overlay=Siguiente capa
 menu.tools.next_overlay_type=Siguiente tipo de capa
 menu.tools.sum_selection=Sumar selección
 
-menu.about.about=Acerca de MCA Selector
+menu.about.about=Acerca de mca-selector-rs
 
 dialog.ok=Aceptar
 dialog.cancel=Cancelar
@@ -75,7 +75,7 @@ dialog.title.import_chunks=Importar chunks
 dialog.title.filter_chunks=Filtrar chunks
 dialog.title.change_fields=Cambiar NBT
 dialog.title.error=Error
-dialog.title.about=Acerca de MCA Selector
+dialog.title.about=Acerca de mca-selector-rs
 dialog.title.select_dimension=Seleccionar dimensión
 dialog.title.are_you_sure=¿Estás seguro?
 dialog.title.edit_overlays=Editar capas

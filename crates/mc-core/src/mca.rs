@@ -789,16 +789,17 @@ impl McaFile {
     /// RegionMCAFile.getStructures: chunk -> structure names via
     /// `chunk::structure_starts` (upstream ChunkFilter.parseStructureStarts;
     /// references + POI are upstream-cached separately).
-    pub fn structures(&self) -> std::collections::HashMap<i64, Vec<String>> {
-        let mut map = std::collections::HashMap::new();
+    pub fn structures(&self) -> crate::cache::StructuresData {
+        let mut out = crate::cache::StructuresData::default();
         for chunk in self.chunks.iter().flatten() {
             let Some(data) = &chunk.data else { continue };
             let names = crate::chunk::structure_starts(data);
             if !names.is_empty() {
-                map.insert(chunk.absolute_location.as_long(), names);
+                out.chunks.insert(chunk.absolute_location.as_long(), names);
             }
+            out.boxes.extend(crate::chunk::structure_boxes(data));
         }
-        map
+        out
     }
 }
 

@@ -31,6 +31,10 @@ pub struct NbtTab {
     pub root: Option<mc_core::nbt::Compound>,
     pub expanded: std::collections::HashSet<String>,
     pub sel: usize,
+    /// first visible row index — the viewport keeps `sel` inside it and
+    /// mouse-wheel scrolling moves it (JTree scrolls independently of the
+    /// selection).
+    pub scroll: usize,
     pub dirty: bool,
     /// why there is nothing to edit ("region file does not exist" /
     /// "no chunk data found", matching upstream placeholders)
@@ -43,6 +47,7 @@ impl NbtTab {
             root: None,
             expanded: std::collections::HashSet::new(),
             sel: 0,
+            scroll: 0,
             dirty: false,
             note: Some(note.to_string()),
         }
@@ -629,8 +634,9 @@ impl MainView {
                     .child(text_el(crate::lang::t("dialog.title.about"), 16.))
                     .child(text_el(concat!("Version: ", env!("CARGO_PKG_VERSION"), " (Rust + GPUI port)"), 12.))
                     .child(text_el("License: MIT", 12.))
-                    .child(text_el("Copyright: © Querz", 12.))
-                    .child(text_el("Source: https://github.com/Querz/mcaselector", 12.))
+                    .child(text_el("Copyright: © Coobyk", 12.))
+                    .child(text_el("Rust rewrite based on MCA Selector by Querz", 12.))
+                    .child(text_el("Source: https://github.com/Coobyk/mca-selector-rs", 12.))
                     .child(text_el("NOT AN OFFICIAL MINECRAFT PRODUCT. NOT APPROVED BY OR ASSOCIATED WITH MOJANG OR MICROSOFT.", 10.))
                     .child(button(crate::lang::t("dialog.close"), cx, |v, _w, cx| {
                         v.dialog = None;
@@ -859,15 +865,23 @@ impl MainView {
                     ));
                 }
                 let t_sel = t.sel;
+                let t_scroll = t.scroll;
                 let rows = t.root.as_ref()
                     .map(|r| crate::nbt_editor::flatten(r, &t.expanded))
                     .unwrap_or_default();
                 let n = rows.len();
                 let vis = 22usize;
-                let start = if t_sel >= vis { t_sel + 1 - vis } else { 0 };
+                // viewport follows the selection, clamped to the row range —
+                // wheel scroll changes t.scroll via nbt_scroll.
+                let max_start = n.saturating_sub(vis);
+                let start = t_scroll.min(max_start)
+                    .min(t_sel)
+                    .max(t_sel.saturating_sub(vis - 1))
+                    .min(max_start);
                 let end = (start + vis).min(n);
                 let mut list = v_flex()
                     .h(px(vis as f32 * 20.))
+                    .flex_grow()
                     .overflow_hidden()
                     .gap(px(1.));
                 for (i, r) in rows[start..end].iter().enumerate() {
@@ -881,16 +895,47 @@ impl MainView {
                         .pl(px(4. + indent))
                         .h(px(20.))
                         .text_size(px(12.))
+                        .cursor_pointer()
                         .bg(if selected { rgb(0x3a5a8a) } else { rgba(0x00000000) })
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |v, _e: &MouseDownEvent, _w, cx| {
+                        .on_mouse_down(MouseButton::Left, cx.listener(move |v, e: &MouseDownEvent, _w, cx| {
                             cx.stop_propagation();
+                            if e.click_count >= 2 {
+                                // double-click: expand/collapse containers,
+                                // open the value editor on leaves
+                                v.nbt_row_activate(idx, cx);
+                                return;
+                            }
                             if let Some(Dialog::NbtEditor { tab, tabs, .. }) = &mut v.dialog {
                                 tabs[*tab].sel = idx;
                             }
                             cx.notify();
                         }));
                     if r.container {
-                        row = row.child(text_el(if r.expanded { "▾ " } else { "▸ " }, 11.));
+                        // the twist arrow toggles on its own click (JTree
+                        // expand handle) — stop propagation so it doesn't
+                        // also select/double-click the row.
+                        let path = r.path.clone();
+                        let was_open = r.expanded;
+                        row = row.child(
+                            div()
+                                .id(("twist", idx))
+                                .w(px(14.))
+                                .cursor_pointer()
+                                .child(text_el(if was_open { "▾" } else { "▸" }, 11.))
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |v, _e: &MouseDownEvent, _w, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(Dialog::NbtEditor { tab, tabs, .. }) = &mut v.dialog {
+                                        let t = &mut tabs[*tab];
+                                        t.sel = idx;
+                                        if was_open {
+                                            t.expanded.remove(&path);
+                                        } else {
+                                            t.expanded.insert(path.clone());
+                                        }
+                                    }
+                                    cx.notify();
+                                })),
+                        );
                     } else {
                         row = row.child(text_el("  ", 11.));
                     }
@@ -916,6 +961,42 @@ impl MainView {
                     );
                     list = list.child(row);
                 }
+                // scrollbar track + proportional thumb (pure decoration —
+                // the wheel handler and selection drive `scroll`).
+                let list = {
+                    let thumb = if n > vis {
+                        let track = vis as f32 * 20.0;
+                        let h = (track * vis as f32 / n as f32).max(16.0);
+                        let top = (track - h) * start as f32 / max_start.max(1) as f32;
+                        div()
+                            .absolute()
+                            .top(px(top))
+                            .right(px(1.))
+                            .w(px(5.))
+                            .h(px(h))
+                            .bg(rgb(0x5a5a5a))
+                            .rounded_sm()
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    };
+                    div()
+                        .id("nbt-rows-scroll")
+                        .relative()
+                        .h(px(vis as f32 * 20.))
+                        .on_scroll_wheel(cx.listener(|v, e: &ScrollWheelEvent, _w, cx| {
+                            cx.stop_propagation();
+                            let dy = match e.delta {
+                                ScrollDelta::Lines(l) => l.y,
+                                ScrollDelta::Pixels(p) => f32::from(p.y) / 20.0,
+                            };
+                            // wheel up (dy>0) scrolls toward row 0
+                            v.nbt_scroll(-(dy.round() as i64), cx);
+                        }))
+                        .child(list)
+                        .child(thumb)
+                        .into_any_element()
+                };
                 let edit_line = if *editing != NbtEdit::None {
                     let hint = match editing {
                         NbtEdit::Value => "value (snbt)",
@@ -1551,10 +1632,21 @@ impl MainView {
                         Some(s)
                     });
                     if let Some(map) = found {
-                        for (chunk_long, names) in map {
+                        for (chunk_long, names) in &map.chunks {
                             for name in names {
-                                batch.push((name, chunk_long));
+                                batch.push((name.clone(), *chunk_long));
                             }
+                        }
+                        // bounding boxes give the locator exact centers —
+                        // pushed alongside the chunk entries so starts
+                        // without a BB still appear via the chunk map.
+                        for (name, bb) in &map.boxes {
+                            let cx = (bb[0] + bb[3]) / 2 >> 4;
+                            let cz = (bb[2] + bb[5]) / 2 >> 4;
+                            batch.push((
+                                name.clone(),
+                                mc_core::point::Point2i::new(cx, cz).as_long(),
+                            ));
                         }
                     }
                     // stream every ~8 regions so the dialog fills live

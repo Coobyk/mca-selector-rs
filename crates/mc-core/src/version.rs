@@ -1002,6 +1002,10 @@ pub struct RenderOut<'a> {
     pub terrain_heights: &'a mut [i16],
     pub water_heights: Option<&'a mut [i16]>,
     pub water: bool,
+    /// RenderSettings.shade == false: no overlay merge at all — every
+    /// translucent block (water/leaves/glass) renders its own flat color
+    /// as the surface pixel, matching upstream's flat unshaded render.
+    pub flat: bool,
     pub height: i32,
     /// nether-style "cave dimension": scan past the ceiling and render the
     /// first floor below open space (Xaero caveModeType==2 semantics).
@@ -1325,11 +1329,15 @@ fn draw_chunk_xaero(
                             continue;
                         }
                         let y_abs = s.section_height + cy;
-                        if e.xflags & X_OVERLAY != 0 {
+                        // overlay merge only when shading is on; a water
+                        // overlay additionally needs shade_water — "water:
+                        // off" renders the water surface opaque + flat, and
+                        // "shade: off" renders every translucent block flat.
+                        let water_ov = e.xflags & X_WATER != 0;
+                        if e.xflags & X_OVERLAY != 0 && !out.flat && (out.water || !water_ov) {
                             if top_h == i32::MIN {
                                 top_h = y_abs;
                             }
-                            let water_ov = e.xflags & X_WATER != 0;
                             // water variants merge into the shared fluid
                             // overlay — depth must cover the whole column
                             // for the coverage curve to see it.
@@ -1380,7 +1388,7 @@ fn draw_chunk_xaero(
                             }
                             continue;
                         }
-                        if e.flags & F_WATERLOGGED != 0 {
+                        if e.flags & F_WATERLOGGED != 0 && !out.flat && out.water {
                             // contained fluid renders as a water overlay
                             // first (Xaero processes fluidState before the
                             // block itself)

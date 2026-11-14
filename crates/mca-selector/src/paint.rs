@@ -259,11 +259,73 @@ impl MainView {
                         paint_structure_icons(
                             &mut self.icon_cache,
                             &self.map,
-                            st,
+                            &st.chunks,
                             &g.structure_icons,
                             icon_size_cfg,
                             scale,
                             window,
+                        );
+                    }
+                }
+                // bounding boxes + name labels: each start's BB is stored on
+                // its region's structure payload (exactly one tile owns it).
+                // Boxes can span tiles, so they draw in canvas space.
+                let ts = window.text_system().clone();
+                let run = [TextRun {
+                    len: usize::MAX,
+                    font: Font {
+                        family: "Sans".into(),
+                        features: FontFeatures::default(),
+                        weight: FontWeight::NORMAL,
+                        style: FontStyle::Normal,
+                        fallbacks: None,
+                    },
+                    color: argb(STRUCTURE_BOX_COLOR).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }];
+                for &(_, _, key) in self.visible_tiles_buf.iter() {
+                    let Some(st) = self.map.tiles.get(&key).and_then(|t| t.structures.as_ref()) else {
+                        continue;
+                    };
+                    for (name, bb) in &st.boxes {
+                        let x0 = (bb[0] as f32 - self.map.offset.x) / scale;
+                        let z0 = (bb[2] as f32 - self.map.offset.z) / scale;
+                        let x1 = (bb[3] as f32 + 1.0 - self.map.offset.x) / scale;
+                        let z1 = (bb[5] as f32 + 1.0 - self.map.offset.z) / scale;
+                        let w = x1 - x0;
+                        let h = z1 - z0;
+                        if w <= 0.0 || h <= 0.0 || x1 < 0.0 || z1 < 0.0
+                            || x0 > self.map.width || z0 > self.map.height
+                        {
+                            continue;
+                        }
+                        let quad = |x: f32, y: f32, w: f32, h: f32| {
+                            fill(
+                                Bounds {
+                                    origin: bounds.origin + point(px(x), px(y)),
+                                    size: size(px(w.max(1.0)), px(h.max(1.0))),
+                                },
+                                argb(STRUCTURE_BOX_COLOR),
+                            )
+                        };
+                        window.paint_quad(quad(x0, z0, w, 1.0));
+                        window.paint_quad(quad(x0, z1 - 1.0, w, 1.0));
+                        window.paint_quad(quad(x0, z0, 1.0, h));
+                        window.paint_quad(quad(x1 - 1.0, z0, 1.0, h));
+                        // display name above the box's top-left corner
+                        let label = mc_core::structures::structures()
+                            .icons
+                            .get(&format!("minecraft:{name}"))
+                            .map(|d| d.display.clone())
+                            .unwrap_or_else(|| name.clone());
+                        let line = ts.shape_line(SharedString::from(label), px(11.), &run, None);
+                        let _ = line.paint(
+                            window.element_offset() + point(px(x0 + 2.0), px(z0 - 13.0)),
+                            px(13.),
+                            window,
+                            _cx,
                         );
                     }
                 }
@@ -472,6 +534,10 @@ impl MainView {
         }
     }
 }
+
+/// structure bounding-box outline + label color (gold — readable over both
+/// terrain and the dark void, distinct from selection orange).
+const STRUCTURE_BOX_COLOR: u32 = 0xFFFFD700;
 
 /// paint one coordinate label, reusing the cached ShapedLine when the same
 /// coordinate was shaped before. `text` runs only on a cache miss.

@@ -54,7 +54,7 @@ menu.tools.next_overlay=Следующий оверлей
 menu.tools.next_overlay_type=Следующий тип оверлея
 menu.tools.sum_selection=Сумма выделения
 
-menu.about.about=О MCA Selector
+menu.about.about=О mca-selector-rs
 
 dialog.ok=ОК
 dialog.cancel=Отмена
@@ -75,7 +75,7 @@ dialog.title.import_chunks=Импорт чанков
 dialog.title.filter_chunks=Фильтр чанков
 dialog.title.change_fields=Изменить NBT
 dialog.title.error=Ошибка
-dialog.title.about=О MCA Selector
+dialog.title.about=О mca-selector-rs
 dialog.title.select_dimension=Выбрать измерение
 dialog.title.are_you_sure=Вы уверены?
 dialog.title.edit_overlays=Править оверлеи

@@ -54,7 +54,7 @@ menu.tools.next_overlay=Nächstes Overlay
 menu.tools.next_overlay_type=Nächster Overlay-Typ
 menu.tools.sum_selection=Auswahl summieren
 
-menu.about.about=Über MCA Selector
+menu.about.about=Über mca-selector-rs
 
 dialog.ok=OK
 dialog.cancel=Abbrechen
@@ -75,7 +75,7 @@ dialog.title.import_chunks=Chunks importieren
 dialog.title.filter_chunks=Chunks filtern
 dialog.title.change_fields=NBT ändern
 dialog.title.error=Fehler
-dialog.title.about=Über MCA Selector
+dialog.title.about=Über mca-selector-rs
 dialog.title.select_dimension=Dimension auswählen
 dialog.title.are_you_sure=Sind Sie sicher?
 dialog.title.edit_overlays=Overlays bearbeiten

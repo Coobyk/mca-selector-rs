@@ -360,6 +360,7 @@ fn draw_one(
             terrain_heights: &mut *terrain_heights,
             water_heights: water_heights.as_deref_mut(),
             water: cfg.shade && cfg.shade_water,
+            flat: !cfg.shade,
             height: cfg.render_height,
             full_cave: cfg.dim == DimKind::Nether,
             xaero: false,
@@ -451,20 +452,15 @@ fn shade(
                     let ratio = 0.5 - 0.5 / 40.0 * (hrow[x] - trow[x]) as f32;
                     prow[x] = blend(prow[x], wrow[x], ratio);
                 } else {
-                    let z_shade = if z == 0 {
-                        hdn[x] - hrow[x]
-                    } else if z == size - 1 {
-                        hrow[x] - hup[x]
-                    } else {
-                        (hdn[x] - hup[x]) * 2
-                    };
-                    let x_shade = if x == 0 {
-                        hrow[1] - hrow[0]
-                    } else if x == size - 1 {
-                        hrow[x] - hrow[x - 1]
-                    } else {
-                        (hrow[x + 1] - hrow[x - 1]) * 2
-                    };
+                    // edge-clamped sampling: out-of-tile neighbors replicate
+                    // the border pixel, so tile edges use the same centered
+                    // diff as the interior (flat at the seam). One-sided
+                    // edge diffs ran at half amplitude and drew a visible
+                    // 512px grid between independently rendered regions.
+                    let z_shade = (hdn[x] - hup[x]) * 2;
+                    let hl = if x == 0 { hrow[0] } else { hrow[x - 1] };
+                    let hr = if x == size - 1 { hrow[x] } else { hrow[x + 1] };
+                    let x_shade = (hr - hl) * 2;
                     let mut shade = (x_shade + z_shade) as f32;
                     shade = shade.clamp(-8.0, 8.0);
                     let mut alt = (hrow[x] - 64) as f32 * altitude_multiplier;
@@ -557,14 +553,23 @@ fn xaero_shade(
                     bb *= depth;
                 }
                 if cfg.shade {
-                    // slopeUnknown when a neighbor pixel is empty (or at a
-                    // tile edge) — Xaero leaves those unshaded.
-                    let (vs, ds, known) = if z > 0 && x > 0 && hup[x] != 0 && hup[x - 1] != 0 {
-                        (
-                            h - hup[x] as f32,
-                            h - hup[x - 1] as f32,
-                            true,
-                        )
+                    // edge-clamped sampling: the N/NW neighbor outside the
+                    // tile replicates the border pixel (flat slope), so the
+                    // ambient term still applies — leaving edge pixels
+                    // unshaded made a brighter 1px line per region (the
+                    // visible "region grid"). Empty neighbors stay unshaded.
+                    let hn = if z == 0 { h } else { hup[x] as f32 };
+                    let hnw = if z == 0 && x == 0 {
+                        h
+                    } else if z == 0 {
+                        hrow[x - 1] as f32
+                    } else if x == 0 {
+                        hup[x] as f32
+                    } else {
+                        hup[x - 1] as f32
+                    };
+                    let (vs, ds, known) = if hn != 0.0 && hnw != 0.0 {
+                        (h - hn, h - hnw, true)
                     } else {
                         (0.0, 0.0, false)
                     };

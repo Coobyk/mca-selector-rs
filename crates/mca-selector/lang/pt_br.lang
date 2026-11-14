@@ -54,7 +54,7 @@ menu.tools.next_overlay=Próxima sobreposição
 menu.tools.next_overlay_type=Próximo tipo de sobreposição
 menu.tools.sum_selection=Somar seleção
 
-menu.about.about=Sobre o MCA Selector
+menu.about.about=Sobre o mca-selector-rs
 
 dialog.ok=OK
 dialog.cancel=Cancelar
@@ -75,7 +75,7 @@ dialog.title.import_chunks=Importar chunks
 dialog.title.filter_chunks=Filtrar chunks
 dialog.title.change_fields=Alterar NBT
 dialog.title.error=Erro
-dialog.title.about=Sobre o MCA Selector
+dialog.title.about=Sobre o mca-selector-rs
 dialog.title.select_dimension=Selecionar dimensão
 dialog.title.are_you_sure=Tem certeza?
 dialog.title.edit_overlays=Editar sobreposições

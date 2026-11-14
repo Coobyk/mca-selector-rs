@@ -37,7 +37,7 @@ impl MainView {
                     .tiles
                     .get(&r.as_long())
                     .and_then(|t| t.structures.as_ref())
-                    .and_then(|m| m.get(&c.as_long()))
+                    .and_then(|m| m.chunks.get(&c.as_long()))
                     .filter(|names| !names.is_empty())
                     .map(|names| (names[0].clone(), names.len() > 1))
             })

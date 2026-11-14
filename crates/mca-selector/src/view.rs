@@ -252,7 +252,10 @@ impl Render for MainView {
 
         div()
             .id("root")
-            .key_context("app")
+            // every KeyBinding requires context "app" — an open dialog swaps
+            // the context so typing in a filter/input can't fire map
+            // shortcuts (e opened RenderSettings mid-search).
+            .key_context(if self.dialog.is_some() { "dialog" } else { "app" })
             .track_focus(&self.focus)
             .size_full()
             .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, _w, _cx| {
