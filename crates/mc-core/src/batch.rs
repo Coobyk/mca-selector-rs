@@ -24,6 +24,9 @@ pub struct RegionFiles {
     pub poi: Option<McaFile>,
     pub entities: Option<McaFile>,
     dirty: u8,
+    /// backup stamp for this batch — save_dirty snapshots every file it
+    /// is about to overwrite into mca-selector-backups/<stamp>/.
+    pub backup_stamp: Option<String>,
 }
 
 impl RegionFiles {
@@ -41,6 +44,7 @@ impl RegionFiles {
             poi: one(&dirs.poi, &name, raw),
             entities: one(&dirs.entities, &name, raw),
             dirty: 0,
+            backup_stamp: None,
         }
     }
 
@@ -66,6 +70,9 @@ impl RegionFiles {
             }
             if let Some(m) = f {
                 let path = m.file.clone();
+                if let Some(st) = &self.backup_stamp {
+                    crate::files::backup_file(&path, st);
+                }
                 match m.save_with_temp_file(&path) {
                     Ok(true) => written += 1,
                     Ok(false) => {}
@@ -143,6 +150,7 @@ fn run_one<F>(
     sel: &Selection,
     region: Point2i,
     raw: bool,
+    stamp: Option<&str>,
     sum: &mut RegionJobSummary,
     body: &mut F,
 ) -> bool
@@ -153,6 +161,7 @@ where
     if files.region.is_none() && files.poi.is_none() && files.entities.is_none() {
         return false;
     }
+    files.backup_stamp = stamp.map(str::to_string);
     let ctx = RegionJobCtx {
         region,
         selection: sel,
@@ -182,8 +191,9 @@ where
         processed: 0,
         errors: Vec::new(),
     };
+    let stamp = crate::files::backup_stamp();
     for region in regions {
-        run_one(dirs, sel, region, raw, &mut sum, &mut body);
+        run_one(dirs, sel, region, raw, Some(&stamp), &mut sum, &mut body);
     }
     sum
 }
@@ -209,13 +219,14 @@ pub fn spawn_region_job<F>(
             processed: 0,
             errors: Vec::new(),
         };
+        let stamp = crate::files::backup_stamp();
         for region in regions {
             let _g = p.inc_guard();
             p.set_current(mca_file_name(region));
             if p.is_cancelled() {
                 break;
             }
-            if run_one(&dirs, &sel, region, raw, &mut sum, &mut body) {
+            if run_one(&dirs, &sel, region, raw, Some(&stamp), &mut sum, &mut body) {
                 on_region(region);
             }
         }

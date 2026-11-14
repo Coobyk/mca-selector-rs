@@ -222,6 +222,116 @@ pub fn world_seed(region_dir: &Path) -> Option<i64> {
     None
 }
 
+/// backups root for a file inside a dimension dir:
+/// `<dimension-root>/mca-selector-backups`.
+pub fn backup_root_for(path: &Path) -> Option<PathBuf> {
+    path.parent()?.parent().map(|d| d.join("mca-selector-backups"))
+}
+
+/// per-operation stamp — one backup set per batch job.
+pub fn backup_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // civil-from-days (Howard Hinnant), UTC
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}{mo:02}{d:02}-{h:02}{m:02}{s:02}")
+}
+
+/// Snapshot `path` before a destructive write: hardlink (free — saves go
+/// through temp+rename, so the old inode survives) with a copy fallback.
+/// Files that don't exist yet are recorded in `created.txt` so a restore
+/// can delete files the operation made. Returns the backup path.
+pub fn backup_file(path: &Path, stamp: &str) -> Option<PathBuf> {
+    let dir = backup_root_for(path)?.join(stamp);
+    if path.is_file() {
+        let kind = path.parent()?.file_name()?;
+        let dst = dir.join(kind).join(path.file_name()?);
+        std::fs::create_dir_all(dst.parent()?).ok()?;
+        if std::fs::hard_link(path, &dst).is_err() {
+            std::fs::copy(path, &dst).ok()?;
+        }
+        Some(dst)
+    } else {
+        std::fs::create_dir_all(&dir).ok()?;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("created.txt"))
+            .ok()?;
+        writeln!(f, "{}", path.display()).ok()?;
+        None
+    }
+}
+
+/// every backup stamp dir under a dimension root, oldest first.
+pub fn list_backups(dimension_root: &Path) -> Vec<PathBuf> {
+    let root = dimension_root.join("mca-selector-backups");
+    let mut v: Vec<PathBuf> = std::fs::read_dir(&root)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// restore one backup set: copy every backed-up file back over its origin
+/// and delete files the operation created. Returns (restored, deleted).
+pub fn restore_backup(dir: &Path) -> std::io::Result<(usize, usize)> {
+    let Some(dim) = dir.parent().and_then(|p| p.parent()).map(|d| d.to_path_buf()) else {
+        return Ok((0, 0));
+    };
+    let mut restored = 0;
+    let mut deleted = 0;
+    for kind in std::fs::read_dir(dir)? {
+        let kind = kind?;
+        if !kind.file_type()?.is_dir() {
+            continue;
+        }
+        for f in std::fs::read_dir(kind.path())? {
+            let f = f?;
+            if !f.file_type()?.is_file() {
+                continue;
+            }
+            let dst = dim.join(kind.file_name()).join(f.file_name());
+            if let Some(p) = dst.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::copy(f.path(), &dst)?;
+            restored += 1;
+        }
+    }
+    if let Ok(txt) = std::fs::read_to_string(dir.join("created.txt")) {
+        for line in txt.lines() {
+            let p = Path::new(line);
+            // only delete files under the dimension root — a hand-edited
+            // manifest can never reach outside the world.
+            if p.starts_with(&dim) && std::fs::remove_file(p).is_ok() {
+                deleted += 1;
+            }
+        }
+    }
+    Ok((restored, deleted))
+}
+
 /// scan region dir for r.*.mca files > header size -> region coords set.
 pub fn scan_region_files(region_dir: &Path) -> std::collections::HashSet<i64> {
     let mut set = std::collections::HashSet::new();
