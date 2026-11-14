@@ -71,7 +71,9 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
+          ssh-keyscan -T 30 aur.archlinux.org >> ~/.ssh/known_hosts || true
+          cat ~/.ssh/known_hosts || true
+          echo "GIT_SSH_COMMAND=ssh -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts" >> "$GITHUB_ENV"
 
       - name: Generate .SRCINFO
         run: |
