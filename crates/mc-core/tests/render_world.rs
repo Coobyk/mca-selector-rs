@@ -22,7 +22,7 @@ fn render_to_png() {
         dim,
         ..RenderSettings::default()
     };
-    let img = generate_image(&m, 1, &cfg, &corrupted).expect("image");
+    let img = generate_image(&m, 1, &cfg, &corrupted, &mc_core::render::Margins::EMPTY).expect("image");
     let mut rgba = Vec::with_capacity(img.len() * 4);
     for &p in img.iter() {
         rgba.push((p >> 16) as u8);

@@ -616,6 +616,45 @@ impl McaFile {
         Ok(Some(c))
     }
 
+    /// Load only the listed header-slot indices — the renderer's margin
+    /// strips need a region's edge chunks without paying for a full
+    /// decompress: one file open, the 8KiB header, then each chunk's own
+    /// sectors (same read path as load_single_chunk).
+    pub fn load_sparse(&mut self, indices: &[usize], raw: bool) -> Result<()> {
+        let mut f = std::fs::File::open(&self.file)?;
+        let mut hdr = [0u8; HEADER_SIZE];
+        f.read_exact(&mut hdr)?;
+        let file_len = f.metadata()?.len() as usize;
+        self.raw_mode = raw;
+        self.parse_header(&hdr[..HEADER_SIZE]);
+        let origin = self.location.region_to_chunk();
+        let mut chunks: Vec<Option<Chunk>> = (0..1024).map(|_| None).collect();
+        for &i in indices {
+            if i >= 1024 || self.offsets[i] == 0 {
+                continue;
+            }
+            let pos = self.offsets[i] as usize * 4096;
+            let loc = origin.add_p(Point2i::from_chunk_index(i as i32));
+            let mut head = [0u8; 5];
+            if f.seek(SeekFrom::Start(pos as u64)).is_err() || f.read_exact(&mut head).is_err() {
+                continue;
+            }
+            let length = i32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
+            let payload_len = length.saturating_sub(1).min(file_len.saturating_sub(pos + 5));
+            let mut data = Vec::with_capacity(5 + payload_len);
+            data.extend_from_slice(&head);
+            if (&mut f).take(payload_len as u64).read_to_end(&mut data).is_err() {
+                continue;
+            }
+            if let Ok(mut c) = Self::parse_chunk(&data, 0, loc, &self.file, raw) {
+                c.timestamp = self.timestamps[i];
+                chunks[i] = Some(c);
+            }
+        }
+        self.chunks = chunks;
+        Ok(())
+    }
+
     /// ChunkSet of present chunks (offsets > 0).
     pub fn offsets_chunk_set(&self) -> crate::selection::ChunkSet {
         let mut cs = crate::selection::ChunkSet::new();

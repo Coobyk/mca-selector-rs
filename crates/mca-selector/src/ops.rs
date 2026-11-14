@@ -516,7 +516,7 @@ impl MainView {
             }),
             move |files, ctx, errs| {
                 let Some(m) = files.region.as_ref() else { return };
-                if let Some(img) = mc_core::render::generate_image(m, 1, &cfg, &corrupted) {
+                if let Some(img) = mc_core::render::generate_image(m, 1, &cfg, &corrupted, &mc_core::render::Margins::EMPTY) {
                     let ox = ((ctx.region.x - minx) * 512) as usize;
                     let oz = ((ctx.region.z - minz) * 512) as usize;
                     let mut px = px_body.lock().unwrap();

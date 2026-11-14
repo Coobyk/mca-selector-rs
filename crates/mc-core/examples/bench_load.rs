@@ -8,6 +8,6 @@ fn main() {
     let corrupted = [0u32; 256];
     let cfg = mc_core::render::RenderSettings::default();
     let t1 = std::time::Instant::now();
-    let _img = mc_core::render::generate_image(&m, 1, &cfg, &corrupted).unwrap();
+    let _img = mc_core::render::generate_image(&m, 1, &cfg, &corrupted, &mc_core::render::Margins::EMPTY).unwrap();
     eprintln!("render: {:.1}ms", t1.elapsed().as_secs_f64() * 1e3);
 }

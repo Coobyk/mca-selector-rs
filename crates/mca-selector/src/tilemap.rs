@@ -104,7 +104,7 @@ impl Tile {
 /// Async results channel: worker -> UI.
 /// bump when the renderer's pixel output changes — forces every cached
 /// PNG/LOD image to be treated as stale and re-rendered once.
-const RENDER_CACHE_VERSION: i64 = 10;
+const RENDER_CACHE_VERSION: i64 = 11;
 
 /// fingerprint of everything that changes a tile's pixels. keyed caches
 /// (disk PNGs, meta) are invalidated by comparing this.
@@ -1519,7 +1519,21 @@ impl TileMapState {
                         // an actual diff invalidates the region so it fully
                         // re-renders (memory + disk caches + overlays).
                         if prev.is_some() && prev != Some(new_mt) {
-                            self.invalidate_region(Point2i::from_long(key), true);
+                            let p = Point2i::from_long(key);
+                            self.invalidate_region(p, true);
+                            // the 4 neighbors shade their edge pixels off
+                            // this region's edge chunks (margin heights) —
+                            // their border pixels are stale too.
+                            for n in [
+                                Point2i::new(p.x, p.z - 1),
+                                Point2i::new(p.x, p.z + 1),
+                                Point2i::new(p.x - 1, p.z),
+                                Point2i::new(p.x + 1, p.z),
+                            ] {
+                                if self.regions.contains(&n.as_long()) {
+                                    self.invalidate_region(n, true);
+                                }
+                            }
                         }
                     }
                 }
@@ -1618,6 +1632,41 @@ pub fn argb_to_rgba(argb: &[u32]) -> Vec<u8> {
 }
 
 // -- worker-side tile probe (runs on pool threads, not the UI) --------------
+
+/// Sparse-loaded neighbor region files for cross-tile shading. Each side
+/// carries only its 32 shared-edge chunks (and the NW corner its (31,31)
+/// chunk), loaded via `McaFile::load_sparse` — ~10% of a full region load.
+#[derive(Default)]
+struct MarginFiles {
+    n: Option<McaFile>,
+    s: Option<McaFile>,
+    e: Option<McaFile>,
+    w: Option<McaFile>,
+    nw: Option<McaFile>,
+}
+
+impl MarginFiles {
+    fn load(region_dir: &std::path::Path, r: Point2i) -> Self {
+        let load = |rx: i32, rz: i32, indices: &[usize]| -> Option<McaFile> {
+            let p = region_dir.join(files::mca_file_name(Point2i::new(rx, rz)));
+            if !p.exists() {
+                return None;
+            }
+            let mut m = McaFile::new(p).ok()?;
+            m.load_sparse(indices, true).ok()?;
+            Some(m)
+        };
+        let row = |cz: i32| -> Vec<usize> { (0..32).map(|cx| (cz * 32 + cx) as usize).collect() };
+        let col = |cx: i32| -> Vec<usize> { (0..32).map(|cz| (cz * 32 + cx) as usize).collect() };
+        MarginFiles {
+            n: load(r.x, r.z - 1, &row(31)),
+            s: load(r.x, r.z + 1, &row(0)),
+            w: load(r.x - 1, r.z, &col(31)),
+            e: load(r.x + 1, r.z, &col(0)),
+            nw: load(r.x - 1, r.z - 1, &[1023]),
+        }
+    }
+}
 
 struct ProbeArgs {
     tx: std::sync::mpsc::Sender<TileResult>,
@@ -1838,7 +1887,23 @@ fn worker_probe_and_render(a: ProbeArgs) {
     if m.load(true).is_err() {
         return send_fail(&a);
     }
-    let Some(img) = render::generate_image(&m, a.zoom_level, &a.cfg, &a.corrupted) else {
+    // neighbor edge chunks give the shading passes real heights one pixel
+    // past each tile edge — without them every region boundary renders a
+    // visible seam. Only the 32 shared-edge chunks per side (+ the NW
+    // corner) are loaded, not the whole neighbor regions.
+    let margin_files = if (a.cfg.shade || a.cfg.caves) && !a.cfg.layer_only {
+        MarginFiles::load(&a.region_dir, region)
+    } else {
+        MarginFiles::default()
+    };
+    let margins = render::Margins {
+        n: margin_files.n.as_ref(),
+        s: margin_files.s.as_ref(),
+        e: margin_files.e.as_ref(),
+        w: margin_files.w.as_ref(),
+        nw: margin_files.nw.as_ref(),
+    };
+    let Some(img) = render::generate_image(&m, a.zoom_level, &a.cfg, &a.corrupted, &margins) else {
         return send_fail(&a);
     };
     let structures = m.structures();

@@ -6,7 +6,7 @@ fn main() {
     m.load(true).unwrap();
     let cfg = RenderSettings { render_height: 319, layer_only: false, caves: false,
         shade: true, shade_water: true, shade_altitude: true, dim: DimKind::Overworld };
-    let img = generate_image(&m, 1, &cfg, &[0;256]).unwrap();
+    let img = generate_image(&m, 1, &cfg, &[0;256], &mc_core::render::Margins::EMPTY).unwrap();
     let rgba: Vec<u8> = img.iter().flat_map(|p| {
         [((p >> 16) & 0xff) as u8, ((p >> 8) & 0xff) as u8, (p & 0xff) as u8, 255]
     }).collect();

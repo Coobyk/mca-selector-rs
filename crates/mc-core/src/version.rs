@@ -1010,6 +1010,10 @@ pub struct RenderOut<'a> {
     /// nether-style "cave dimension": scan past the ceiling and render the
     /// first floor below open space (Xaero caveModeType==2 semantics).
     pub full_cave: bool,
+    /// RenderSettings.shade_water == false: water blocks are skipped
+    /// entirely — the column continues and the underwater terrain renders
+    /// as the surface. Unlike `flat`, water is hidden, not drawn opaque.
+    pub no_water: bool,
     /// set by draw_chunk when the xaero pipeline ran — the pixel buffers
     /// carry the xaero layout (water_* = overlay data, pixel alpha 0xFE
     /// marks glowing blocks), so the shade pass must be xaero_shade.
@@ -1108,6 +1112,14 @@ pub fn draw_chunk(
                         let bk =
                             || biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min);
                         let y_abs = s.section_height + cy;
+                        if e.flags & F_WATER != 0 && out.no_water {
+                            // "water: off" hides water — the underwater
+                            // terrain below renders as the surface.
+                            if uniform {
+                                break;
+                            }
+                            continue;
+                        }
                         if out.water {
                             let wh = out.water_heights.as_deref_mut().unwrap();
                             if !water_depth {
@@ -1329,11 +1341,18 @@ fn draw_chunk_xaero(
                             continue;
                         }
                         let y_abs = s.section_height + cy;
-                        // overlay merge only when shading is on; a water
-                        // overlay additionally needs shade_water — "water:
-                        // off" renders the water surface opaque + flat, and
-                        // "shade: off" renders every translucent block flat.
                         let water_ov = e.xflags & X_WATER != 0;
+                        if water_ov && out.no_water {
+                            // "water: off" hides water — the column keeps
+                            // scanning so the underwater terrain renders as
+                            // the surface.
+                            if uniform {
+                                break;
+                            }
+                            continue;
+                        }
+                        // overlay merge only when shading is on; "shade:
+                        // off" renders every translucent block flat.
                         if e.xflags & X_OVERLAY != 0 && !out.flat && (out.water || !water_ov) {
                             if top_h == i32::MIN {
                                 top_h = y_abs;

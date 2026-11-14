@@ -759,13 +759,14 @@ impl MainView {
             Dialog::RenderSettings { draft } => panel(
                 v_flex().gap_1()
                     .child(text_el(crate::lang::t("dialog.title.render_settings"), 16.))
-                    .child(text_el(format!("Render height: {}", draft.render_height), 12.))
+                    .child(text_el(format!("Render height: {} — blocks above this Y are hidden", draft.render_height), 12.))
                     .child(
                         h_flex().gap_1().flex_wrap()
                             .child(self.toggle_render("Shade", draft.shade, |d| &mut d.shade, cx))
                             .child(self.toggle_render("Water", draft.shade_water, |d| &mut d.shade_water, cx))
                             .child(self.toggle_render("Altitude", draft.shade_altitude, |d| &mut d.shade_altitude, cx)),
                     )
+                    .child(text_el("shade: slope lighting  ·  water: draw water (off = see the seabed)  ·  altitude: brighter higher up", 10.).text_color(rgb(0x999999)))
                     .child(
                         h_flex().gap_1().flex_wrap()
                             .child(self.toggle_render("Smooth render", draft.smooth_rendering, |d| &mut d.smooth_rendering, cx))
@@ -777,6 +778,7 @@ impl MainView {
                             .child(self.toggle_render("Caves", draft.render_caves, |d| &mut d.render_caves, cx))
                             .child(self.toggle_render("Nonexistent", draft.show_nonexistent_regions, |d| &mut d.show_nonexistent_regions, cx)),
                     )
+                    .child(text_el("layer only: x-ray slice at the render height  ·  caves: render cave floors instead of the surface", 10.).text_color(rgb(0x999999)))
                     .child(text_el(format!("Header-only zoom: {}", draft.render_header_only_zoom_level), 12.))
                     .child(
                         h_flex().gap_2()

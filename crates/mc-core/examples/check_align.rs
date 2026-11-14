@@ -7,7 +7,7 @@ fn main() {
     let cfg = RenderSettings { render_height: 319, layer_only: false, caves: false,
         shade: true, shade_water: true, shade_altitude: true, dim: DimKind::Overworld };
     for zoom in [8, 32] {
-        let img = generate_image(&m, zoom, &cfg, &[0;256]).unwrap();
+        let img = generate_image(&m, zoom, &cfg, &[0;256], &mc_core::render::Margins::EMPTY).unwrap();
         let side = (512 / zoom) as usize;
         let csz = 16 / zoom.max(1);
         let mut mism = 0;

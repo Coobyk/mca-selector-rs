@@ -65,11 +65,63 @@ pub fn blend(a: u32, b: u32, ratio: f32) -> u32 {
 
 /// generateImage(mcaFile, scale) -> ARGB pixel buffer of 512/scale × 512/scale.
 /// `corrupted` is a 16x16 argb overlay used when a chunk fails to render.
+/// Neighbor region files supplying real cross-boundary heights so shading
+/// doesn't have to fake it at tile edges. Load each with
+/// `McaFile::load_sparse` — only the shared-edge chunks are needed (32 per
+/// side, 1 for the corner).
+#[derive(Default)]
+pub struct Margins<'a> {
+    pub n: Option<&'a McaFile>,
+    pub s: Option<&'a McaFile>,
+    pub e: Option<&'a McaFile>,
+    pub w: Option<&'a McaFile>,
+    pub nw: Option<&'a McaFile>,
+}
+
+impl Margins<'_> {
+    pub const EMPTY: Margins<'static> = Margins {
+        n: None,
+        s: None,
+        e: None,
+        w: None,
+        nw: None,
+    };
+
+    fn any(&self) -> bool {
+        self.n.is_some()
+            || self.s.is_some()
+            || self.e.is_some()
+            || self.w.is_some()
+            || self.nw.is_some()
+    }
+}
+
+/// Surface heights one pixel beyond each tile edge, sampled from the
+/// neighbors' real edge chunks at this tile's pixel resolution.
+/// `n` holds size+1 entries: index 0 is the NW corner column (-1,-1),
+/// indices 1..=size are the (x,-1) row. s/e/w hold `size` entries for
+/// the (x,size), (size,z) and (-1,z) edges. Empty vecs mean "no margin"
+/// — callers fall back to edge clamping.
+#[derive(Default)]
+struct MarginStrips {
+    n: Vec<i16>,
+    s: Vec<i16>,
+    e: Vec<i16>,
+    w: Vec<i16>,
+}
+
+#[derive(Default)]
+struct MarginSet {
+    terrain: MarginStrips,
+    water: MarginStrips,
+}
+
 pub fn generate_image(
     mca: &McaFile,
     scale: i32,
     cfg: &RenderSettings,
     corrupted: &[u32; 256],
+    margins: &Margins,
 ) -> Option<Vec<u32>> {
     let size = TILE_SIZE / scale as usize;
     let chunk_size = CHUNK_SIZE / scale as usize;
@@ -77,7 +129,7 @@ pub fn generate_image(
     // loops collapse onto pixel 0 and emit an empty image. Render at scale
     // 16 and box-average down instead — keeps real terrain at max zoom-out.
     if chunk_size == 0 {
-        let fine = generate_image(mca, scale / 2, cfg, corrupted)?;
+        let fine = generate_image(mca, scale / 2, cfg, corrupted, margins)?;
         return Some(scale_down(&fine, TILE_SIZE / (scale / 2) as usize, size));
     }
     let pixels = TILE_SIZE * TILE_SIZE / (scale * scale) as usize;
@@ -127,6 +179,16 @@ pub fn generate_image(
     let draw_ms = t0.elapsed().as_secs_f64() * 1e3;
     let t1 = std::time::Instant::now();
 
+    // Real heights one pixel past each edge: without them the shading
+    // passes can't compute the true slope at region boundaries and draw a
+    // visible 512px grid (the "region seams" issue). Costs ~130 edge-chunk
+    // scans spread over the 5 margin files.
+    let mset = if margins.any() && !cfg.layer_only && (cfg.shade || cfg.caves) {
+        margin_strips(margins, scale, cfg, corrupted, size, chunk_size)
+    } else {
+        MarginSet::default()
+    };
+
     if xaero_used && !cfg.caves && !cfg.layer_only {
         xaero_shade(
             &mut pixel_buffer,
@@ -135,11 +197,25 @@ pub fn generate_image(
             &water_heights,
             scale,
             cfg,
+            &mset.terrain,
         );
     } else if cfg.caves {
-        flat_shade(&mut pixel_buffer, &terrain_heights, scale);
+        flat_shade(&mut pixel_buffer, &terrain_heights, scale, &mset.terrain);
     } else if cfg.shade && !cfg.layer_only {
-        shade(&mut pixel_buffer, &water_pixels, &terrain_heights, &water_heights, scale, cfg);
+        let ms = if cfg.shade_water {
+            &mset.water
+        } else {
+            &mset.terrain
+        };
+        shade(
+            &mut pixel_buffer,
+            &water_pixels,
+            &terrain_heights,
+            &water_heights,
+            scale,
+            cfg,
+            ms,
+        );
     }
     if bench_timing() {
         eprintln!("[bench] draw={:.1}ms shade={:.1}ms", draw_ms, t1.elapsed().as_secs_f64() * 1e3);
@@ -361,6 +437,7 @@ fn draw_one(
             water_heights: water_heights.as_deref_mut(),
             water: cfg.shade && cfg.shade_water,
             flat: !cfg.shade,
+            no_water: !cfg.shade_water,
             height: cfg.render_height,
             full_cave: cfg.dim == DimKind::Nether,
             xaero: false,
@@ -393,10 +470,154 @@ fn draw_one(
     xaero_used
 }
 
-fn flat_shade(px: &mut [u32], heights: &[i16], _scale: i32) {
-    px.par_iter_mut().enumerate().for_each(|(i, p)| {
-        let alt = (heights[i] / 4).clamp(-50, 50);
-        *p = shade_color(*p, (alt * 4) as i32);
+/// Render a strip of already-loaded neighbor edge chunks through draw_one
+/// and extract the shared-edge heights. Strips draw into a full `size`-row
+/// scratch (the chunk renderers hardcode that row stride): N/S place
+/// chunks along a row at z=0 and take their last/first pixel row; W/E
+/// place chunks down a column at x=0 and take their last/first pixel
+/// column; the NW corner is a single chunk's bottom-right pixel.
+#[allow(clippy::too_many_arguments)]
+fn margin_strips(
+    margins: &Margins,
+    scale: i32,
+    cfg: &RenderSettings,
+    corrupted: &[u32; 256],
+    size: usize,
+    chunk_size: usize,
+) -> MarginSet {
+    let mut set = MarginSet::default();
+    let want_water = cfg.shade && cfg.shade_water;
+    let cs = chunk_size;
+    let len = size * size;
+    let mut px = vec![0u32; len];
+    let mut th = vec![0i16; len];
+    let mut wp = vec![0u32; len];
+    let mut wh = vec![0i16; len];
+    let mut dispatch = Dispatch::new();
+    let mut run = |m: &McaFile,
+                   chunks: &[(usize, usize, usize)],
+                   px: &mut [u32],
+                   th: &mut [i16],
+                   wp: &mut [u32],
+                   wh: &mut [i16]| {
+        th.fill(0);
+        wh.fill(0);
+        for &(i, x, z) in chunks {
+            let Some(chunk) = &m.chunks[i] else { continue };
+            let Some(data) = &chunk.data else { continue };
+            let (format, cm) = dispatch.get(nbt::data_version(Some(data)));
+            draw_one(
+                data,
+                cm,
+                format,
+                x,
+                z,
+                scale,
+                cfg,
+                corrupted,
+                size,
+                len,
+                px,
+                th,
+                Some(&mut *wp),
+                Some(&mut *wh),
+            );
+        }
+    };
+    // N: the neighbor's southernmost chunk row (cz=31); shared edge is the
+    // strip's last row. NW corner prepends the (-1,-1) column height.
+    if let Some(m) = margins.n {
+        let chunks: Vec<(usize, usize, usize)> =
+            (0..32).map(|cx| (31 * 32 + cx, cx * cs, 0)).collect();
+        run(m, &chunks, &mut px, &mut th, &mut wp, &mut wh);
+        set.terrain.n = th[(cs - 1) * size..cs * size].to_vec();
+        if want_water {
+            set.water.n = wh[(cs - 1) * size..cs * size].to_vec();
+        }
+    }
+    if let Some(m) = margins.nw {
+        run(m, &[(1023, 0, 0)], &mut px, &mut th, &mut wp, &mut wh);
+        let last = (cs - 1) * size + cs - 1;
+        set.terrain.n.insert(0, th[last]);
+        if want_water && !set.water.n.is_empty() {
+            set.water.n.insert(0, wh[last]);
+        }
+    }
+    // S: northernmost row (cz=0); shared edge is the strip's first row.
+    if let Some(m) = margins.s {
+        let chunks: Vec<(usize, usize, usize)> =
+            (0..32).map(|cx| (cx, cx * cs, 0)).collect();
+        run(m, &chunks, &mut px, &mut th, &mut wp, &mut wh);
+        set.terrain.s = th[..size].to_vec();
+        if want_water {
+            set.water.s = wh[..size].to_vec();
+        }
+    }
+    // W: easternmost column (cx=31); shared edge is the strip's last column.
+    if let Some(m) = margins.w {
+        let chunks: Vec<(usize, usize, usize)> =
+            (0..32).map(|cz| (cz * 32 + 31, 0, cz * cs)).collect();
+        run(m, &chunks, &mut px, &mut th, &mut wp, &mut wh);
+        set.terrain.w = (0..size).map(|z| th[z * size + cs - 1]).collect();
+        if want_water {
+            set.water.w = (0..size).map(|z| wh[z * size + cs - 1]).collect();
+        }
+    }
+    // E: westernmost column (cx=0); shared edge is the strip's first column.
+    if let Some(m) = margins.e {
+        let chunks: Vec<(usize, usize, usize)> =
+            (0..32).map(|cz| (cz * 32, 0, cz * cs)).collect();
+        run(m, &chunks, &mut px, &mut th, &mut wp, &mut wh);
+        set.terrain.e = (0..size).map(|z| th[z * size]).collect();
+        if want_water {
+            set.water.e = (0..size).map(|z| wh[z * size]).collect();
+        }
+    }
+    set
+}
+
+/// Margin lookup: a present strip entry is used as-is (0 = missing chunk,
+/// consistent with interior empty-column handling); a missing entry —
+/// strip not loaded or too short — falls back to the border pixel.
+#[inline]
+fn mg(strip: &[i16], i: usize, fallback: i16) -> i16 {
+    strip.get(i).copied().unwrap_or(fallback)
+}
+
+/// Caves: absolute-height lightness (deep = dark) PLUS the same
+/// edge-aware slope shading as the surface pass — pure altitude shading
+/// left the cave floor looking flat.
+fn flat_shade(px: &mut [u32], heights: &[i16], scale: i32, m: &MarginStrips) {
+    let size = TILE_SIZE / scale as usize;
+    if size == 0 {
+        return;
+    }
+    let n = (size * size).min(px.len());
+    px[..n].par_chunks_mut(size).enumerate().for_each(|(z, prow)| {
+        let hrow = &heights[z * size..(z + 1) * size];
+        let hup = if z == 0 {
+            hrow
+        } else {
+            &heights[(z - 1) * size..z * size]
+        };
+        let hdn = if z == size - 1 && size > 1 {
+            hrow
+        } else {
+            &heights[(z + 1) * size..(z + 2) * size]
+        };
+        for x in 0..size {
+            let h = hrow[x];
+            if h <= 0 || prow[x] == 0 {
+                continue;
+            }
+            let hup_x = if z == 0 { mg(&m.n, x + 1, h) } else { hup[x] };
+            let hdn_x = if z == size - 1 { mg(&m.s, x, h) } else { hdn[x] };
+            let hl = if x == 0 { mg(&m.w, z, h) } else { hrow[x - 1] };
+            let hr = if x == size - 1 { mg(&m.e, z, h) } else { hrow[x + 1] };
+            let slope = ((hdn_x - hup_x) + (hr - hl)).clamp(-16, 16);
+            let alt = (h / 4).clamp(-50, 50) * 4;
+            prow[x] = shade_color(prow[x], (alt + slope) as i32);
+        }
     });
 }
 
@@ -407,6 +628,7 @@ fn shade(
     water: &[i16],
     scale: i32,
     cfg: &RenderSettings,
+    m: &MarginStrips,
 ) {
     let water_heights: &[i16] = if cfg.shade_water && cfg.shade {
         water
@@ -452,14 +674,16 @@ fn shade(
                     let ratio = 0.5 - 0.5 / 40.0 * (hrow[x] - trow[x]) as f32;
                     prow[x] = blend(prow[x], wrow[x], ratio);
                 } else {
-                    // edge-clamped sampling: out-of-tile neighbors replicate
-                    // the border pixel, so tile edges use the same centered
-                    // diff as the interior (flat at the seam). One-sided
-                    // edge diffs ran at half amplitude and drew a visible
-                    // 512px grid between independently rendered regions.
-                    let z_shade = (hdn[x] - hup[x]) * 2;
-                    let hl = if x == 0 { hrow[0] } else { hrow[x - 1] };
-                    let hr = if x == size - 1 { hrow[x] } else { hrow[x + 1] };
+                    // margin-aware centered diff: heights one pixel beyond
+                    // the tile come from the neighbor region's real edge
+                    // chunks; a missing margin falls back to edge clamping
+                    // (flat), never to the half-amplitude one-sided diffs
+                    // that drew the 512px region grid.
+                    let hup_x = if z == 0 { mg(&m.n, x + 1, hrow[x]) } else { hup[x] };
+                    let hdn_x = if z == size - 1 { mg(&m.s, x, hrow[x]) } else { hdn[x] };
+                    let z_shade = (hdn_x - hup_x) * 2;
+                    let hl = if x == 0 { mg(&m.w, z, hrow[x]) } else { hrow[x - 1] };
+                    let hr = if x == size - 1 { mg(&m.e, z, hrow[x]) } else { hrow[x + 1] };
                     let x_shade = (hr - hl) * 2;
                     let mut shade = (x_shade + z_shade) as f32;
                     shade = shade.clamp(-8.0, 8.0);
@@ -488,6 +712,7 @@ fn xaero_shade(
     top: &[i16],
     scale: i32,
     cfg: &RenderSettings,
+    m: &MarginStrips,
 ) {
     let size = TILE_SIZE / scale as usize;
     if size == 0 || overlay_px.is_empty() {
@@ -558,13 +783,22 @@ fn xaero_shade(
                     // ambient term still applies — leaving edge pixels
                     // unshaded made a brighter 1px line per region (the
                     // visible "region grid"). Empty neighbors stay unshaded.
-                    let hn = if z == 0 { h } else { hup[x] as f32 };
-                    let hnw = if z == 0 && x == 0 {
-                        h
-                    } else if z == 0 {
-                        hrow[x - 1] as f32
-                    } else if x == 0 {
+                    // N/NW heights one pixel past the tile edge come from
+                    // the neighbor's real edge chunks (m.n[0] is the NW
+                    // corner column). An absent margin falls back to the
+                    // border pixel (flat); a margin of 0 = missing chunk,
+                    // unshaded like interior empty columns.
+                    let hn = if z == 0 {
+                        mg(&m.n, x + 1, hrow[x]) as f32
+                    } else {
                         hup[x] as f32
+                    };
+                    let hnw = if z == 0 && x == 0 {
+                        mg(&m.n, 0, hrow[x]) as f32
+                    } else if z == 0 {
+                        mg(&m.n, x, hrow[x]) as f32
+                    } else if x == 0 {
+                        mg(&m.w, z - 1, hrow[x]) as f32
                     } else {
                         hup[x - 1] as f32
                     };
@@ -686,7 +920,7 @@ mod tests {
         let mut checksum = 0u64;
         for i in 0..5 {
             let t = std::time::Instant::now();
-            let img = generate_image(&m, 1, &RenderSettings::default(), &corrupted).expect("image");
+            let img = generate_image(&m, 1, &RenderSettings::default(), &corrupted, &Margins::EMPTY).expect("image");
             let el = t.elapsed();
             checksum = img
                 .iter()

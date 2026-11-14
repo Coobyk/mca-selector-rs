@@ -491,7 +491,7 @@ impl MainView {
         if self.map.show_chunk_grid && scale <= CHUNK_GRID_SCALE {
             for rx in rmin.x..=rmax.x + 1 {
                 for i in 0..32 {
-                    let sx = px(((rx * 512 + i * 16) as f32 - self.map.offset.x) / scale);
+                    let sx = px(((rx * 512 + i * 16) as f32 - self.map.offset.x) / scale).round();
                     if sx >= px(0.) && sx <= bounds.size.width {
                         window.paint_quad(fill(
                             Bounds { origin: point(sx + bounds.origin.x, bounds.origin.y), size: size(px(GRID_LINE_WIDTH), bounds.size.height) },
@@ -502,7 +502,7 @@ impl MainView {
             }
             for rz in rmin.z..=rmax.z + 1 {
                 for i in 0..32 {
-                    let sz = px(((rz * 512 + i * 16) as f32 - self.map.offset.z) / scale);
+                    let sz = px(((rz * 512 + i * 16) as f32 - self.map.offset.z) / scale).round();
                     if sz >= px(0.) && sz <= bounds.size.height {
                         window.paint_quad(fill(
                             Bounds { origin: point(bounds.origin.x, sz + bounds.origin.y), size: size(bounds.size.width, px(GRID_LINE_WIDTH)) },
@@ -514,7 +514,7 @@ impl MainView {
         }
         if self.map.show_region_grid {
             for rx in rmin.x..=rmax.x + 1 {
-                let sx = px((rx as f32 * 512.0 - self.map.offset.x) / scale);
+                let sx = px((rx as f32 * 512.0 - self.map.offset.x) / scale).round();
                 if sx >= px(0.) && sx <= bounds.size.width {
                     window.paint_quad(fill(
                         Bounds { origin: point(sx + bounds.origin.x, bounds.origin.y), size: size(px(GRID_LINE_WIDTH), bounds.size.height) },
@@ -523,7 +523,7 @@ impl MainView {
                 }
             }
             for rz in rmin.z..=rmax.z + 1 {
-                let sz = px((rz as f32 * 512.0 - self.map.offset.z) / scale);
+                let sz = px((rz as f32 * 512.0 - self.map.offset.z) / scale).round();
                 if sz >= px(0.) && sz <= bounds.size.height {
                     window.paint_quad(fill(
                         Bounds { origin: point(bounds.origin.x, sz + bounds.origin.y), size: size(bounds.size.width, px(GRID_LINE_WIDTH)) },
