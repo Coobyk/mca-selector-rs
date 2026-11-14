@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=MCA Selector
+Comment=Fast Minecraft world region/chunk viewer and editor
+Exec=mca-selector
+Icon=mca-selector
+Terminal=false
+Categories=Utility;Game;
+Keywords=minecraft;world;region;chunk;editor;nbt;
+StartupWMClass=MCA Selector
