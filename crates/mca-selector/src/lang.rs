@@ -5,27 +5,17 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-/// (code, native display name) — Settings language picker order.
-pub(crate) const LANGS: &[(&str, &str)] = &[
-    ("en", "English"),
-    ("de", "Deutsch"),
-    ("fr", "Français"),
-    ("es", "Español"),
-    ("zh_cn", "简体中文"),
-    ("ru", "Русский"),
-    ("ja", "日本語"),
-    ("pt_br", "Português (Brasil)"),
-];
-
-const FILES: &[(&str, &str)] = &[
-    ("en", include_str!("../lang/en.lang")),
-    ("de", include_str!("../lang/de.lang")),
-    ("fr", include_str!("../lang/fr.lang")),
-    ("es", include_str!("../lang/es.lang")),
-    ("zh_cn", include_str!("../lang/zh_cn.lang")),
-    ("ru", include_str!("../lang/ru.lang")),
-    ("ja", include_str!("../lang/ja.lang")),
-    ("pt_br", include_str!("../lang/pt_br.lang")),
+/// (code, native display name, embedded source) — Settings picker order;
+/// element 0 is the English fallback.
+pub(crate) const LANGS: &[(&str, &str, &str)] = &[
+    ("en", "English", include_str!("../lang/en.lang")),
+    ("de", "Deutsch", include_str!("../lang/de.lang")),
+    ("fr", "Français", include_str!("../lang/fr.lang")),
+    ("es", "Español", include_str!("../lang/es.lang")),
+    ("zh_cn", "简体中文", include_str!("../lang/zh_cn.lang")),
+    ("ru", "Русский", include_str!("../lang/ru.lang")),
+    ("ja", "日本語", include_str!("../lang/ja.lang")),
+    ("pt_br", "Português (Brasil)", include_str!("../lang/pt_br.lang")),
 ];
 
 fn parse(src: &'static str) -> HashMap<&'static str, &'static str> {
@@ -46,21 +36,21 @@ static ACTIVE: RwLock<Option<HashMap<&'static str, &'static str>>> = RwLock::new
 /// Select the active language (GlobalConfig.language). Called at startup and
 /// again when the Settings language changes — menus are rebuilt next frame.
 pub(crate) fn init(code: &str) {
-    let src = FILES
+    let src = LANGS
         .iter()
-        .find(|(c, _)| *c == code)
-        .map(|(_, s)| *s)
-        .unwrap_or(FILES[0].1);
+        .find(|(c, _, _)| *c == code)
+        .map(|(_, _, s)| *s)
+        .unwrap_or(LANGS[0].2);
     *ACTIVE.write().unwrap() = Some(parse(src));
 }
 
 pub(crate) fn display_name(code: &str) -> &'static str {
-    LANGS.iter().find(|(c, _)| *c == code).map(|(_, n)| *n).unwrap_or("English")
+    LANGS.iter().find(|(c, _, _)| *c == code).map(|(_, n, _)| *n).unwrap_or("English")
 }
 
 /// Next language code after `code` in LANGS order (Settings cycles through).
 pub(crate) fn next_code(code: &str) -> &'static str {
-    let i = LANGS.iter().position(|(c, _)| *c == code).unwrap_or(0);
+    let i = LANGS.iter().position(|(c, _, _)| *c == code).unwrap_or(0);
     LANGS[(i + 1) % LANGS.len()].0
 }
 
@@ -80,6 +70,6 @@ pub(crate) fn t(key: &'static str) -> &'static str {
         }
     }
     let mut en = EN.write().unwrap();
-    let e = en.get_or_insert_with(|| parse(FILES[0].1));
+    let e = en.get_or_insert_with(|| parse(LANGS[0].2));
     e.get(key).copied().unwrap_or(key)
 }

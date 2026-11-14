@@ -6,27 +6,27 @@ use crate::chunk::{self, PackedData, PackedSrc};
 use crate::colors::{self, ColorConfig};
 use crate::nbt::{self, Compound, Tag};
 
-pub const DEFAULT_GRASS_TINT: u32 = 0x91bd59;
-pub const DEFAULT_FOLIAGE_TINT: u32 = 0x77ab2f;
-pub const DEFAULT_WATER_TINT: u32 = 0x3f76e4;
+pub(crate) const DEFAULT_GRASS_TINT: u32 = 0x91bd59;
+pub(crate) const DEFAULT_FOLIAGE_TINT: u32 = 0x77ab2f;
+pub(crate) const DEFAULT_WATER_TINT: u32 = 0x3f76e4;
 
 #[derive(Clone, Copy)]
-pub enum BiomeKey<'a> {
+pub(crate) enum BiomeKey<'a> {
     Idx(i32),
     Name(&'a str),
 }
 
 // --- legacy color model (java_1_9) -------------------------------------------
 
-pub struct LegacyColorMapping {
-    pub colors: std::collections::HashMap<i32, u32>, // (id<<4)|data -> argb
-    pub grass_tints: [u32; 256],
-    pub foliage_tints: [u32; 256],
-    pub water_tints: [u32; 256],
-    pub name_to_id: std::collections::HashMap<String, i32>,
+pub(crate) struct LegacyColorMapping {
+    pub(crate) colors: std::collections::HashMap<i32, u32>, // (id<<4)|data -> argb
+    pub(crate) grass_tints: [u32; 256],
+    pub(crate) foliage_tints: [u32; 256],
+    pub(crate) water_tints: [u32; 256],
+    pub(crate) name_to_id: std::collections::HashMap<String, i32>,
 }
 
-pub fn legacy_colors() -> &'static LegacyColorMapping {
+pub(crate) fn legacy_colors() -> &'static LegacyColorMapping {
     static C: std::sync::OnceLock<LegacyColorMapping> = std::sync::OnceLock::new();
     C.get_or_init(|| {
         let mut m = LegacyColorMapping {
@@ -89,10 +89,9 @@ fn legacy_is_transparent(id: i32) -> bool {
 
 // --- color map dispatch ------------------------------------------------------
 
-pub enum ColorMap {
+pub(crate) enum ColorMap {
     Null,
     Legacy(&'static LegacyColorMapping),
-    Config(&'static ColorConfig),
     /// Xaero palette + per-version config as fallback for blocks the
     /// generated xaero table doesn't know.
     Xaero(&'static ColorConfig, &'static ColorConfig),
@@ -101,17 +100,10 @@ pub enum ColorMap {
 impl ColorMap {
     /// Modern path: palette-entry name + pre-resolved block-state bitset,
     /// (renderers resolve it once per palette entry).
-    pub fn get_rgb_state(&self, name: &str, state: Option<&BitSet>, biome: BiomeKey) -> u32 {
+    pub(crate) fn get_rgb_state(&self, name: &str, state: Option<&BitSet>, biome: BiomeKey) -> u32 {
         match self {
             ColorMap::Null => 0,
             ColorMap::Legacy(_) => 0xFF00_0000,
-            ColorMap::Config(c) => {
-                let biome_name = match biome {
-                    BiomeKey::Name(s) => s,
-                    BiomeKey::Idx(id) => biome_id_to_name(id),
-                };
-                c.get_color_state(name, biome_name, state).color | 0xFF00_0000
-            }
             ColorMap::Xaero(x, fallback) => {
                 let biome_name = match biome {
                     BiomeKey::Name(s) => s,
@@ -129,7 +121,7 @@ impl ColorMap {
 
     /// the generated xaero table when this mapping uses it — entry
     /// resolution consults it for overlay/invisible/glow/short metadata.
-    pub fn xaero_cfg(&self) -> Option<&'static ColorConfig> {
+    pub(crate) fn xaero_cfg(&self) -> Option<&'static ColorConfig> {
         match self {
             ColorMap::Xaero(x, _) => Some(x),
             _ => None,
@@ -137,7 +129,7 @@ impl ColorMap {
     }
 
     /// Legacy path: key = (blockId<<4)|data, biome = biome id.
-    pub fn get_rgb_legacy(&self, key: i32, biome: i32) -> u32 {
+    pub(crate) fn get_rgb_legacy(&self, key: i32, biome: i32) -> u32 {
         match self {
             ColorMap::Legacy(m) => {
                 let color = m.colors.get(&key).copied().unwrap_or(0xFF00_0000);
@@ -160,7 +152,7 @@ impl ColorMap {
 }
 
 /// floorEntry dispatch for the color mapping (VersionHandler.getImpl).
-pub fn color_mapping(data_version: i32) -> ColorMap {
+pub(crate) fn color_mapping(data_version: i32) -> ColorMap {
     const TABLE: &[(i32, fn() -> &'static ColorConfig)] = &[
         (chunk::DV_17W47A, colors::cfg_17w47a),
         (chunk::DV_18W43A, colors::cfg_18w43a),
@@ -190,7 +182,7 @@ pub fn color_mapping(data_version: i32) -> ColorMap {
 // chunk formats
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum ChunkFormat {
+pub(crate) enum ChunkFormat {
     Null,
     Legacy15w32a,
     P17w47a,
@@ -204,7 +196,7 @@ pub enum ChunkFormat {
     P26_3s7,
 }
 
-pub fn chunk_format(data_version: i32) -> ChunkFormat {
+pub(crate) fn chunk_format(data_version: i32) -> ChunkFormat {
     const TABLE: &[(i32, ChunkFormat)] = &[
         (chunk::DV_15W32A, ChunkFormat::Legacy15w32a),
         (chunk::DV_17W47A, ChunkFormat::P17w47a),
@@ -344,7 +336,6 @@ fn resolve_entry<'a>(
 /// code's `s.color(state)` where Single ignores `state` entirely.
 fn resolve_color(cm: &ColorMap, name: &str, props: Option<&Compound>) -> CellVal {
     let c = match cm {
-        ColorMap::Config(c) => *c,
         ColorMap::Xaero(x, fb) => {
             if x.colors.contains_key(name) {
                 x
@@ -709,7 +700,7 @@ fn biome_int(biomes: Option<&[u8]>, x: usize, y: i32, z: usize, format: ChunkFor
 /// section internals are the 21w37a+ layout (per-section block_states/
 /// biomes compounds). NOTE: the section *list* stays under Level until
 /// 21w43a — locating it is chunk::sections' job.
-pub fn is_modern(format: ChunkFormat) -> bool {
+pub(crate) fn is_modern(format: ChunkFormat) -> bool {
     matches!(
         format,
         ChunkFormat::P21w37a | ChunkFormat::P21w43a | ChunkFormat::P26_3s7
@@ -899,31 +890,6 @@ fn build_section<'a>(
     }
 }
 
-/// bitmask for `bits`-wide reads — matches chunk.rs's private helper.
-#[inline]
-fn bmask(bits: usize) -> u64 {
-    if bits >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    }
-}
-
-/// spanning-layout read (< 20w17a) — chunk.rs's private helper duplicated
-/// so the column cursor doesn't need a division-free PackedData::get.
-#[inline]
-fn get_spanning(src: &PackedSrc<'_>, bit: usize, bits: usize) -> u64 {
-    let li = bit >> 6;
-    let off = bit & 63;
-    if off + bits > 64 {
-        let prev = src.long(li) >> off;
-        let next = src.long(li + 1) & bmask(off + bits - 64);
-        (next << (64 - off)) | prev
-    } else {
-        (src.long(li) >> off) & bmask(bits)
-    }
-}
-
 /// Incremental top-down column cursor (steps of 256 indexes — one section
 /// row). For the non-spanning layout `prev` is a pair of integer updates:
 /// the ipl constant and the 256/ipl split are precomputed per section, so
@@ -964,7 +930,7 @@ fn col_cursor<'a>(s: &IndexedSection<'a>, index: usize) -> ColCursor<'a> {
         let li = ((index as u64 * s.col_div as u64) >> 24) as usize;
         c.li = li;
         c.shift = ((index - li * s.col_ipl as usize) * b.bits) as i32;
-        c.mask = bmask(b.bits);
+        c.mask = chunk::mask(b.bits);
     }
     c
 }
@@ -973,7 +939,7 @@ impl ColCursor<'_> {
     #[inline]
     fn get(&self) -> u64 {
         if self.spanning {
-            get_spanning(&self.src, self.index * self.bits, self.bits)
+            chunk::get_spanning(&self.src, self.index * self.bits, self.bits)
         } else {
             (self.src.long(self.li) >> self.shift) & self.mask
         }
@@ -996,34 +962,33 @@ impl ColCursor<'_> {
     }
 }
 
-pub struct RenderOut<'a> {
-    pub pixel_buffer: &'a mut [u32],
-    pub water_pixels: Option<&'a mut [u32]>,
-    pub terrain_heights: &'a mut [i16],
-    pub water_heights: Option<&'a mut [i16]>,
-    pub water: bool,
+pub(crate) struct RenderOut<'a> {
+    pub(crate) pixel_buffer: &'a mut [u32],
+    pub(crate) water_pixels: Option<&'a mut [u32]>,
+    pub(crate) terrain_heights: &'a mut [i16],
+    pub(crate) water_heights: Option<&'a mut [i16]>,
+    /// water handling for this render — see [`WaterMode`].
+    pub(crate) water: crate::render::WaterMode,
     /// RenderSettings.shade == false: no overlay merge at all — every
     /// translucent block (water/leaves/glass) renders its own flat color
     /// as the surface pixel, matching upstream's flat unshaded render.
-    pub flat: bool,
-    pub height: i32,
+    pub(crate) flat: bool,
+    pub(crate) height: i32,
     /// nether-style "cave dimension": scan past the ceiling and render the
     /// first floor below open space (Xaero caveModeType==2 semantics).
-    pub full_cave: bool,
-    /// RenderSettings.shade_water == false: water blocks are skipped
-    /// entirely — the column continues and the underwater terrain renders
-    /// as the surface. Unlike `flat`, water is hidden, not drawn opaque.
-    pub no_water: bool,
+    pub(crate) full_cave: bool,
     /// set by draw_chunk when the xaero pipeline ran — the pixel buffers
     /// carry the xaero layout (water_* = overlay data, pixel alpha 0xFE
     /// marks glowing blocks), so the shade pass must be xaero_shade.
-    pub xaero: bool,
+    pub(crate) xaero: bool,
 }
+
+pub(crate) use crate::render::WaterMode;
 
 const WATER_DUMMY_NAME: &str = "minecraft:water";
 
 /// drawChunk — top-down surface render with water handling.
-pub fn draw_chunk(
+pub(crate) fn draw_chunk(
     root: &Compound,
     cm: &ColorMap,
     format: ChunkFormat,
@@ -1042,7 +1007,7 @@ pub fn draw_chunk(
         return draw_chunk_xaero(root, xc, cm, format, x, z, scale, out);
     }
     let Some((list, container)) = chunk::sections(root) else { return };
-    let y_min = nbt::int_from(Some(container), "yPos", -4);
+    let y_min = nbt::int_from(Some(container), "yPos", crate::chunk::Y_POS_DEFAULT);
     let modern = is_modern(format);
     let height = out.height;
     let indexed = index_sections(Some(list), format, height, y_min, cm.xaero_cfg());
@@ -1112,7 +1077,7 @@ pub fn draw_chunk(
                         let bk =
                             || biome_at(s, chunk_biomes, modern, format, cx, cy, cz, y_min);
                         let y_abs = s.section_height + cy;
-                        if e.flags & F_WATER != 0 && out.no_water {
+                        if e.flags & F_WATER != 0 && out.water == WaterMode::Hidden {
                             // "water: off" hides water — the underwater
                             // terrain below renders as the surface.
                             if uniform {
@@ -1120,7 +1085,7 @@ pub fn draw_chunk(
                             }
                             continue;
                         }
-                        if out.water {
+                        if out.water == WaterMode::Shaded {
                             let wh = out.water_heights.as_deref_mut().unwrap();
                             if !water_depth {
                                 out.pixel_buffer[pixel_index] = entry_rgb(memo, cm, e, bk);
@@ -1192,7 +1157,7 @@ fn draw_chunk_xaero(
     out: &mut RenderOut,
 ) {
     let Some((list, container)) = chunk::sections(root) else { return };
-    let y_min = nbt::int_from(Some(container), "yPos", -4);
+    let y_min = nbt::int_from(Some(container), "yPos", crate::chunk::Y_POS_DEFAULT);
     let modern = is_modern(format);
     let height = out.height;
     let indexed = index_sections(Some(list), format, height, y_min, Some(xc));
@@ -1342,7 +1307,7 @@ fn draw_chunk_xaero(
                         }
                         let y_abs = s.section_height + cy;
                         let water_ov = e.xflags & X_WATER != 0;
-                        if water_ov && out.no_water {
+                        if water_ov && out.water == WaterMode::Hidden {
                             // "water: off" hides water — the column keeps
                             // scanning so the underwater terrain renders as
                             // the surface.
@@ -1353,7 +1318,7 @@ fn draw_chunk_xaero(
                         }
                         // overlay merge only when shading is on; "shade:
                         // off" renders every translucent block flat.
-                        if e.xflags & X_OVERLAY != 0 && !out.flat && (out.water || !water_ov) {
+                        if e.xflags & X_OVERLAY != 0 && !out.flat && (out.water == WaterMode::Shaded || !water_ov) {
                             if top_h == i32::MIN {
                                 top_h = y_abs;
                             }
@@ -1407,7 +1372,7 @@ fn draw_chunk_xaero(
                             }
                             continue;
                         }
-                        if e.flags & F_WATERLOGGED != 0 && !out.flat && out.water {
+                        if e.flags & F_WATERLOGGED != 0 && !out.flat && out.water == WaterMode::Shaded {
                             // contained fluid renders as a water overlay
                             // first (Xaero processes fluidState before the
                             // block itself)
@@ -1547,7 +1512,7 @@ fn with_memo<R>(f: impl FnOnce(&mut RgbMemo) -> R) -> R {
 }
 
 /// drawLayer — single Y layer.
-pub fn draw_layer(
+pub(crate) fn draw_layer(
     root: &Compound,
     cm: &ColorMap,
     format: ChunkFormat,
@@ -1561,7 +1526,7 @@ pub fn draw_layer(
         return;
     }
     let Some((list, container)) = chunk::sections(root) else { return };
-    let y_min = nbt::int_from(Some(container), "yPos", -4);
+    let y_min = nbt::int_from(Some(container), "yPos", crate::chunk::Y_POS_DEFAULT);
     let modern = is_modern(format);
     let target_y = if modern { height >> 4 } else { height.clamp(0, 255) >> 4 };
     let mut target: Option<&Compound> = None;
@@ -1611,7 +1576,7 @@ pub fn draw_layer(
 }
 
 /// drawCaves — first opaque non-foliage block below the surface blocks.
-pub fn draw_caves(
+pub(crate) fn draw_caves(
     root: &Compound,
     cm: &ColorMap,
     format: ChunkFormat,
@@ -1629,7 +1594,7 @@ pub fn draw_caves(
         Some((l, c)) => (Some(l), c),
         None => (None, root),
     };
-    let y_min = nbt::int_from(Some(container), "yPos", -4);
+    let y_min = nbt::int_from(Some(container), "yPos", crate::chunk::Y_POS_DEFAULT);
     let modern = is_modern(format);
     let indexed = index_sections(sections_opt, format, height, y_min, cm.xaero_cfg());
     let chunk_biomes = if modern {
@@ -1759,7 +1724,7 @@ fn draw_chunk_legacy(
                         continue;
                     }
                     let key = (block << 4) + data;
-                    if out.water {
+                    if out.water == WaterMode::Shaded {
                         let wh = out.water_heights.as_deref_mut().unwrap();
                         out.pixel_buffer[pixel_index] = cm.get_rgb_legacy(key, biome);
                         wh[pixel_index] = (i * 16 + cy) as i16;

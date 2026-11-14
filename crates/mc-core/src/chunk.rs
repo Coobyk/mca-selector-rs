@@ -8,6 +8,9 @@ use crate::nbt::{Compound, Tag};
 
 // ---- data-version boundaries (upstream MCVersionImplementation) ----
 
+/// default chunk `yPos` when the tag is absent (pre-1.18 layout).
+pub const Y_POS_DEFAULT: i32 = -4;
+
 pub const DV_15W32A: i32 = 100; // first supported format: Level.Sections byte blocks
 pub const DV_17W47A: i32 = 1451; // flattened palette sections (Level.Sections: Palette/BlockStates)
 pub const DV_18W06A: i32 = 1466; // Level.Status, int biomes, Heightmaps compound
@@ -60,7 +63,7 @@ pub fn data_container(root: &Compound, dv: i32) -> Option<&Compound> {
     if dv >= DV_21W43A {
         Some(root)
     } else {
-        nbt_level(root)
+        crate::nbt::level_from_root(root)
     }
 }
 
@@ -81,9 +84,6 @@ pub fn sections_key(dv: i32) -> &'static str {
     }
 }
 
-fn nbt_level(root: &Compound) -> Option<&Compound> {
-    crate::nbt::level_from_root(root)
-}
 
 /// The section list, located by presence: root `sections` (>= 21w43a),
 /// then `Level.Sections` (< 21w43a — including the 2834-2843 transition
@@ -94,7 +94,7 @@ pub fn sections<'a>(root: &'a Compound) -> Option<(&'a Vec<Tag>, &'a Compound)> 
     if let Some((_, l)) = root.get("sections").and_then(Tag::as_list) {
         return Some((l, root));
     }
-    let level = nbt_level(root)?;
+    let level = crate::nbt::level_from_root(root)?;
     let l = ["Sections", "sections"]
         .iter()
         .find_map(|k| level.get(*k).and_then(Tag::as_list))?;
@@ -164,7 +164,7 @@ pub const TILE_ENTITY_LIST_KEYS: &[&str] = &["block_entities", "tile_entities", 
 /// root, then under `Level` (upstream picks exactly one source; summing
 /// would double-count).
 pub fn list_size(data: &Compound, keys: &[&str]) -> i64 {
-    let level = nbt_level(data);
+    let level = crate::nbt::level_from_root(data);
     for k in keys {
         for c in [Some(data), level] {
             if let Some((_, l)) = c.and_then(|cc| cc.get(*k)).and_then(Tag::as_list) {
@@ -349,7 +349,7 @@ impl Default for PackedSrc<'_> {
 }
 
 #[inline]
-fn mask(bits: usize) -> u64 {
+pub(crate) fn mask(bits: usize) -> u64 {
     if bits >= 64 {
         u64::MAX
     } else {
@@ -360,7 +360,7 @@ fn mask(bits: usize) -> u64 {
 /// Spanning-layout read (< 20w17a): `bits` at absolute bit position
 /// `bit` may cross a long boundary. Out-of-range longs read as 0.
 #[inline]
-fn get_spanning(src: &PackedSrc<'_>, bit: usize, bits: usize) -> u64 {
+pub(crate) fn get_spanning(src: &PackedSrc<'_>, bit: usize, bits: usize) -> u64 {
     let li = bit >> 6;
     let off = bit & 63;
     if off + bits > 64 {
@@ -425,78 +425,8 @@ impl<'a> PackedData<'a> {
             (self.src.long(li) >> ((index % ipl) * bits)) & mask(bits)
         }
     }
-
-    /// Cursor at `index`, stepping `step` indexes down per `prev()`
-    /// (the renderers walk columns by 256 = one section row).
-    pub fn cursor(&self, index: usize, step: usize) -> PackedCursor<'a> {
-        let mut c = PackedCursor {
-            data: *self,
-            bit_pos: 0,
-            step_bits: 0,
-            li: 0,
-            rem: 0,
-            step_li: 0,
-            step_rem: 0,
-        };
-        if self.spanning {
-            c.bit_pos = index * self.bits;
-            c.step_bits = step * self.bits;
-        } else {
-            let ipl = self.ipl();
-            c.li = index / ipl;
-            c.rem = index % ipl;
-            c.step_li = step / ipl;
-            c.step_rem = step % ipl;
-        }
-        c
-    }
 }
 
-/// Incremental cursor over a [`PackedData`]: O(1) per step with no
-/// division, for the renderers' top-down column scans.
-#[derive(Clone, Copy)]
-pub struct PackedCursor<'a> {
-    data: PackedData<'a>,
-    /// spanning layout: absolute bit position of the current index.
-    bit_pos: usize,
-    step_bits: usize,
-    /// non-spanning layout: long index + index-in-long of the current
-    /// index, and their per-step decrements.
-    li: usize,
-    rem: usize,
-    step_li: usize,
-    step_rem: usize,
-}
-
-impl PackedCursor<'_> {
-    #[inline]
-    pub fn get(&self) -> u64 {
-        let bits = self.data.bits;
-        if bits == 0 {
-            return 0;
-        }
-        if self.data.spanning {
-            get_spanning(&self.data.src, self.bit_pos, bits)
-        } else {
-            (self.data.src.long(self.li) >> (self.rem * bits)) & mask(bits)
-        }
-    }
-
-    /// move `step` indexes down (underflow saturates — corrupt data).
-    #[inline]
-    pub fn prev(&mut self) {
-        if self.data.spanning {
-            self.bit_pos = self.bit_pos.saturating_sub(self.step_bits);
-        } else {
-            if self.rem < self.step_rem {
-                self.rem += self.data.ipl();
-                self.li = self.li.saturating_sub(1);
-            }
-            self.rem -= self.step_rem;
-            self.li = self.li.saturating_sub(self.step_li);
-        }
-    }
-}
 
 /// Writable packed access over an i64 backing (the changer re-encodes
 /// block states as owned long arrays). Both layouts, bits derived from

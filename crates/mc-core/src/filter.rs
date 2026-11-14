@@ -37,20 +37,7 @@ impl Cmp {
             _ => return None,
         })
     }
-    pub fn negate(&self) -> Cmp {
-        match self {
-            Cmp::Eq => Cmp::Ne,
-            Cmp::Ne => Cmp::Eq,
-            Cmp::Lt => Cmp::Ge,
-            Cmp::Gt => Cmp::Le,
-            Cmp::Le => Cmp::Gt,
-            Cmp::Ge => Cmp::Lt,
-            Cmp::Contains => Cmp::ContainsNot,
-            Cmp::ContainsNot => Cmp::Contains,
-            Cmp::Intersects => Cmp::IntersectsNot,
-            Cmp::IntersectsNot => Cmp::Intersects,
-        }
-    }
+
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -122,8 +109,8 @@ impl Expr {
 /// Evaluation context for filters that need filesystem access
 /// (Border neighbor lookups, entities dimension, csv selections, player data).
 pub struct FilterCtx {
-    pub region_dir: Option<std::path::PathBuf>,
-    pub entities_dir: Option<std::path::PathBuf>,
+    region_dir: Option<std::path::PathBuf>,
+    entities_dir: Option<std::path::PathBuf>,
     chunk_sets: std::collections::HashMap<i64, Option<crate::selection::ChunkSet>>,
     entities_files: std::collections::HashMap<i64, Option<std::rc::Rc<crate::mca::McaFile>>>,
     csvs: std::collections::HashMap<std::path::PathBuf, Option<crate::selection::Selection>>,
@@ -143,11 +130,6 @@ impl FilterCtx {
             csvs: std::collections::HashMap::new(),
             player_sets: std::collections::HashMap::new(),
         }
-    }
-
-    /// preload the chunk set of the current region (avoid a header reload)
-    pub fn insert_chunk_set(&mut self, region: i64, cs: crate::selection::ChunkSet) {
-        self.chunk_sets.insert(region, Some(cs));
     }
 
     /// region header chunk set for Border lookups (cached).
@@ -252,7 +234,7 @@ pub enum Filter {
 
 impl Filter {
     /// upstream per-filter matchesRegion (only some filters implement it).
-    pub fn matches_region(&self, region: crate::point::Point2i, ctx: &mut FilterCtx) -> MatchType {
+    fn matches_region(&self, region: crate::point::Point2i, ctx: &mut FilterCtx) -> MatchType {
         match self {
             Filter::XPos(cmp, v) | Filter::ZPos(cmp, v) => {
                 let base = region.region_to_chunk();
@@ -275,8 +257,8 @@ impl Filter {
                 };
                 let n = sel
                     .selected_chunks(region)
-                    .map(|c| c.map(|s| s.size()).unwrap_or(1024))
-                    .unwrap_or(0);
+                    .map(|s| s.size() as usize)
+                    .unwrap_or(1024);
                 match cmp {
                     Cmp::Eq => match n {
                         0 => MatchType::None,
@@ -399,7 +381,7 @@ fn biome_names(data: &Compound) -> Vec<String> {
 }
 
 impl Filter {
-    pub fn matches(&self, c: &Chunk, dv: i32, ctx: &mut FilterCtx) -> bool {
+    fn matches(&self, c: &Chunk, dv: i32, ctx: &mut FilterCtx) -> bool {
         let Some(data) = &c.data else { return false };
         let l = chunk::data_container(data, dv).unwrap_or(data);
         match self {
@@ -440,11 +422,12 @@ impl Filter {
                 set_cmp(*cmp, &names, v)
             }
             Filter::Compression(cmp, v) => {
-                num_cmp(*cmp, c.compression.to_byte() as i64, *v)
+                num_cmp(*cmp, c.compression.to_byte() as i8 as i64, *v)
             }
             Filter::LightPopulated(cmp, v) => {
                 let lp = l
                     .get("isLightOn")
+                    .or_else(|| l.get("LightPopulated"))
                     .and_then(|t| t.as_i64())
                     .map(|b| b != 0)
                     .unwrap_or(false);
@@ -489,7 +472,8 @@ impl Filter {
             }
             Filter::Border(cmp, v) => {
                 // 9 when no data or status != full (upstream getNumber)
-                let status = nbt::string_or(Some(l), "Status", "");
+                let status = nbt::string_or(Some(l), "Status", "")
+                    .trim_start_matches("minecraft:");
                 let n = if status != "full" {
                     9
                 } else {
@@ -649,7 +633,7 @@ fn load_player_chunks(
 
 fn read_player_dat(bytes: &[u8]) -> Option<Compound> {
     // player .dat files are gzip-compressed NBT
-    nbt::read_compressed(bytes)
+    crate::mca::read_compressed(bytes)
 }
 
 fn dimension_matches(dim: Option<&Tag>, want: &str) -> bool {

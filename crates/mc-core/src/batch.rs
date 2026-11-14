@@ -16,6 +16,19 @@ pub enum McKind {
     Entities,
 }
 
+/// region/poi/entities in one place — every table that enumerates the three
+/// file kinds (save order, NBT editor tabs, job bodies) uses this order.
+pub const MCA_KINDS: [McKind; 3] = [McKind::Region, McKind::Poi, McKind::Entities];
+
+/// the mca file name for a kind, matching files::{region,poi,entities} dir names.
+pub fn mca_kind_dir(kind: McKind) -> &'static str {
+    match kind {
+        McKind::Region => "region",
+        McKind::Poi => "poi",
+        McKind::Entities => "entities",
+    }
+}
+
 /// The mca files backing one region (region/poi/entities); `None` where the
 /// file does not exist on disk. `touch` marks a file dirty; the runner saves
 /// dirty files after the body returns.
@@ -52,25 +65,36 @@ impl RegionFiles {
         self.dirty |= 1 << kind as u8;
     }
 
+    /// Snapshot `dst` into this batch's backup set (no-op when the job runs
+    /// without a stamp). Every write path — save_dirty and the manual
+    /// copy/delete sites — calls this before overwriting.
+    pub fn backup(&self, dst: &std::path::Path) {
+        if let Some(st) = &self.backup_stamp {
+            crate::files::backup_file(dst, st);
+        }
+    }
+
+    pub fn file_mut(&mut self, kind: McKind) -> &mut Option<McaFile> {
+        match kind {
+            McKind::Region => &mut self.region,
+            McKind::Poi => &mut self.poi,
+            McKind::Entities => &mut self.entities,
+        }
+    }
+
     /// Save every touched file in place; returns how many were written.
     /// Failures are pushed onto `errors` (a false `Ok` from
     /// save_with_temp_file means "nothing to write" — not an error).
     pub fn save_dirty(&mut self, errors: &mut Vec<String>) -> usize {
         let mut written = 0;
-        for (i, f) in [
-            &mut self.region,
-            &mut self.poi,
-            &mut self.entities,
-        ]
-        .iter_mut()
-        .enumerate()
-        {
+        let stamp = self.backup_stamp.clone();
+        for (i, kind) in MCA_KINDS.iter().enumerate() {
             if self.dirty & (1 << i) == 0 {
                 continue;
             }
-            if let Some(m) = f {
+            if let Some(m) = self.file_mut(*kind) {
                 let path = m.file.clone();
-                if let Some(st) = &self.backup_stamp {
+                if let Some(st) = &stamp {
                     crate::files::backup_file(&path, st);
                 }
                 match m.save_with_temp_file(&path) {

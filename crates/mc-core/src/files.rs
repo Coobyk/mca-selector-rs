@@ -1,7 +1,7 @@
 //! Port of io.FileHelper + config directory resolution (Config.BASE_*).
 
 use crate::mca::WorldDirectories;
-use crate::nbt::{self, Tag};
+use crate::nbt::Tag;
 use crate::point::Point2i;
 use std::path::{Path, PathBuf};
 
@@ -42,11 +42,8 @@ pub fn world_uuid(region_dir: &Path) -> String {
     name_uuid(region_dir.to_string_lossy().as_bytes()).replace('-', "")
 }
 
-fn env_or(env: &str, def: &str) -> PathBuf {
-    std::env::var(env).map(PathBuf::from).unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(def.replace('~', &home))
-    })
+fn home_dir() -> PathBuf {
+    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| ".".into())
 }
 
 /// BASE_CACHE_DIR (linux branch: XDG_CACHE_HOME/mcaselector or ~/.cache/mcaselector)
@@ -57,7 +54,7 @@ pub fn base_cache_dir() -> PathBuf {
     P.get_or_init(|| {
         let dir = std::env::var("XDG_CACHE_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| env_or("HOME", "~").join(".cache"));
+            .unwrap_or_else(|_| home_dir().join(".cache"));
         let p = dir.join("mcaselector");
         let _ = std::fs::create_dir_all(&p);
         p
@@ -71,7 +68,7 @@ pub fn base_config_dir() -> PathBuf {
     P.get_or_init(|| {
         let dir = std::env::var("XDG_CONFIG_HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| env_or("HOME", "~").join(".mcaselector"));
+            .unwrap_or_else(|_| home_dir().join(".mcaselector"));
         let p = dir.join("mcaselector");
         let _ = std::fs::create_dir_all(&p);
         p
@@ -146,7 +143,7 @@ pub fn detect_dimension_directories(dir: &Path) -> Vec<PathBuf> {
     if is_valid_dimension(dir) {
         result.push(dir.to_path_buf());
     }
-    for sub in ["DIM-1", "DIM1"] {
+    for sub in LEGACY_DIMS {
         let p = dir.join(sub);
         if is_valid_dimension(&p) {
             result.push(p);
@@ -155,7 +152,7 @@ pub fn detect_dimension_directories(dir: &Path) -> Vec<PathBuf> {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if name == "DIM-1" || name == "DIM1" {
+            if LEGACY_DIMS.contains(&name.as_str()) {
                 continue;
             }
             if is_dim_folder(&name) && e.path().is_dir() && is_valid_dimension(&e.path()) {
@@ -165,6 +162,9 @@ pub fn detect_dimension_directories(dir: &Path) -> Vec<PathBuf> {
     }
     result
 }
+
+/// pre-1.13 saves keep the nether/end dims directly under the world root
+const LEGACY_DIMS: [&str; 2] = ["DIM-1", "DIM1"];
 
 fn is_dim_folder(name: &str) -> bool {
     // ^DIM-?\d+$
@@ -186,7 +186,12 @@ fn detect_datapack_dimensions(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) 
             continue;
         }
         let name = e.file_name().to_string_lossy().to_string();
-        if depth == 1 && matches!(name.as_str(), "overworld" | "the_nether" | "the_end") {
+        // vanilla dims under dimensions/minecraft/ are covered by the
+        // explicit candidates above — skip them only in that namespace
+        if depth == 1
+            && dir.file_name().map(|n| n == "minecraft").unwrap_or(false)
+            && matches!(name.as_str(), "overworld" | "the_nether" | "the_end")
+        {
             continue;
         }
         if is_valid_dimension(&p) {
@@ -206,18 +211,18 @@ pub fn world_seed(region_dir: &Path) -> Option<i64> {
         if !p.is_file() {
             continue;
         }
-        let bytes = std::fs::read(&p).ok()?;
-        let root = nbt::read_compressed(&bytes)?;
+        let Ok(bytes) = std::fs::read(&p) else { continue };
+        let Some(root) = crate::mca::read_compressed(&bytes) else { continue };
         let data = root.get("Data").and_then(Tag::as_compound);
-        if let Some(wgs) = data
+        let seed = data
             .and_then(|d| d.get("WorldGenSettings"))
             .and_then(Tag::as_compound)
-        {
-            if let Some(s) = wgs.get("seed").and_then(Tag::as_i64) {
-                return Some(s);
-            }
+            .and_then(|w| w.get("seed"))
+            .or_else(|| data.and_then(|d| d.get("RandomSeed")))
+            .and_then(Tag::as_i64);
+        if seed.is_some() {
+            return seed;
         }
-        return data.and_then(|d| d.get("RandomSeed")).and_then(Tag::as_i64);
     }
     None
 }
@@ -230,10 +235,12 @@ pub fn backup_root_for(path: &Path) -> Option<PathBuf> {
 
 /// per-operation stamp — one backup set per batch job.
 pub fn backup_stamp() -> String {
-    let secs = std::time::SystemTime::now()
+    let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    let ms = millis % 1000;
+    let secs = millis / 1000;
     // civil-from-days (Howard Hinnant), UTC
     let days = (secs / 86400) as i64;
     let rem = secs % 86400;
@@ -248,7 +255,7 @@ pub fn backup_stamp() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mo = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mo <= 2 { y + 1 } else { y };
-    format!("{y:04}{mo:02}{d:02}-{h:02}{m:02}{s:02}")
+    format!("{y:04}{mo:02}{d:02}-{h:02}{m:02}{s:02}{ms:03}")
 }
 
 /// Snapshot `path` before a destructive write: hardlink (free — saves go

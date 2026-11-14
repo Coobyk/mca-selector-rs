@@ -2,17 +2,13 @@
 //!
 //! All shift-based conversions use arithmetic shifts, matching Java's `>>`.
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Point2i {
     pub x: i32,
     pub z: i32,
 }
 
 impl Point2i {
-    pub const ZERO: Point2i = Point2i { x: 0, z: 0 };
-
     pub const fn new(x: i32, z: i32) -> Self {
         Point2i { x, z }
     }
@@ -129,10 +125,6 @@ impl Point2f {
 
     pub fn mul(&self, m: f32) -> Point2f {
         Point2f::new(self.x * m, self.z * m)
-    }
-
-    pub fn div(&self, d: f32) -> Point2f {
-        Point2f::new(self.x / d, self.z / d)
     }
 
     pub fn to_point2i(&self) -> Point2i {

@@ -24,8 +24,6 @@ pub enum ApplyType {
 
 #[derive(Default, Debug)]
 pub struct FilterJobResult {
-    /// region files processed (not skipped)
-    pub regions_processed: usize,
     /// chunks matched by the filter (or touched by run_change_fields)
     pub chunks_matched: usize,
     /// region files whose contents were written back / written out
@@ -86,7 +84,7 @@ pub fn run_filter_select(
     apply: ApplyType,
     radius: i32,
     target: &mut Selection,
-) -> Result<FilterJobResult, String> {
+) -> FilterJobResult {
     let mut res = FilterJobResult::default();
     let mut fctx = FilterCtx::new(wd.region.clone(), wd.entities.clone());
     let all = Selection::all();
@@ -132,9 +130,8 @@ pub fn run_filter_select(
             }
         }
     });
-    res.regions_processed = sum.processed;
     res.errors += sum.errors.len();
-    Ok(res)
+    res
 }
 
 /// upstream DeleteFilterJob: delete every matching chunk from all three
@@ -143,7 +140,7 @@ pub fn run_filter_delete(
     expr: &Expr,
     wd: &WorldDirectories,
     selection: Option<&Selection>,
-) -> Result<FilterJobResult, String> {
+) -> FilterJobResult {
     let mut res = FilterJobResult::default();
     let mut fctx = FilterCtx::new(wd.region.clone(), wd.entities.clone());
     let all = Selection::all();
@@ -164,13 +161,8 @@ pub fn run_filter_delete(
             return;
         }
         res.chunks_matched += to_delete.size();
-        for kind in [batch::McKind::Region, batch::McKind::Poi, batch::McKind::Entities] {
-            let f = match kind {
-                batch::McKind::Region => &mut files.region,
-                batch::McKind::Poi => &mut files.poi,
-                batch::McKind::Entities => &mut files.entities,
-            };
-            if let Some(m) = f {
+        for kind in batch::MCA_KINDS {
+            if let Some(m) = files.file_mut(kind) {
                 m.delete_chunks(&to_delete);
                 files.touch(kind);
             }
@@ -179,9 +171,8 @@ pub fn run_filter_delete(
         // files_written.
         res.files_written += files.save_dirty(errs);
     });
-    res.regions_processed = sum.processed;
     res.errors += sum.errors.len();
-    Ok(res)
+    res
 }
 
 /// upstream ChangeFieldsJob + Region.applyFieldChanges: apply parsed change
@@ -192,7 +183,7 @@ pub fn run_change_fields(
     force: bool,
     wd: &WorldDirectories,
     selection: Option<&Selection>,
-) -> Result<FilterJobResult, String> {
+) -> FilterJobResult {
     let mut res = FilterJobResult::default();
     let all = Selection::all();
     let sel = effective_sel(selection, &all);
@@ -224,7 +215,7 @@ pub fn run_change_fields(
             let cr = crate::changer::apply_change(&mut refs, fields, force);
             if cr.applied > 0 {
                 res.chunks_matched += 1;
-                for kind in [batch::McKind::Region, batch::McKind::Poi, batch::McKind::Entities] {
+                for kind in batch::MCA_KINDS {
                     files.touch(kind);
                 }
             }
@@ -232,9 +223,8 @@ pub fn run_change_fields(
         }
         res.files_written += files.save_dirty(errs);
     });
-    res.regions_processed = sum.processed;
     res.errors += sum.errors.len();
-    Ok(res)
+    res
 }
 
 /// upstream ExportFilterJob: write matching chunks into `dest`
@@ -245,7 +235,7 @@ pub fn run_filter_export(
     wd: &WorldDirectories,
     selection: Option<&Selection>,
     dest: &WorldDirectories,
-) -> Result<FilterJobResult, String> {
+) -> FilterJobResult {
     let mut res = FilterJobResult::default();
     let mut fctx = FilterCtx::new(wd.region.clone(), wd.entities.clone());
     let all = Selection::all();
@@ -292,7 +282,6 @@ pub fn run_filter_export(
             }
         }
     });
-    res.regions_processed = sum.processed;
     res.errors += sum.errors.len();
-    Ok(res)
+    res
 }

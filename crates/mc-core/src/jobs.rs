@@ -16,29 +16,28 @@ pub fn active_jobs() -> usize {
     ACTIVE.load(Ordering::Relaxed)
 }
 
-/// A job carries its work plus an optional dynamic priority supplier
-/// (tile-map jobs re-rank by queue pressure; everything else passes `None`).
+/// A job carries its work plus an optional priority offset. Tile-map jobs
+/// pass an offset computed from queue pressure at enqueue (bounded by
+/// [`MAX_DYNAMIC_PRIO`]); everything else passes `None`.
 pub struct Job {
     id: i64,
     base: i64,
-    prio: Option<Box<dyn Fn() -> i64 + Send>>,
+    prio: i64,
     work: Box<dyn FnOnce() + Send>,
 }
 
 impl Job {
-    pub fn new(base: i64, prio: Option<Box<dyn Fn() -> i64 + Send>>, work: impl FnOnce() + Send + 'static) -> Self {
+    pub fn new(base: i64, prio: Option<i64>, work: impl FnOnce() + Send + 'static) -> Self {
         Job {
             id: JOB_ID.fetch_add(1, Ordering::Relaxed),
             base,
-            prio,
+            prio: prio.unwrap_or(0),
             work: Box::new(work),
         }
     }
-    /// effective priority: base + dynamic offset. Evaluated once at enqueue
-    /// (see HeapEntry::prio) — a live re-read per heap comparison would also
-    /// run arbitrary thunk code while the queue lock is held.
+    /// effective priority: base + enqueue-time offset (see HeapEntry::prio).
     fn priority(&self) -> i64 {
-        self.base + self.prio.as_ref().map(|p| p()).unwrap_or(0)
+        self.base + self.prio
     }
     fn run(self) {
         // a panicking job must not take its worker thread down — upstream
@@ -59,7 +58,7 @@ impl Job {
     }
 }
 
-struct Queue {
+pub struct Queue {
     inner: Mutex<Inner>,
     cv: Condvar,
 }
@@ -69,7 +68,7 @@ struct Queue {
 /// `fast` holds jobs whose *base* priority is better than PRIORITY_LOW
 /// (MEDIUM/HIGH: overlay parses, png loads); `slow` holds the bulk
 /// render/batch-op backlog. Callers never let the dynamic prio offset cross
-/// the class boundary (offsets are in 1..=9_999_999, classes are 10M apart),
+/// the class boundary (offsets are in 1..=MAX_DYNAMIC_PRIO, classes are 10M apart),
 /// so classifying by `base` is equivalent to classifying by effective
 /// priority — and it lets one reserved worker serve `fast` exclusively
 /// without a slow job ever masking a fast one underneath it in the heap.
@@ -111,12 +110,13 @@ impl Ord for HeapEntry {
     }
 }
 
-pub struct Pools {
-    process: Arc<Queue>,
-}
+/// dynamic prio offsets must stay below this to keep the class boundary:
+/// PRIORITY classes are 10M apart and lanes classify on the base value.
+pub const MAX_DYNAMIC_PRIO: i64 = 9_999_999;
 
-static POOLS: std::sync::OnceLock<Pools> = std::sync::OnceLock::new();
+static QUEUE: std::sync::OnceLock<Queue> = std::sync::OnceLock::new();
 static PROCESS_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static SPAWNED: std::sync::Once = std::sync::Once::new();
 
 /// app-configured process pool size (upstream Config.processThreads); must be
 /// called before first pools() use.
@@ -124,8 +124,12 @@ pub fn set_process_threads(n: usize) {
     let _ = PROCESS_THREADS.set(n.max(1));
 }
 
-pub fn pools() -> &'static Pools {
-    POOLS.get_or_init(|| {
+pub fn pools() -> &'static Queue {
+    let q = QUEUE.get_or_init(|| Queue {
+        inner: Mutex::new(Inner::default()),
+        cv: Condvar::new(),
+    });
+    SPAWNED.call_once(|| {
         let cpus = thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -134,15 +138,20 @@ pub fn pools() -> &'static Pools {
         // linearly with cores on big machines. `process_threads` config
         // overrides this via set_process_threads().
         let default_threads = cpus.saturating_sub(2).max(4);
-        let process_threads = PROCESS_THREADS
+        let n = PROCESS_THREADS
             .get()
             .copied()
             .unwrap_or(default_threads)
             .max(1);
-        Pools {
-            process: spawn_pool(process_threads, "processPool"),
+        for _ in 0..n {
+            spawn_worker(q, "processPool", Lane::Any);
         }
-    })
+        // the express worker is extra on top of the configured/general
+        // count, so `process_threads` still means "bulk worker count" and
+        // the reservation costs nothing when the queue is calm.
+        spawn_worker(q, "processPool-fast", Lane::FastOnly);
+    });
+    q
 }
 
 /// Which lanes a worker may drain.
@@ -157,23 +166,7 @@ enum Lane {
     FastOnly,
 }
 
-fn spawn_pool(n: usize, name: &str) -> Arc<Queue> {
-    let q = Arc::new(Queue {
-        inner: Mutex::new(Inner::default()),
-        cv: Condvar::new(),
-    });
-    for _ in 0..n {
-        spawn_worker(&q, name, Lane::Any);
-    }
-    // the express worker is extra on top of the configured/general count, so
-    // `process_threads` still means "bulk worker count" and the reservation
-    // costs nothing when the queue is calm. Total threads = n + 1.
-    spawn_worker(&q, "processPool-fast", Lane::FastOnly);
-    q
-}
-
-fn spawn_worker(q: &Arc<Queue>, name: &str, lane: Lane) {
-    let q = q.clone();
+fn spawn_worker(q: &'static Queue, name: &str, lane: Lane) {
     let name = name.to_string();
     thread::Builder::new()
         .name(name)
@@ -209,21 +202,18 @@ fn spawn_worker(q: &Arc<Queue>, name: &str, lane: Lane) {
         .expect("spawn pool thread");
 }
 
-impl Pools {
+impl Queue {
     /// Enqueue a job. Upstream had two pools (ProcessDataWriterPool for batch
     /// ops, a process pool for the rest); here both collapse onto the one
     /// two-lane queue described at [`Inner`].
     pub fn add_process(&self, job: Job) {
-        // snapshot priority and classify *before* taking the lock: the prio
-        // thunk is arbitrary user code and must not run under the queue lock.
-        // (also before ACTIVE++ so a panicking thunk can't leak the count)
         let entry = HeapEntry {
             prio: job.priority(),
             job,
         };
         ACTIVE.fetch_add(1, Ordering::Relaxed);
         {
-            let mut g = self.process.inner.lock();
+            let mut g = self.inner.lock();
             if entry.job.base < PRIORITY_LOW {
                 g.fast.push(entry);
             } else {
@@ -233,12 +223,12 @@ impl Pools {
         // notify after releasing the lock so the woken worker doesn't bounce
         // off a still-held mutex. notify_one is enough: every waiter pops at
         // most one job, and the FastOnly worker relays a slow-lane wakeup.
-        self.process.cv.notify_one();
+        self.cv.notify_one();
     }
 
     pub fn clear_queues(&self) {
         let n = {
-            let mut g = self.process.inner.lock();
+            let mut g = self.inner.lock();
             let n = g.fast.len() + g.slow.len();
             g.fast.clear();
             g.slow.clear();

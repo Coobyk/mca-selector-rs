@@ -150,7 +150,7 @@ impl MainView {
                         match ctx.selection.selected_chunks(ctx.region) {
                             // whole region selected: upstream deletes all
                             // three mca files outright.
-                            Some(None) => {
+                            None => {
                                 for m in [
                                     files.region.take(),
                                     files.poi.take(),
@@ -164,7 +164,7 @@ impl MainView {
                                     }
                                 }
                             }
-                            Some(Some(cs)) => {
+                            Some(cs) => {
                                 if cs.is_empty() {
                                     return;
                                 }
@@ -183,7 +183,6 @@ impl MainView {
                                     files.touch(McKind::Entities);
                                 }
                             }
-                            None => {}
                         }
                     },
                 );
@@ -294,18 +293,16 @@ impl MainView {
             move |files, ctx, errs| {
                 let dst = region_dir.join(mca_file_name(ctx.region));
                 match ctx.selection.selected_chunks(ctx.region) {
-                    Some(None) => {
+                    None => {
                         // whole region: copy the file verbatim
                         if let Some(m) = files.region.as_ref() {
-                            if let Some(st) = &files.backup_stamp {
-                                files::backup_file(&dst, st);
-                            }
+                            files.backup(&dst);
                             if let Err(e) = std::fs::copy(&m.file, &dst) {
                                 errs.push(format!("{}: {e}", dst.display()));
                             }
                         }
                     }
-                    Some(Some(cs)) => {
+                    Some(cs) => {
                         if cs.is_empty() {
                             return;
                         }
@@ -319,7 +316,6 @@ impl MainView {
                             errs.push(format!("{}: {e}", dst.display()));
                         }
                     }
-                    None => {}
                 }
             },
         );
@@ -332,8 +328,6 @@ impl MainView {
         let clip = files::base_cache_dir().join("clipboard").join("region");
         let _ = std::fs::remove_dir_all(&clip);
         let _ = std::fs::create_dir_all(&clip);
-        let Some(origin_l) = sel.regions().next().map(|(k, _)| k) else { return };
-        let origin = Point2i::from_long(origin_l);
         let dirs = crate::config::world().map(|w| w.dirs.clone()).unwrap_or_default();
         let regions = batch::effective_regions(&sel, &dirs);
         let clip_sel = sel.clone();
@@ -349,25 +343,22 @@ impl MainView {
                 if !sum.errors.is_empty() {
                     job_info(&tx, format!("Finished with {} error(s):\n{}", sum.errors.len(), sum.errors.join("\n")));
                 }
-                // record origin + selection for offset paste
+                // selection bitmask for paste's "selection only" mode
                 let clip = files::base_cache_dir().join("clipboard").join("region");
-                let _ = std::fs::write(clip.join("../origin.txt"), format!("{},{}", origin.x, origin.z));
                 let _ = clip_sel.save_csv(&clip.join("../selection.csv"));
             }),
             move |files, ctx, errs| {
                 let dst = clip.join(mca_file_name(ctx.region));
                 match ctx.selection.selected_chunks(ctx.region) {
-                    Some(None) => {
+                    None => {
                         if let Some(m) = files.region.as_ref() {
-                            if let Some(st) = &files.backup_stamp {
-                                files::backup_file(&dst, st);
-                            }
+                            files.backup(&dst);
                             if let Err(e) = std::fs::copy(&m.file, &dst) {
                                 errs.push(format!("{}: {e}", dst.display()));
                             }
                         }
                     }
-                    Some(Some(cs)) => {
+                    Some(cs) => {
                         if cs.is_empty() {
                             return;
                         }
@@ -380,7 +371,6 @@ impl MainView {
                             errs.push(format!("{}: {e}", dst.display()));
                         }
                     }
-                    None => {}
                 }
             },
         );
@@ -738,7 +728,7 @@ impl MainView {
                             m.load(false).ok()?;
                             Some((p, m))
                         };
-                        let mut fail = |m: &str| job_info(&tx, format!("swap failed: {m}"));
+                        let fail = |m: &str| job_info(&tx, format!("swap failed: {m}"));
                         let (p1, mut m1) = match load(r1) { Some(v) => v, None => return fail("could not load first region") };
                         _p.inc();
                         let (p2, mut m2) = match load(r2) { Some(v) => v, None => return fail("could not load second region") };
@@ -825,13 +815,11 @@ impl MainView {
                     jobs::PRIORITY_LOW, None,
                     move || {
                         let __p = Progress::new("Changing NBT data", -1);
-                        match mc_core::filter_ops::run_change_fields(&fields, force, &dirs, sel_opt.as_ref()) {
-                            Ok(r) => job_info(&tx, format!(
-                                "changed data in {} chunks ({} files written, {} errors)",
-                                r.chunks_matched, r.files_written, r.errors
-                            )),
-                            Err(e) => job_info(&tx, format!("change fields failed: {e}")),
-                        }
+                        let r = mc_core::filter_ops::run_change_fields(&fields, force, &dirs, sel_opt.as_ref());
+                        job_info(&tx, format!(
+                            "changed data in {} chunks ({} files written, {} errors)",
+                            r.chunks_matched, r.files_written, r.errors
+                        ));
                         for region in inv {
                             let _ = tx.send(TileResult::Invalidate { region });
                         }
@@ -867,13 +855,11 @@ impl MainView {
                         .unwrap_or_default();
                     // force: write the flag even on chunks missing it —
                     // otherwise untouched chunks keep stale light forever.
-                    match mc_core::filter_ops::run_change_fields(&fields, true, &dirs, sel_opt.as_ref()) {
-                        Ok(r) => job_info(&tx, format!(
-                            "marked {} chunks for relighting ({} files written, {} errors)\nMinecraft will relight them on next load.",
-                            r.chunks_matched, r.files_written, r.errors
-                        )),
-                        Err(e) => job_info(&tx, format!("relight failed: {e}")),
-                    }
+                    let r = mc_core::filter_ops::run_change_fields(&fields, true, &dirs, sel_opt.as_ref());
+                    job_info(&tx, format!(
+                        "marked {} chunks for relighting ({} files written, {} errors)\nMinecraft will relight them on next load.",
+                        r.chunks_matched, r.files_written, r.errors
+                    ));
                 }));
                 v.dialog = None;
                 cx.notify();
@@ -945,12 +931,10 @@ impl MainView {
                     jobs::PRIORITY_LOW, None,
                     move || {
                         let __p = Progress::new("Filtering chunks", -1);
-                        match mc_core::filter_ops::run_filter_select(
+                        let r = mc_core::filter_ops::run_filter_select(
                             &expr, &dirs, bound.as_ref(), apply, radius, &mut target,
-                        ) {
-                            Ok(r) => job_info(&tx, format!("{} chunks matched the filter", r.chunks_matched)),
-                            Err(e) => job_info(&tx, format!("filter failed: {e}")),
-                        }
+                        );
+                        job_info(&tx, format!("{} chunks matched the filter", r.chunks_matched));
                         let _ = tx.send(TileResult::FilterResult { selection: target });
                     }));
             }
@@ -966,13 +950,11 @@ impl MainView {
                             jobs::PRIORITY_LOW, None,
                             move || {
                                 let __p = Progress::new("Deleting filtered chunks", -1);
-                                match mc_core::filter_ops::run_filter_delete(&expr, &dirs, sel_bound.as_ref()) {
-                                    Ok(r) => job_info(&tx, format!(
-                                        "deleted {} chunks ({} files written)",
-                                        r.chunks_matched, r.files_written
-                                    )),
-                                    Err(e) => job_info(&tx, format!("delete failed: {e}")),
-                                }
+                                let r = mc_core::filter_ops::run_filter_delete(&expr, &dirs, sel_bound.as_ref());
+                                job_info(&tx, format!(
+                                    "deleted {} chunks ({} files written)",
+                                    r.chunks_matched, r.files_written
+                                ));
                                 for region in inv {
                                     let _ = tx.send(TileResult::Invalidate { region });
                                 }
@@ -1018,15 +1000,13 @@ impl MainView {
                                             jobs::PRIORITY_LOW, None,
                                             move || {
                                                 let __p = Progress::new("Exporting filtered chunks", -1);
-                                                match mc_core::filter_ops::run_filter_export(
+                                                let r = mc_core::filter_ops::run_filter_export(
                                                     &expr, &dirs, sel_bound.as_ref(), &dest,
-                                                ) {
-                                                    Ok(r) => job_info(&tx, format!(
-                                                        "exported {} chunks ({} files written)",
-                                                        r.chunks_matched, r.files_written
-                                                    )),
-                                                    Err(e) => job_info(&tx, format!("export failed: {e}")),
-                                                }
+                                                );
+                                                job_info(&tx, format!(
+                                                    "exported {} chunks ({} files written)",
+                                                    r.chunks_matched, r.files_written
+                                                ));
                                             }));
                                         v.dialog = None;
                                         cx.notify();
@@ -1085,9 +1065,8 @@ fn import_mca_dir(
                 let sel_cs = match &src_sel {
                     None => { ChunkSet::full() }
                     Some(s) => match s.selected_chunks(src_region) {
-                        Some(Some(cs)) => cs,
-                        Some(None) => { ChunkSet::full() }
-                        None => continue,
+                        Some(cs) => cs,
+                        None => { ChunkSet::full() }
                     },
                 };
                 if sel_cs.is_empty() { continue; }

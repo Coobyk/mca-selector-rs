@@ -27,10 +27,6 @@ impl ChunkSet {
         }
         self.words[i >> 6] &= !(1u64 << (i & 63));
     }
-    pub fn clear_all(&mut self) {
-        self.words = [0; 16];
-        self.set_bits = 0;
-    }
     pub fn get(&self, i: usize) -> bool {
         (self.words[i >> 6] >> (i & 63)) & 1 == 1
     }
@@ -159,20 +155,18 @@ impl Selection {
         }
     }
     /// selected chunk bits for a region (None => all selected / inverted-all).
-    pub fn selected_chunks(&self, region: Point2i) -> Option<Option<ChunkSet>> {
+    pub fn selected_chunks(&self, region: Point2i) -> Option<ChunkSet> {
         if self.inverted {
             match self.selection.get(&region.as_long()) {
-                Some(v) => Some(Some(
-                    v.clone().map(|c| c.flip()).unwrap_or_default(),
-                )),
+                Some(v) => Some(v.clone().map(|c| c.flip()).unwrap_or_default()),
                 // inverted + unmarked region = all chunks selected (whole-region
                 // sentinel, matching is_chunk_selected)
-                None => Some(None),
+                None => None,
             }
         } else {
             match self.selection.get(&region.as_long()) {
-                Some(v) => Some(v.clone()),
-                None => Some(Some(ChunkSet::new())),
+                Some(v) => v.clone(),
+                None => Some(ChunkSet::new()),
             }
         }
     }
@@ -377,11 +371,6 @@ impl Selection {
                 }
             }
         }
-    }
-
-    pub fn clear(&mut self) {
-        self.selection.clear();
-        self.inverted = false;
     }
 
     /// merge(other) — union of selections (Selection.merge).
@@ -793,14 +782,14 @@ mod tests {
         let mut s = Selection::all();
         s.set_region(r.as_long(), Some(cs(&[0])));
         match s.selected_chunks(r) {
-            Some(Some(c)) => {
+            Some(c) => {
                 assert_eq!(c.size(), 1023);
                 assert!(!c.get(0));
             }
             other => panic!("expected partial set, got {other:?}"),
         }
         // region with no exclusions -> whole-region sentinel
-        assert_eq!(s.selected_chunks(Point2i::new(1, 1)), Some(None));
+        assert_eq!(s.selected_chunks(Point2i::new(1, 1)), None);
     }
 
     #[test]

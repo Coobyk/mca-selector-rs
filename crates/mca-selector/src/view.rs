@@ -258,16 +258,6 @@ impl Render for MainView {
             .key_context(if self.dialog.is_some() { "dialog" } else { "app" })
             .track_focus(&self.focus)
             .size_full()
-            .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, _w, _cx| {
-                eprintln!(
-                    "[mca] mousedown {:?} ({}, {}) dialog={} menu={:?}",
-                    e.button,
-                    f32::from(e.position.x) as i32,
-                    f32::from(e.position.y) as i32,
-                    v.dialog.as_ref().map(|d| d.name()).unwrap_or("-"),
-                    v.open_menu
-                );
-            }))
             .flex()
             .flex_col()
             .bg(rgb(0x0a0a0a))
@@ -353,7 +343,7 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &CoordStyleDynamicAction, _w, cx| {
                 v.map.coordinate_style = crate::tilemap::CoordinateStyle::Dynamic;
                 let mut g = config::global();
-                g.coordinate_style = "DYNAMIC".into();
+                g.coordinate_style = v.map.coordinate_style.name().into();
                 config::set_global(g);
                 Self::rebuild_menus(cx);
                 cx.notify();
@@ -361,7 +351,7 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &CoordStyleEdgeAction, _w, cx| {
                 v.map.coordinate_style = crate::tilemap::CoordinateStyle::Edge;
                 let mut g = config::global();
-                g.coordinate_style = "EDGE".into();
+                g.coordinate_style = v.map.coordinate_style.name().into();
                 config::set_global(g);
                 Self::rebuild_menus(cx);
                 cx.notify();
@@ -369,7 +359,7 @@ impl Render for MainView {
             .on_action(cx.listener(|v, _: &CoordStyleGridAction, _w, cx| {
                 v.map.coordinate_style = crate::tilemap::CoordinateStyle::Grid;
                 let mut g = config::global();
-                g.coordinate_style = "GRID".into();
+                g.coordinate_style = v.map.coordinate_style.name().into();
                 config::set_global(g);
                 Self::rebuild_menus(cx);
                 cx.notify();

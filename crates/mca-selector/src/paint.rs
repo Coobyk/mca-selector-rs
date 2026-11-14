@@ -62,9 +62,8 @@ impl MainView {
         let scale = self.map.scale;
         // read-guard instead of config::world(): world() clones the whole
         // WorldState (dirs, dimensions, cfg) and this ran every frame.
-        let show_empty = self.map.show_nonexistent_regions
-            && config::WORLD.read().unwrap().as_ref()
-                .map(|w| w.cfg.show_nonexistent_regions).unwrap_or(true);
+        let show_empty = config::WORLD.read().unwrap().as_ref()
+            .map(|w| w.cfg.show_nonexistent_regions).unwrap_or(true);
         // upstream draws the empty tile image under every unloaded/missing
         // region — one fullscreen quad does the same job. EMPTY_COLOR is
         // opaque and covers the same bounds, so the black clear is only
@@ -724,12 +723,12 @@ fn build_paste_overlay(
             for (region_l, _) in sel.regions() {
                 let base = Point2i::from_long(region_l).region_to_chunk();
                 match sel.selected_chunks(Point2i::from_long(region_l)) {
-                    Some(Some(c)) => {
+                    Some(c) => {
                         for i in c.iter() {
                             put(base.add_p(Point2i::from_chunk_index(i as i32)).add_p(p.offset));
                         }
                     }
-                    Some(None) | None => {
+                    None => {
                         for i in 0..1024i32 {
                             put(base.add_p(Point2i::from_chunk_index(i)).add_p(p.offset));
                         }
@@ -824,7 +823,7 @@ fn marked_chunks_image(region: Point2i, sel: &mc_core::selection::Selection, ver
     }
     let g = config::global();
     let mut px = [0u32; 32 * 32];
-    if let Some(Some(cs)) = sel.selected_chunks(region) {
+    if let Some(cs) = sel.selected_chunks(region) {
         let color = g.chunk_selection_color.to_argb();
         for i in cs.iter() {
             px[i] = color;

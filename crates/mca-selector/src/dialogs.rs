@@ -147,31 +147,6 @@ pub enum Dialog {
     },
 }
 
-impl Dialog {
-    /// short name for trace logging — avoids Debug-formatting the payloads.
-    pub(crate) fn name(&self) -> &'static str {
-        match self {
-            Dialog::Goto { .. } => "Goto",
-            Dialog::About => "About",
-            Dialog::Error { .. } => "Error",
-            Dialog::Confirm { .. } => "Confirm",
-            Dialog::SelectDimension { .. } => "SelectDimension",
-            Dialog::Settings { .. } => "Settings",
-            Dialog::RenderSettings { .. } => "RenderSettings",
-            Dialog::Info { .. } => "Info",
-            Dialog::PasteConfirm { .. } => "PasteConfirm",
-            Dialog::JobProgress => "JobProgress",
-            Dialog::NbtEditor { .. } => "NbtEditor",
-            Dialog::TextInput { .. } => "TextInput",
-            Dialog::Filter { .. } => "Filter",
-            Dialog::ChangeFields { .. } => "ChangeFields",
-            Dialog::Import { .. } => "Import",
-            Dialog::OverlayEditor { .. } => "OverlayEditor",
-            Dialog::StructureLocator { .. } => "StructureLocator",
-        }
-    }
-}
-
 /// locator list model: (display name, canonical name, chunk, block dist)
 /// sorted by distance from the view center and name-filtered.
 fn locator_rows(
@@ -208,10 +183,6 @@ fn locator_rows(
 impl MainView {
     pub(crate) fn dialog_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = event.keystroke.key.as_str();
-        eprintln!(
-            "[mca] dialog_key {k} dialog={}",
-            self.dialog.as_ref().map(|d| d.name()).unwrap_or("-")
-        );
         if let Some(Dialog::Goto { x, z, focus_x, invalid }) = &mut self.dialog {
             match k {
                 "enter" => {
@@ -703,14 +674,13 @@ impl MainView {
                     .child(text_el(format!("Region selection color: rgba({:.2},{:.2},{:.2},{:.2})", draft.region_selection_color.r, draft.region_selection_color.g, draft.region_selection_color.b, draft.region_selection_color.a), 12.))
                     .child(text_el(format!("Chunk selection color: rgba({:.2},{:.2},{:.2},{:.2})", draft.chunk_selection_color.r, draft.chunk_selection_color.g, draft.chunk_selection_color.b, draft.chunk_selection_color.a), 12.))
                     .child(text_el(format!("Paste chunks color: rgba({:.2},{:.2},{:.2},{:.2})", draft.paste_chunks_color.r, draft.paste_chunks_color.g, draft.paste_chunks_color.b, draft.paste_chunks_color.a), 12.))
-                    .child(text_el(format!("Process threads: {}  Write threads: {}  Max loaded files: {}", draft.process_threads, draft.write_threads, draft.max_loaded_files), 12.))
+                    .child(text_el(format!("Process threads: {}", draft.process_threads), 12.))
                     .child(text_el(format!("Minecraft saves dir: {}", draft.mc_saves_dir), 12.))
                     .child(
                         h_flex().gap_1().flex_wrap()
                             .child(self.toggle_global("Chunk grid", draft.show_chunk_grid, |d| &mut d.show_chunk_grid, cx))
                             .child(self.toggle_global("Region grid", draft.show_region_grid, |d| &mut d.show_region_grid, cx))
-                            .child(self.toggle_global("Coordinates", draft.show_coordinates, |d| &mut d.show_coordinates, cx))
-                            .child(self.toggle_global("Debug", draft.debug, |d| &mut d.debug, cx)),
+                            .child(self.toggle_global("Coordinates", draft.show_coordinates, |d| &mut d.show_coordinates, cx)),
                     )
                     .child(
                         h_flex().gap_1()
@@ -769,11 +739,6 @@ impl MainView {
                     .child(text_el("shade: slope lighting  ·  water: draw water (off = see the seabed)  ·  altitude: brighter higher up", 10.).text_color(rgb(0x999999)))
                     .child(
                         h_flex().gap_1().flex_wrap()
-                            .child(self.toggle_render("Smooth render", draft.smooth_rendering, |d| &mut d.smooth_rendering, cx))
-                            .child(self.toggle_render("Smooth overlays", draft.smooth_overlays, |d| &mut d.smooth_overlays, cx)),
-                    )
-                    .child(
-                        h_flex().gap_1().flex_wrap()
                             .child(self.toggle_render("Layer only", draft.render_layer_only, |d| &mut d.render_layer_only, cx))
                             .child(self.toggle_render("Caves", draft.render_caves, |d| &mut d.render_caves, cx))
                             .child(self.toggle_render("Nonexistent", draft.show_nonexistent_regions, |d| &mut d.show_nonexistent_regions, cx)),
@@ -826,7 +791,6 @@ impl MainView {
                                 );
                             }))
                             .on_click(cx.listener(move |v, _, _w, cx| {
-                                eprintln!("[mca] dimension picked: {}", dp.display());
                                 // close the picker FIRST — after do_open,
                                 // `dialog = None` used to erase its error
                                 // dialog, turning a failed open into a
@@ -1488,16 +1452,9 @@ impl MainView {
             }
         };
         let overlay = overlay
-            .on_mouse_down(MouseButton::Left, cx.listener(|v, e: &MouseDownEvent, _w, _cx| {
-                // upstream dialogs are modal — an outside click never
-                // dismisses them (SelectDimension used to vanish here).
-                eprintln!(
-                    "[mca] backdrop mousedown ({}, {}) dialog={}",
-                    f32::from(e.position.x) as i32,
-                    f32::from(e.position.y) as i32,
-                    v.dialog.as_ref().map(|d| d.name()).unwrap_or("-")
-                );
-            }))
+            // absorb backdrop clicks — upstream dialogs are modal, an
+            // outside click must not reach the canvas.
+            .on_mouse_down(MouseButton::Left, cx.listener(|_v, _e: &MouseDownEvent, _w, _cx| {}))
             .child(body);
         Some(
             deferred(

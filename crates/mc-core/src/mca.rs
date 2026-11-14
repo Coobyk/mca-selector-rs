@@ -28,6 +28,13 @@ pub enum CompressionType {
 }
 
 impl CompressionType {
+    /// every variant — one enumeration for tables that must cover all
+    /// compression types (changer's parse, filter validation).
+    pub const ALL: [CompressionType; 10] = [
+        Self::None, Self::Gzip, Self::Zlib, Self::Uncompressed, Self::Lz4,
+        Self::NoneExt, Self::GzipExt, Self::ZlibExt, Self::UncompressedExt, Self::Lz4Ext,
+    ];
+
     pub fn from_byte(b: u8) -> Result<Self> {
         Ok(match b as i8 {
             0 => Self::None,
@@ -60,7 +67,7 @@ impl CompressionType {
         })
     }
     pub fn is_external(&self) -> bool {
-        (self.to_byte() as i8) < -120
+        (self.to_byte() & 0x80) != 0
     }
     pub fn to_byte(&self) -> u8 {
         match self {
@@ -170,24 +177,20 @@ fn lz4_compress_blocks(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Borrowing variant of [`decompress`]: uncompressed payloads are returned as
-/// a view into `data` (zero-copy), compressed ones come back owned.
-/// `bufread` decoders inflate straight from the source slice with no
-/// intermediate buffer copy.
-fn decompress_cow(compression: CompressionType, data: &[u8]) -> Result<Cow<'_, [u8]>> {
+fn decompress(compression: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
     Ok(match compression.base() {
         CompressionType::Gzip => {
             let mut v = Vec::with_capacity(data.len().saturating_mul(4).max(4096));
             GzDecoder::new(data).read_to_end(&mut v)?;
-            Cow::Owned(v)
+            v
         }
         CompressionType::Zlib => {
             let mut v = Vec::with_capacity(data.len().saturating_mul(4).max(4096));
             ZlibDecoder::new(data).read_to_end(&mut v)?;
-            Cow::Owned(v)
+            v
         }
-        CompressionType::Lz4 => Cow::Owned(lz4_decompress_blocks(data)?),
-        _ => Cow::Borrowed(data),
+        CompressionType::Lz4 => lz4_decompress_blocks(data)?,
+        _ => data.to_vec(),
     })
 }
 
@@ -230,9 +233,7 @@ thread_local! {
     static DECOMPRESS_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-pub(crate) fn decompress(compression: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
-    Ok(decompress_cow(compression, data)?.into_owned())
-}
+
 
 fn compress(compression: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
     Ok(match compression.base() {
@@ -278,16 +279,13 @@ impl Chunk {
 pub struct McaFile {
     pub location: Point2i,
     pub file: PathBuf,
-    pub timestamps: [i32; 1024],
+    timestamps: [i32; 1024],
     pub chunks: Vec<Option<Chunk>>,
-    pub offsets: [i32; 1024],
-    pub sectors: [u8; 1024],
+    offsets: [i32; 1024],
+    sectors: [u8; 1024],
     /// set by `load(true)` — arrays were parsed as undecoded byte blobs and
     /// would serialize back corrupted, so all write paths refuse.
     pub raw_mode: bool,
-    /// chunks that failed to parse on the last `load` (upstream logs and
-    /// skips them; we count them so callers can surface the number).
-    pub skipped: usize,
 }
 
 /// 3-byte big-endian chunk-offset decode (header i-th entry)
@@ -295,6 +293,38 @@ fn offset_at(buf: &[u8], i: usize) -> i32 {
     let o = i * 4;
     ((buf[o] as i32) << 16) | ((buf[o + 1] as i32) << 8) | (buf[o + 2] as i32)
 }
+
+/// the 8KiB header's three tables: offsets, sector counts, timestamps.
+fn header_tables(hdr: &[u8; HEADER_SIZE]) -> ([i32; 1024], [u8; 1024], [i32; 1024]) {
+    let mut offsets = [0i32; 1024];
+    let mut sectors = [0u8; 1024];
+    let mut timestamps = [0i32; 1024];
+    for i in 0..1024 {
+        let o = i * 4;
+        offsets[i] = offset_at(hdr, i);
+        sectors[i] = hdr[o + 3];
+        timestamps[i] = i32::from_be_bytes(hdr[4096 + o..4096 + o + 4].try_into().unwrap());
+    }
+    (offsets, sectors, timestamps)
+}
+
+/// read one chunk's `[len i32][type u8][payload]` record at sector-offset
+/// `pos` — synthesizes the buffer layout `parse_chunk` expects without
+/// pulling the whole region file into memory.
+fn read_chunk_record(f: &mut std::fs::File, pos: usize) -> Result<Vec<u8>> {
+    let file_len = f.metadata()?.len() as usize;
+    f.seek(SeekFrom::Start(pos as u64))?;
+    let mut head = [0u8; 5];
+    f.read_exact(&mut head)
+        .map_err(|_| anyhow::anyhow!("chunk offset out of bounds"))?;
+    let length = i32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
+    let payload_len = length.saturating_sub(1).min(file_len.saturating_sub(pos + 5));
+    let mut data = Vec::with_capacity(5 + payload_len);
+    data.extend_from_slice(&head);
+    (&mut *f).take(payload_len as u64).read_to_end(&mut data)?;
+    Ok(data)
+}
+
 
 // -- raw region-file image cache ------------------------------------------------
 
@@ -352,7 +382,6 @@ impl McaFile {
             offsets: [0; 1024],
             sectors: [0; 1024],
             raw_mode: false,
-            skipped: 0,
         })
     }
 
@@ -365,7 +394,6 @@ impl McaFile {
             offsets: [0; 1024],
             sectors: [0; 1024],
             raw_mode: false,
-            skipped: 0,
         }
     }
 
@@ -420,8 +448,8 @@ impl McaFile {
     }
 
     /// loadOffsets: read just the 8KiB header (offsets + sectors + timestamps)
-    /// instead of the whole (multi-MB) region file. Callers like defragment()
-    /// require all three header tables.
+    /// instead of the whole (multi-MB) region file — the Border filter's
+    /// neighbor probes only need the header tables.
     pub fn load_offsets(&mut self) -> Result<()> {
         let mut hdr = [0u8; HEADER_SIZE];
         let mut f = std::fs::File::open(&self.file)?;
@@ -430,22 +458,12 @@ impl McaFile {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e.into()),
         }
-        self.parse_header(&hdr);
+        self.parse_header(hdr[..HEADER_SIZE].try_into().unwrap());
         Ok(())
     }
 
-    fn parse_header(&mut self, hdr: &[u8]) {
-        for i in 0..1024 {
-            let o = i * 4;
-            self.offsets[i] = offset_at(hdr, i);
-            self.sectors[i] = hdr[o + 3];
-            self.timestamps[i] = i32::from_be_bytes([
-                hdr[4096 + o],
-                hdr[4096 + o + 1],
-                hdr[4096 + o + 2],
-                hdr[4096 + o + 3],
-            ]);
-        }
+    fn parse_header(&mut self, hdr: &[u8; HEADER_SIZE]) {
+        (self.offsets, self.sectors, self.timestamps) = header_tables(hdr);
     }
 
     /// load(raw): reads header then every chunk's NBT.
@@ -454,17 +472,15 @@ impl McaFile {
     pub fn load(&mut self, raw: bool) -> Result<()> {
         let data = self.read_file()?;
         self.raw_mode = raw;
-        self.skipped = 0;
         if data.len() <= HEADER_SIZE {
             return Ok(());
         }
-        self.parse_header(&data[..HEADER_SIZE]);
+        self.parse_header(data[..HEADER_SIZE].try_into().unwrap());
         let origin = self.location.region_to_chunk();
         let data: &[u8] = data.as_slice();
         let offsets = &self.offsets;
         let timestamps = &self.timestamps;
         let file = &self.file;
-        let failed = std::sync::atomic::AtomicUsize::new(0);
         let parse = |i: usize| -> Option<Chunk> {
             if offsets[i] == 0 {
                 return None;
@@ -476,10 +492,7 @@ impl McaFile {
                     c.timestamp = timestamps[i];
                     Some(c)
                 }
-                Err(_) => {
-                    failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    None
-                }
+                Err(_) => None,
             }
         };
         // decompress+parse is the dominant region-load cost and chunks are
@@ -502,7 +515,6 @@ impl McaFile {
         } else {
             (0..1024).map(parse).collect()
         };
-        self.skipped = failed.load(std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -543,15 +555,14 @@ impl McaFile {
         let tag = DECOMPRESS_SCRATCH.with(|cell| -> Result<Tag> {
             let mut scratch = cell.borrow_mut();
             let nbt_data = decompress_into(compression, &payload, &mut scratch)?;
-            let mut reader = SliceReader::new(nbt_data);
-            reader.raw_arrays = raw;
             // raw (render) loads don't need block_entities/tick schedules/
             // upgrade_data materialized: keep them as raw spans — every
             // Compound accessor resolves them on first touch, so all
             // readers still see a complete tree. load(false) parses fully
             // (mutation/write-back paths need owned tags up front).
+            let mut reader = SliceReader::new(nbt_data).raw_arrays(raw);
             if raw {
-                reader.lazy_keep = Some(crate::nbt::RENDER_LAZY_KEEP);
+                reader = reader.lazy_keep(crate::nbt::RENDER_LAZY_KEEP);
             }
             Ok(reader.read()?)
         })?;
@@ -574,45 +585,18 @@ impl McaFile {
         // the old version pulled the whole multi-MB region file into memory.
         let mut f = std::fs::File::open(&self.file)?;
         let mut hdr = [0u8; HEADER_SIZE];
-        let mut n = 0usize;
-        while n < HEADER_SIZE {
-            match f.read(&mut hdr[n..]) {
-                Ok(0) => break,
-                Ok(k) => n += k,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        if n < HEADER_SIZE {
+        if f.read_exact(&mut hdr).is_err() {
             return Ok(None);
         }
-        let offset = offset_at(&hdr, idx);
-        let o = idx * 4;
-        let timestamp = i32::from_be_bytes(hdr[4096 + o..4096 + o + 4].try_into().unwrap());
-        if offset <= 0 {
+        let (offsets, _, timestamps) = header_tables(&hdr);
+        if offsets[idx] <= 0 {
             // no chunk recorded — same as load() leaving the slot None
             return Ok(None);
         }
-        let pos = offset as usize * 4096;
-        // parse_chunk wants a buffer laid out as [len i32][type u8][payload]
-        // starting at `pos`; build exactly that slice instead of the file.
-        let file_len = f.metadata()?.len() as usize;
-        f.seek(SeekFrom::Start(pos as u64))?;
-        let mut head = [0u8; 5];
-        if f.read_exact(&mut head).is_err() {
-            // pos+5 beyond EOF — same failure parse_chunk produced when the
-            // offset pointed outside the whole-file image.
-            bail!("chunk offset out of bounds");
-        }
-        let length = i32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
-        let payload_len = length
-            .saturating_sub(1)
-            .min(file_len.saturating_sub(pos + 5));
-        let mut data = Vec::with_capacity(5 + payload_len);
-        data.extend_from_slice(&head);
-        (&mut f).take(payload_len as u64).read_to_end(&mut data)?;
+        let pos = offsets[idx] as usize * 4096;
+        let data = read_chunk_record(&mut f, pos)?;
         let mut c = Self::parse_chunk(&data, 0, abs, &self.file, raw)?;
-        c.timestamp = timestamp;
+        c.timestamp = timestamps[idx];
         Ok(Some(c))
     }
 
@@ -624,9 +608,8 @@ impl McaFile {
         let mut f = std::fs::File::open(&self.file)?;
         let mut hdr = [0u8; HEADER_SIZE];
         f.read_exact(&mut hdr)?;
-        let file_len = f.metadata()?.len() as usize;
         self.raw_mode = raw;
-        self.parse_header(&hdr[..HEADER_SIZE]);
+        self.parse_header(hdr[..HEADER_SIZE].try_into().unwrap());
         let origin = self.location.region_to_chunk();
         let mut chunks: Vec<Option<Chunk>> = (0..1024).map(|_| None).collect();
         for &i in indices {
@@ -635,17 +618,7 @@ impl McaFile {
             }
             let pos = self.offsets[i] as usize * 4096;
             let loc = origin.add_p(Point2i::from_chunk_index(i as i32));
-            let mut head = [0u8; 5];
-            if f.seek(SeekFrom::Start(pos as u64)).is_err() || f.read_exact(&mut head).is_err() {
-                continue;
-            }
-            let length = i32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
-            let payload_len = length.saturating_sub(1).min(file_len.saturating_sub(pos + 5));
-            let mut data = Vec::with_capacity(5 + payload_len);
-            data.extend_from_slice(&head);
-            if (&mut f).take(payload_len as u64).read_to_end(&mut data).is_err() {
-                continue;
-            }
+            let Ok(data) = read_chunk_record(&mut f, pos) else { continue };
             if let Ok(mut c) = Self::parse_chunk(&data, 0, loc, &self.file, raw) {
                 c.timestamp = self.timestamps[i];
                 chunks[i] = Some(c);
@@ -710,7 +683,7 @@ impl McaFile {
             // seek only right before a write (skips the padding gap); empty
             // slots no longer cost an lseek each.
             w.seek(SeekFrom::Start((global_offset * 4096) as u64))?;
-            last_written = write_chunk_data(w, chunk, &self.file, chunk.absolute_location)?;
+            last_written = write_chunk_data(w, chunk, &self.file)?;
             let secs = (last_written >> 12) + usize::from(last_written % 4096 != 0);
             offsets[i] = global_offset as i32;
             sectors[i] = secs as u8;
@@ -847,16 +820,11 @@ fn write_chunk_data<W: std::io::Write>(
     w: &mut W,
     chunk: &Chunk,
     mca_file: &Path,
-    loc: Point2i,
 ) -> Result<usize> {
     let mut buf = Vec::with_capacity(8192);
     let empty = Compound::default();
     // borrow the compound — avoids a deep clone of the whole chunk per save.
-    nbt::write_root_compound(
-        &mut Cursor::new(&mut buf),
-        "",
-        chunk.data.as_ref().unwrap_or(&empty),
-    )?;
+    nbt::write_root_compound(&mut Cursor::new(&mut buf), chunk.data.as_ref().unwrap_or(&empty))?;
     let payload = compress(chunk.compression, &buf)?;
     if payload.len() > 1_044_475 {
         // external .mcc
@@ -866,11 +834,11 @@ fn write_chunk_data<W: std::io::Write>(
             .and_then(|d| nbt::int_from_opt(Some(d), "DataVersion"))
             .unwrap_or(0);
         if dv < crate::chunk::DV_19W36A {
-            anyhow::bail!("chunk at {loc} is oversized and can't be saved (DataVersion < 2203)");
+            anyhow::bail!("chunk at {} is oversized and can't be saved (DataVersion < 2203)", chunk.absolute_location);
         }
         w.write_all(&1i32.to_be_bytes())?;
         w.write_all(&[chunk.compression.external().to_byte()])?;
-        std::fs::write(mcc_path(mca_file, loc), &payload)?;
+        std::fs::write(mcc_path(mca_file, chunk.absolute_location), &payload)?;
         Ok(5)
     } else {
         w.write_all(&((payload.len() + 1) as i32).to_be_bytes())?;
@@ -917,5 +885,18 @@ mod tests {
         assert_eq!(m.sectors[5], 3);
         assert_eq!(m.timestamps[5], 0x01020304);
         std::fs::remove_file(&path).ok();
+    }
+}
+
+/// gzip-or-plain NBT blob -> root compound (player .dat files).
+pub(crate) fn read_compressed(bytes: &[u8]) -> Option<nbt::Compound> {
+    let raw = if bytes.starts_with(&[0x1f, 0x8b]) {
+        decompress(CompressionType::Gzip, bytes).ok()?
+    } else {
+        bytes.to_vec()
+    };
+    match nbt::SliceReader::new(&raw).read().ok()? {
+        nbt::Tag::Compound(c) => Some(c),
+        _ => None,
     }
 }

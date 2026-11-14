@@ -9,6 +9,26 @@ pub const TILE_SIZE: usize = 512;
 pub const CHUNK_SIZE: usize = 16;
 pub const SIZE_IN_CHUNKS: usize = 32;
 
+/// shared-edge chunk lists the margins load/render — tilemap's
+/// MarginFiles::load sparse-loads exactly these chunks of each neighbor.
+const fn edge_row(cz: usize) -> [usize; SIZE_IN_CHUNKS] {
+    let mut a = [0usize; SIZE_IN_CHUNKS];
+    let mut cx = 0;
+    while cx < SIZE_IN_CHUNKS { a[cx] = cz * SIZE_IN_CHUNKS + cx; cx += 1; }
+    a
+}
+const fn edge_col(cx: usize) -> [usize; SIZE_IN_CHUNKS] {
+    let mut a = [0usize; SIZE_IN_CHUNKS];
+    let mut cz = 0;
+    while cz < SIZE_IN_CHUNKS { a[cz] = cz * SIZE_IN_CHUNKS + cx; cz += 1; }
+    a
+}
+pub const MARGIN_IDX_N: [usize; SIZE_IN_CHUNKS] = edge_row(31);
+pub const MARGIN_IDX_S: [usize; SIZE_IN_CHUNKS] = edge_row(0);
+pub const MARGIN_IDX_W: [usize; SIZE_IN_CHUNKS] = edge_col(31);
+pub const MARGIN_IDX_E: [usize; SIZE_IN_CHUNKS] = edge_col(0);
+pub const MARGIN_IDX_NW: [usize; 1] = [1023];
+
 /// Dimension kind — drives Xaero's per-dimension ambient color,
 /// depth curve and (nether) the full-cave column scan.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -30,6 +50,38 @@ pub struct RenderSettings {
     pub dim: DimKind,
 }
 
+/// How water surfaces render, derived from `shade`/`shade_water` — the
+/// three legal combinations of what used to be three separate booleans on
+/// RenderOut (`water`, `flat`, `no_water`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaterMode {
+    /// water surface drawn, merged over the terrain with depth shading.
+    Shaded,
+    /// water surface drawn flat and opaque (shade off, water on).
+    Flat,
+    /// water skipped — the scanner keeps going to expose the seabed.
+    Hidden,
+}
+
+impl RenderSettings {
+    /// whether margin strips should be rendered (edge shading needs them;
+    /// layer-only renders have no neighbors to blend with). The tilemap
+    /// uses the same predicate to decide whether to load margin files.
+    pub(crate) fn wants_margins(&self) -> bool {
+        !self.layer_only && (self.shade || self.caves)
+    }
+
+    pub(crate) fn water_mode(&self) -> WaterMode {
+        if !self.shade_water {
+            WaterMode::Hidden
+        } else if self.shade {
+            WaterMode::Shaded
+        } else {
+            WaterMode::Flat
+        }
+    }
+}
+
 impl Default for RenderSettings {
     fn default() -> Self {
         RenderSettings {
@@ -44,19 +96,14 @@ impl Default for RenderSettings {
     }
 }
 
-fn bench_timing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MCA_BENCH").is_some())
-}
-
-pub fn shade_color(argb: u32, shade: i32) -> u32 {
+pub(crate) fn shade_color(argb: u32, shade: i32) -> u32 {
     let r = (((argb >> 16) & 0xFF) as i32 + shade).clamp(0, 255) as u32;
     let g = (((argb >> 8) & 0xFF) as i32 + shade).clamp(0, 255) as u32;
     let b = ((argb & 0xFF) as i32 + shade).clamp(0, 255) as u32;
     (argb & 0xFF00_0000) | (r << 16) | (g << 8) | b
 }
 
-pub fn blend(a: u32, b: u32, ratio: f32) -> u32 {
+pub(crate) fn blend(a: u32, b: u32, ratio: f32) -> u32 {
     let ir = ((a >> 16 & 0xFF) as f32 * ratio + (b >> 16 & 0xFF) as f32 * (1.0 - ratio)) as u32;
     let ig = ((a >> 8 & 0xFF) as f32 * ratio + (b >> 8 & 0xFF) as f32 * (1.0 - ratio)) as u32;
     let ib = ((a & 0xFF) as f32 * ratio + (b & 0xFF) as f32 * (1.0 - ratio)) as u32;
@@ -135,9 +182,9 @@ pub fn generate_image(
     let pixels = TILE_SIZE * TILE_SIZE / (scale * scale) as usize;
 
     let mut pixel_buffer = vec![0u32; pixels];
-    // the overlay buffers are always allocated for surface rendering —
-    // the xaero pipeline needs them unconditionally.
-    let aux = !cfg.caves;
+    // the xaero surface pipeline writes these unconditionally; cave and
+    // layer-only renders never read them.
+    let aux = !cfg.caves && !cfg.layer_only;
     let mut water_pixels = if aux { vec![0u32; pixels] } else { Vec::new() };
     let mut terrain_heights = vec![0i16; pixels];
     let mut water_heights = if aux { vec![0i16; pixels] } else { Vec::new() };
@@ -147,43 +194,26 @@ pub fn generate_image(
     // is a pure partition only when that stride equals `size`, i.e. for
     // power-of-two scales that keep chunk_size > 0 (1,2,4,8,16). Anything
     // else runs the original sequential loop verbatim.
-    let t0 = std::time::Instant::now();
-    let xaero_used = if chunk_size > 0 && scale > 0 && (scale & (scale - 1)) == 0 {
-        draw_bands(
-            mca,
-            scale,
-            cfg,
-            corrupted,
-            size,
-            chunk_size,
-            &mut pixel_buffer,
-            &mut terrain_heights,
-            &mut water_pixels,
-            &mut water_heights,
-        )
-    } else {
-        draw_sequential(
-            mca,
-            scale,
-            cfg,
-            corrupted,
-            size,
-            chunk_size,
-            pixels,
-            &mut pixel_buffer,
-            &mut terrain_heights,
-            &mut water_pixels,
-            &mut water_heights,
-        )
-    };
-    let draw_ms = t0.elapsed().as_secs_f64() * 1e3;
-    let t1 = std::time::Instant::now();
-
+    // The renderers address the buffers with a row stride of
+    // `512 >> ilog2(scale)`, which equals `size` only for power-of-two
+    // scales — the only values get_zoom_level() produces.
+    let xaero_used = draw_bands(
+        mca,
+        scale,
+        cfg,
+        corrupted,
+        size,
+        chunk_size,
+        &mut pixel_buffer,
+        &mut terrain_heights,
+        &mut water_pixels,
+        &mut water_heights,
+    );
     // Real heights one pixel past each edge: without them the shading
     // passes can't compute the true slope at region boundaries and draw a
     // visible 512px grid (the "region seams" issue). Costs ~130 edge-chunk
     // scans spread over the 5 margin files.
-    let mset = if margins.any() && !cfg.layer_only && (cfg.shade || cfg.caves) {
+    let mset = if margins.any() && cfg.wants_margins() {
         margin_strips(margins, scale, cfg, corrupted, size, chunk_size)
     } else {
         MarginSet::default()
@@ -216,9 +246,6 @@ pub fn generate_image(
             cfg,
             ms,
         );
-    }
-    if bench_timing() {
-        eprintln!("[bench] draw={:.1}ms shade={:.1}ms", draw_ms, t1.elapsed().as_secs_f64() * 1e3);
     }
     Some(pixel_buffer)
 }
@@ -349,62 +376,6 @@ fn draw_band(
     xaero
 }
 
-/// The original sequential loop, kept verbatim for scales where the
-/// renderers' internal row stride (`512 >> ilog2(scale)`) does not equal
-/// `size` — a band split would not be a pure partition there.
-#[allow(clippy::too_many_arguments)]
-fn draw_sequential(
-    mca: &McaFile,
-    scale: i32,
-    cfg: &RenderSettings,
-    corrupted: &[u32; 256],
-    size: usize,
-    chunk_size: usize,
-    pixels: usize,
-    pixel_buffer: &mut [u32],
-    terrain_heights: &mut [i16],
-    water_pixels: &mut Vec<u32>,
-    water_heights: &mut Vec<i16>,
-) -> bool {
-    let mut dispatch = Dispatch::new();
-    let mut xaero = false;
-    for cx in 0..SIZE_IN_CHUNKS {
-        for cz in 0..SIZE_IN_CHUNKS {
-            let index = cz * SIZE_IN_CHUNKS + cx;
-            let Some(chunk) = &mca.chunks[index] else { continue };
-            let Some(data) = &chunk.data else { continue };
-            let (format, cm) = dispatch.get(nbt::data_version(Some(data)));
-            let x = cx * chunk_size;
-            let z = cz * chunk_size;
-            xaero |= draw_one(
-                data,
-                cm,
-                format,
-                x,
-                z,
-                scale,
-                cfg,
-                corrupted,
-                size,
-                pixels,
-                pixel_buffer,
-                terrain_heights,
-                if !water_pixels.is_empty() {
-                    Some(water_pixels.as_mut_slice())
-                } else {
-                    None
-                },
-                if !water_heights.is_empty() {
-                    Some(water_heights.as_mut_slice())
-                } else {
-                    None
-                },
-            );
-        }
-    }
-    xaero
-}
-
 /// One chunk's draw_chunk/draw_layer/draw_caves + the corrupted-overlay
 /// fallback. `x`/`z` are pixel offsets into the given buffer slices, which
 /// address `buf_size`-wide rows; overlay writes are clipped at `buf_len`
@@ -435,9 +406,8 @@ fn draw_one(
             water_pixels: water_pixels.as_deref_mut(),
             terrain_heights: &mut *terrain_heights,
             water_heights: water_heights.as_deref_mut(),
-            water: cfg.shade && cfg.shade_water,
+            water: cfg.water_mode(),
             flat: !cfg.shade,
-            no_water: !cfg.shade_water,
             height: cfg.render_height,
             full_cave: cfg.dim == DimKind::Nether,
             xaero: false,
@@ -889,43 +859,3 @@ pub fn scale_down(img: &[u32], from_size: usize, to_size: usize) -> Vec<u32> {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mca::McaFile;
-
-    /// Timing harness for renderer changes. Needs a real region dir:
-    ///   cargo test -p mc-core --release render_timing -- --ignored --nocapture
-    /// MCA_WORLD_DIR overrides the default world path; MCA_REGION_PATH picks
-    /// a single file.
-    #[test]
-    #[ignore]
-    fn render_timing() {
-        let dir = std::env::var("MCA_WORLD_DIR").unwrap_or_else(|_| {
-            "/home/coobyk/Documents/Chunkyied/dimensions/minecraft/overworld".into()
-        });
-        let path = if let Ok(p) = std::env::var("MCA_REGION_PATH") {
-            std::path::PathBuf::from(p)
-        } else {
-            std::fs::read_dir(&dir)
-                .expect("world dir")
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .find(|p| p.extension().map(|e| e == "mca").unwrap_or(false))
-                .expect("a .mca region file")
-        };
-        eprintln!("rendering {}", path.display());
-        let mut m = McaFile::new(path).expect("region file");
-        m.load(true).expect("load");
-        let corrupted = [0u32; 256];
-        let mut checksum = 0u64;
-        for i in 0..5 {
-            let t = std::time::Instant::now();
-            let img = generate_image(&m, 1, &RenderSettings::default(), &corrupted, &Margins::EMPTY).expect("image");
-            let el = t.elapsed();
-            checksum = img
-                .iter()
-                .fold(0u64, |a, &p| a.wrapping_mul(31).wrapping_add(p as u64));
-            eprintln!("iter {i}: {el:?} ({} px, checksum {checksum:016x})", img.len());
-        }
-    }
-}

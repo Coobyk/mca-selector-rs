@@ -51,10 +51,10 @@ pub fn set_file_time(world_uuid: &str, r: Point2i, t: i64) {
 /// render settings hash recorded when the image was generated; a cached
 /// image is stale when the world's current render settings differ.
 pub fn get_render_hash(world_uuid: &str, r: Point2i) -> i64 {
-    let p = meta_path(world_uuid, "rset", r);
-    let b = std::fs::read(p).unwrap_or_default();
-    let a: [u8; 8] = b.get(..8).unwrap_or(&[0; 8]).try_into().unwrap_or([0; 8]);
-    i64::from_le_bytes(a)
+    std::fs::read(meta_path(world_uuid, "rset", r))
+        .ok()
+        .and_then(|b| b.try_into().ok().map(i64::from_le_bytes))
+        .unwrap_or(0)
 }
 
 pub fn set_render_hash(world_uuid: &str, r: Point2i, h: i64) {
@@ -103,16 +103,20 @@ pub fn set_structures(world_uuid: &str, r: Point2i, s: &StructuresData) {
 // -- z>=32 lod images ------------------------------------------------------------
 
 /// pixels are always LOD_IMAGE_SIZE x LOD_IMAGE_SIZE.
+/// RGBA bytes -> u32 ARGB pixels (the format both the lod db and gpui
+/// images use).
+pub fn rgba_to_argb(b: &[u8]) -> Vec<u32> {
+    b.chunks_exact(4)
+        .map(|c| ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)
+        .collect()
+}
+
 pub fn get_lod_image(world_uuid: &str, r: Point2i) -> Option<Vec<u32>> {
     let b = std::fs::read(lod_image_path(world_uuid, r)).ok()?;
     if b.len() != LOD_IMAGE_SIZE * LOD_IMAGE_SIZE * 4 {
         return None;
     }
-    let px: Vec<u32> = b
-        .chunks_exact(4)
-        .map(|c| ((c[3] as u32) << 24) | ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32)
-        .collect();
-    Some(px)
+    Some(rgba_to_argb(&b))
 }
 
 /// fixed-resolution LOD image: one pixel per 2x2 chunks (upstream lodLevel).
@@ -130,7 +134,7 @@ pub fn set_lod_image(world_uuid: &str, r: Point2i, argb: &[u32]) {
 }
 
 pub fn delete_data(world_uuid: &str, r: Point2i) {
-    for kind in ["time", "chunks", "structures"] {
+    for kind in ["time", "rset", "chunks", "structures"] {
         let _ = std::fs::remove_file(meta_path(world_uuid, kind, r));
     }
     let _ = std::fs::remove_file(lod_image_path(world_uuid, r));

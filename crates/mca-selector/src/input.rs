@@ -66,14 +66,8 @@ impl MainView {
 
     pub(crate) fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.map.disabled() || self.dialog.is_some() {
-            eprintln!(
-                "[mca] canvas mousedown ignored: disabled={} dialog={}",
-                self.map.disabled(),
-                self.dialog.as_ref().map(|d| d.name()).unwrap_or("-")
-            );
             return;
         }
-        eprintln!("[mca] canvas mousedown {:?} -> map interaction", event.button);
         self.focus.focus(window);
         self.map.mark_prev = None;
         let pos = self.map.canvas_pos(f32::from(event.position.x), f32::from(event.position.y));

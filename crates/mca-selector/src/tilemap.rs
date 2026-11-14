@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
-pub const TILE_SIZE: usize = 512;
+pub use mc_core::render::TILE_SIZE;
 pub const CHUNK_GRID_SCALE: f32 = 1.5;
 pub const TILE_VISIBILITY_THRESHOLD: i32 = 2;
 
@@ -183,6 +183,9 @@ pub enum TileResult {
     /// currently exist and each one's mtime (None = stat failed). The UI
     /// diffs this against `region_mtimes` to invalidate changed regions.
     WatchScan {
+        /// world the scan was launched against — results from a previous
+        /// world must not overwrite the new world's region set.
+        uuid: String,
         present: HashSet<i64>,
         mtimes: HashMap<i64, Option<std::time::SystemTime>>,
     },
@@ -230,7 +233,6 @@ pub struct TileMapState {
     pub show_region_grid: bool,
     pub show_coordinates: bool,
     pub show_structure_icons: bool,
-    pub show_nonexistent_regions: bool,
     pub coordinate_style: CoordinateStyle,
     pub hovered_block: Option<Point2i>,
     pub pasted: Option<Pasted>,
@@ -291,6 +293,23 @@ pub enum CoordinateStyle {
     Grid,
 }
 
+impl CoordinateStyle {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Dynamic => "DYNAMIC",
+            Self::Edge => "EDGE",
+            Self::Grid => "GRID",
+        }
+    }
+    pub fn from_name(s: &str) -> Self {
+        match s {
+            "EDGE" => Self::Edge,
+            "GRID" => Self::Grid,
+            _ => Self::Dynamic,
+        }
+    }
+}
+
 impl TileMapState {
     pub fn new() -> Self {
         let (tx, rx) = channel();
@@ -313,12 +332,7 @@ impl TileMapState {
             show_region_grid: g.show_region_grid,
             show_coordinates: g.show_coordinates,
             show_structure_icons: g.show_structure_icons,
-            show_nonexistent_regions: true,
-            coordinate_style: match g.coordinate_style.to_ascii_uppercase().as_str() {
-                "EDGE" => CoordinateStyle::Edge,
-                "GRID" => CoordinateStyle::Grid,
-                _ => CoordinateStyle::Dynamic,
-            },
+            coordinate_style: CoordinateStyle::from_name(&g.coordinate_style),
             hovered_block: None,
             pasted: None,
             pool: HashMap::new(),
@@ -845,7 +859,7 @@ impl TileMapState {
         let enq_epoch = epoch.load(Ordering::Relaxed);
         jobs::pools().add_process(Job::new(
             jobs::PRIORITY_MEDIUM,
-            Option::<Box<dyn Fn() -> i64 + Send>>::None,
+            None,
             move || {
                 for (region, zoom_level, priority, seq) in specs {
                     let tx = tx.clone();
@@ -855,7 +869,7 @@ impl TileMapState {
                     let epoch = epoch.clone();
                     jobs::pools().add_process(Job::new(
                         jobs::PRIORITY_LOW,
-                        Some(Box::new(move || priority)),
+                        Some(priority),
                         move || {
                             worker_probe_and_render(ProbeArgs {
                                 tx,
@@ -910,7 +924,7 @@ impl TileMapState {
         let seed = ws.seed;
         jobs::pools().add_process(Job::new(
             jobs::PRIORITY_MEDIUM,
-            Some(Box::new(move || priority)),
+            Some(priority),
             move || {
                 let data = McaFile::new(path)
                     .and_then(|mut m| m.load(true).map(|_| m))
@@ -1091,7 +1105,7 @@ impl TileMapState {
                     let to = TILE_SIZE / zoom_level as usize;
                     jobs::pools().add_process(Job::new(
                         jobs::PRIORITY_LOW,
-                        Some(Box::new(move || priority)),
+                        Some(priority),
                         move || {
                             let scaled = render::scale_down(&argb, from, to);
                             let gpu_img = argb_to_render_image(&scaled, to);
@@ -1163,7 +1177,7 @@ impl TileMapState {
         // reads the small bincode cache file for pool-adopted tiles.
         jobs::pools().add_process(Job::new(
             jobs::PRIORITY_MEDIUM,
-            Some(Box::new(move || priority)),
+            Some(priority),
             move || {
                 let s = cache::get_structures(&uuid, region);
                 let _ = tx.send(TileResult::Structures { region, structures: s });
@@ -1286,6 +1300,7 @@ impl TileMapState {
             candidates.insert(k);
         }
         let tx = self.result_tx.clone();
+        let uuid = ws.uuid.clone();
         jobs::pools().add_process(Job::new(
             jobs::PRIORITY_LOW,
             None,
@@ -1302,7 +1317,7 @@ impl TileMapState {
                         .ok();
                     mtimes.insert(key, mtime);
                 }
-                let _ = tx.send(TileResult::WatchScan { present, mtimes });
+                let _ = tx.send(TileResult::WatchScan { uuid, present, mtimes });
             },
         ));
     }
@@ -1502,8 +1517,11 @@ impl TileMapState {
                         }
                     }
                 }
-                TileResult::WatchScan { present, mtimes } => {
+                TileResult::WatchScan { uuid, present, mtimes } => {
                     self.watch_running = false;
+                    if ws.as_ref().map(|w| w.uuid != uuid).unwrap_or(true) {
+                        continue;
+                    }
                     // vanished region files: drop their tiles entirely so
                     // they stop drawing (and stop requesting) like upstream
                     // after a rescan removes them from the region set.
@@ -1656,14 +1674,12 @@ impl MarginFiles {
             m.load_sparse(indices, true).ok()?;
             Some(m)
         };
-        let row = |cz: i32| -> Vec<usize> { (0..32).map(|cx| (cz * 32 + cx) as usize).collect() };
-        let col = |cx: i32| -> Vec<usize> { (0..32).map(|cz| (cz * 32 + cx) as usize).collect() };
         MarginFiles {
-            n: load(r.x, r.z - 1, &row(31)),
-            s: load(r.x, r.z + 1, &row(0)),
-            w: load(r.x - 1, r.z, &col(31)),
-            e: load(r.x + 1, r.z, &col(0)),
-            nw: load(r.x - 1, r.z - 1, &[1023]),
+            n: load(r.x, r.z - 1, &render::MARGIN_IDX_N),
+            s: load(r.x, r.z + 1, &render::MARGIN_IDX_S),
+            w: load(r.x - 1, r.z, &render::MARGIN_IDX_W),
+            e: load(r.x + 1, r.z, &render::MARGIN_IDX_E),
+            nw: load(r.x - 1, r.z - 1, &render::MARGIN_IDX_NW),
         }
     }
 }
@@ -2073,33 +2089,5 @@ mod tests {
         m.mark_prev = None;
         m.mark(e.x, e.z, true, f, false);
         assert_eq!(m.selected_chunks, 25 * 1024);
-    }
-}
-
-#[cfg(test)]
-mod bench {
-    use super::*;
-    use std::time::Instant;
-
-    #[test]
-    fn mark_bench() {
-        // 40x40 region rect, 60 mousemove steps growing the rect
-        let px = |p: Point2i| Point2f::new(p.x as f32 * 32.0 + 16.0, p.z as f32 * 32.0 + 16.0);
-        let mut steps = Vec::new();
-        for i in 0..=60i32 {
-            steps.push(Point2i::new(i * 40 / 60, i * 40 / 60));
-        }
-        for &delta in &[false, true] {
-            let t0 = Instant::now();
-            let mut m = TileMapState::new();
-            m.scale = 16.0;
-            let f = px(Point2i::new(0, 0));
-            for &s in &steps {
-                if !delta { m.mark_prev = None; }
-                let p = px(s);
-                m.mark(p.x, p.z, true, f, false);
-            }
-            eprintln!("[bench] delta={delta}: {:?} ({} regions)", t0.elapsed(), m.selection.selection.len());
-        }
     }
 }

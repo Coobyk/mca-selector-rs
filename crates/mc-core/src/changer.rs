@@ -19,15 +19,13 @@
 //! - `LightPopulated` replicates upstream's `putLong` quirk for the legacy
 //!   `LightPopulated` / `isLightOn` tags.
 
-use crate::chunk::{self, PackedData, PackedSrc};
-pub use crate::chunk::ChunkRefs;
-use crate::mca::{Chunk, CompressionType};
+use crate::chunk::{self, ChunkRefs, PackedData, PackedSrc};
+use crate::mca::CompressionType;
 use crate::nbt::{self, Compound, Tag};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-const T_STRING: u8 = 8;
-const T_COMPOUND: u8 = 10;
+
 
 // ---------------------------------------------------------------- FieldType
 
@@ -350,22 +348,12 @@ fn parse_compression(s: &str) -> Result<CompressionType, String> {
         return Ok(t);
     }
     // upstream also accepts the raw (signed) byte value
-    for t in [
-        CompressionType::None,
-        CompressionType::Gzip,
-        CompressionType::Zlib,
-        CompressionType::Uncompressed,
-        CompressionType::Lz4,
-        CompressionType::NoneExt,
-        CompressionType::GzipExt,
-        CompressionType::ZlibExt,
-        CompressionType::UncompressedExt,
-        CompressionType::Lz4Ext,
-    ] {
-        if let Ok(v) = s.parse::<i64>() {
-            if v == t.to_byte() as i8 as i64 {
-                return Ok(t);
-            }
+    if let Ok(v) = s.parse::<i64>() {
+        if let Some(t) = CompressionType::ALL
+            .iter()
+            .find(|t| v == t.to_byte() as i8 as i64)
+        {
+            return Ok(*t);
         }
     }
     Err("invalid compression".into())
@@ -626,7 +614,7 @@ fn parse_ranges(s: &str) -> Result<Vec<(i32, i32)>, String> {
 
 fn structure_names() -> &'static HashSet<String> {
     static S: OnceLock<HashSet<String>> = OnceLock::new();
-    S.get_or_init(|| crate::structures::structures().valid.keys().cloned().collect())
+    S.get_or_init(|| crate::structures::structures().valid.clone())
 }
 
 /// upstream StructureRegistry.getAlts approximation:
@@ -694,7 +682,8 @@ pub fn apply_change(refs: &mut ChunkRefs, fields: &[Field], force: bool) -> Chan
 }
 
 /// convenience wrapper for a single region chunk.
-pub fn apply_change_region(chunk: &mut Chunk, fields: &[Field], force: bool) -> ChangeResult {
+#[cfg(test)]
+fn apply_change_region(chunk: &mut crate::mca::Chunk, fields: &[Field], force: bool) -> ChangeResult {
     let mut refs = ChunkRefs {
         region: Some(chunk),
         poi: None,
@@ -1158,7 +1147,7 @@ fn delete_sections(root: &mut Compound, ranges: &[(i32, i32)]) {
                 bs.swap_remove("data");
                 let mut p = Compound::default();
                 p.insert("Name".into(), Tag::String("minecraft:air".into()));
-                bs.insert("palette".into(), Tag::List(T_COMPOUND, vec![Tag::Compound(p)]));
+                bs.insert("palette".into(), Tag::List(crate::nbt::TAG_COMPOUND, vec![Tag::Compound(p)]));
             }
             s.swap_remove("BlockLight");
         }
@@ -1223,7 +1212,7 @@ fn apply_biome(root: &mut Compound, b: &BiomeIdent, force: bool) {
                 let mut biomes = Compound::default();
                 biomes.insert(
                     "palette".into(),
-                    Tag::List(T_STRING, vec![Tag::String(name.clone())]),
+                    Tag::List(crate::nbt::TAG_STRING, vec![Tag::String(name.clone())]),
                 );
                 biomes.insert("data".into(), Tag::LongArray(vec![0]));
                 s.insert("biomes".into(), Tag::Compound(biomes));
@@ -1845,14 +1834,14 @@ fn complete_section(s: &mut Compound, y: i32, dv: i32) {
                 bs.insert("data".into(), Tag::LongArray(vec![0; 256]));
             }
             if !bs.contains_key("palette") {
-                bs.insert("palette".into(), Tag::List(T_COMPOUND, vec![air_entry(dv)]));
+                bs.insert("palette".into(), Tag::List(crate::nbt::TAG_COMPOUND, vec![air_entry(dv)]));
             }
         }
         if !s.contains_key("biomes") {
             let mut biomes = Compound::default();
             biomes.insert(
                 "palette".into(),
-                Tag::List(T_STRING, vec![Tag::String("minecraft:the_void".into())]),
+                Tag::List(crate::nbt::TAG_STRING, vec![Tag::String("minecraft:the_void".into())]),
             );
             biomes.insert("data".into(), Tag::LongArray(vec![0]));
             s.insert("biomes".into(), Tag::Compound(biomes));
@@ -1862,7 +1851,7 @@ fn complete_section(s: &mut Compound, y: i32, dv: i32) {
             s.insert("BlockStates".into(), Tag::LongArray(vec![0; 256]));
         }
         if !s.contains_key("Palette") {
-            s.insert("Palette".into(), Tag::List(T_COMPOUND, vec![air_entry(dv)]));
+            s.insert("Palette".into(), Tag::List(crate::nbt::TAG_COMPOUND, vec![air_entry(dv)]));
         }
     }
 }
@@ -2018,7 +2007,7 @@ fn replace_blocks(root: &mut Compound, replace: &[(String, BlockReplace)]) {
         return;
     };
     if !matches!(c.get(tiles_key), Some(Tag::List(..))) {
-        c.insert(tiles_key.into(), Tag::List(T_COMPOUND, Vec::new()));
+        c.insert(tiles_key.into(), Tag::List(crate::nbt::TAG_COMPOUND, Vec::new()));
     }
     let Some(te) = c.get_mut(tiles_key).and_then(as_list_mut) else {
         return;
@@ -2092,7 +2081,7 @@ fn replace_blocks_legacy(root: &mut Compound, replace: &[(String, BlockReplace)]
     let Some(l) = level_mut(root) else { return };
     if replaces_air {
         if !l.contains_key("Sections") {
-            l.insert("Sections".into(), Tag::List(T_COMPOUND, Vec::new()));
+            l.insert("Sections".into(), Tag::List(crate::nbt::TAG_COMPOUND, Vec::new()));
         }
         if let Some(secs) = l.get_mut("Sections").and_then(as_list_mut) {
             let present: HashSet<i64> = secs
@@ -2186,7 +2175,7 @@ fn custom_walk(scope: &mut Compound, key: &str, rest: &[&str], tag: &Tag, force:
             return;
         }
         let intermediate = if rest[0] == "*" || rest[0].parse::<usize>().is_ok() {
-            Tag::List(T_COMPOUND, Vec::new())
+            Tag::List(crate::nbt::TAG_COMPOUND, Vec::new())
         } else {
             Tag::Compound(Compound::default())
         };
@@ -2219,7 +2208,7 @@ fn custom_walk_tag(t: &mut Tag, segs: &[&str], tag: &Tag, force: bool) {
         _ => {
             if force {
                 let intermediate = if *seg == "*" || seg.parse::<usize>().is_ok() {
-                    Tag::List(T_COMPOUND, Vec::new())
+                    Tag::List(crate::nbt::TAG_COMPOUND, Vec::new())
                 } else {
                     Tag::Compound(Compound::default())
                 };
@@ -2237,8 +2226,8 @@ mod tests {
     use super::*;
     use crate::point::Point2i;
 
-    fn chunk(data: Compound) -> Chunk {
-        let mut c = Chunk::new(Point2i::new(0, 0));
+    fn chunk(data: Compound) -> crate::mca::Chunk {
+        let mut c = crate::mca::Chunk::new(Point2i::new(0, 0));
         c.data = Some(data);
         c
     }
@@ -2248,7 +2237,7 @@ mod tests {
         let mut s0 = Compound::default();
         s0.insert("Y".into(), Tag::Byte(0));
         let mut bs = Compound::default();
-        bs.insert("palette".into(), Tag::List(T_COMPOUND, vec![air_entry(2844)]));
+        bs.insert("palette".into(), Tag::List(crate::nbt::TAG_COMPOUND, vec![air_entry(2844)]));
         bs.insert("data".into(), Tag::LongArray(vec![0; 256]));
         s0.insert("block_states".into(), Tag::Compound(bs));
         s0.insert("BlockLight".into(), Tag::ByteArray(vec![0; 2048]));
@@ -2259,7 +2248,7 @@ mod tests {
         r.insert("zPos".into(), Tag::Int(0));
         r.insert("Status".into(), Tag::String("full".into()));
         r.insert("isLightOn".into(), Tag::Byte(1));
-        r.insert("sections".into(), Tag::List(T_COMPOUND, vec![Tag::Compound(s0)]));
+        r.insert("sections".into(), Tag::List(crate::nbt::TAG_COMPOUND, vec![Tag::Compound(s0)]));
         r
     }
 
@@ -2351,7 +2340,7 @@ mod tests {
         let Tag::Compound(f) = &c.data.as_ref().unwrap()["foo"] else {
             panic!()
         };
-        assert_eq!(f["bar"], Tag::Int(42));
+        assert_eq!(f.get("bar"), Some(&Tag::Int(42)));
     }
 
     #[test]
@@ -2386,7 +2375,7 @@ mod tests {
             panic!()
         };
         let s = secs[0].as_compound().unwrap();
-        let bs = s["block_states"].as_compound().unwrap();
+        let bs = s.get("block_states").unwrap().as_compound().unwrap();
         assert!(!bs.contains_key("data"));
         assert!(!s.contains_key("BlockLight"));
     }
@@ -2400,7 +2389,7 @@ mod tests {
             "Pos".into(),
             Tag::List(6, vec![Tag::Double(0.0), Tag::Double(64.0), Tag::Double(0.0)]),
         );
-        level.insert("Entities".into(), Tag::List(T_COMPOUND, vec![Tag::Compound(e)]));
+        level.insert("Entities".into(), Tag::List(crate::nbt::TAG_COMPOUND, vec![Tag::Compound(e)]));
         level.insert("DataVersion".into(), Tag::Int(1400));
         let mut root = Compound::default();
         root.insert("DataVersion".into(), Tag::Int(1400));

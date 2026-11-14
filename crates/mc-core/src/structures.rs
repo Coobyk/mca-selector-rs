@@ -1,7 +1,7 @@
 //! Port of version.mapping.registry.StructureRegistry data.
 
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 #[derive(Deserialize)]
@@ -21,8 +21,9 @@ pub struct StructureRegistry {
     pub icons: HashMap<String, StructureData>,
     /// display name -> canonical minecraft:name
     pub display_names: Vec<(String, String)>,
-    /// any valid name/alt -> canonical name
-    pub valid: HashMap<String, String>,
+    /// any valid name/alt (canonical `minecraft:name`, bare name, and
+    /// case-sensitive aliases from allNames)
+    pub valid: HashSet<String>,
 }
 
 pub fn structures() -> &'static StructureRegistry {
@@ -35,17 +36,17 @@ pub fn structures() -> &'static StructureRegistry {
         let mut r = StructureRegistry {
             icons: HashMap::new(),
             display_names: Vec::new(),
-            valid: HashMap::new(),
+            valid: HashSet::new(),
         };
         for s in list {
             let canon = format!("minecraft:{}", s.name);
             r.display_names.push((s.display.clone(), canon.clone()));
             for name in &s.all_names {
                 if name.chars().any(|c| c.is_ascii_uppercase()) {
-                    r.valid.insert(name.clone(), canon.clone());
+                    r.valid.insert(name.clone());
                 } else {
-                    r.valid.insert(format!("minecraft:{name}"), canon.clone());
-                    r.valid.insert(name.clone(), canon.clone());
+                    r.valid.insert(format!("minecraft:{name}"));
+                    r.valid.insert(name.clone());
                 }
             }
             r.icons.insert(canon, s);

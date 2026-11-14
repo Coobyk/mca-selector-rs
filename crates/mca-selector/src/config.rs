@@ -46,8 +46,6 @@ pub struct GlobalConfig {
     pub chunk_selection_color: Color,
     pub paste_chunks_color: Color,
     pub process_threads: i32,
-    pub write_threads: i32,
-    pub max_loaded_files: i32,
     pub mc_saves_dir: String,
     pub show_chunk_grid: bool,
     pub show_region_grid: bool,
@@ -58,7 +56,6 @@ pub struct GlobalConfig {
     pub coordinate_style: String,
     /// UI language code — see lang::LANGS (upstream Settings.languageCode)
     pub language: String,
-    pub debug: bool,
     /// upstream FilterChunksDialog keeps the last filter query for the session;
     /// we persist it (GlobalConfig has no dedicated filter file).
     pub filter_query: String,
@@ -80,8 +77,6 @@ impl Default for GlobalConfig {
             chunk_selection_color: Color::new(1.0, 0.45, 0.0, 0.8),
             paste_chunks_color: Color::new(0.0, 1.0, 0.0, 0.8),
             process_threads: (num_cpus() as i32 - 2).max(4),
-            write_threads: (num_cpus() as i32).clamp(1, 4),
-            max_loaded_files: 1,
             mc_saves_dir: mc_saves_dir(),
             show_chunk_grid: true,
             show_region_grid: true,
@@ -89,7 +84,6 @@ impl Default for GlobalConfig {
             show_structure_icons: false,
             coordinate_style: "DYNAMIC".into(),
             language: "en".into(),
-            debug: false,
             filter_query: String::new(),
             overlays: Vec::new(),
             recent_worlds: BTreeMap::new(),
@@ -153,12 +147,8 @@ pub struct WorldConfig {
     pub shade: bool,
     pub shade_water: bool,
     pub shade_altitude: bool,
-    pub smooth_rendering: bool,
-    pub smooth_overlays: bool,
-    pub tile_map_background: String,
     pub show_nonexistent_regions: bool,
     pub structure_icon_size: i32,
-    pub structure_icon_border_size: i32,
     pub render_header_only_zoom_level: i32,
     #[serde(skip)]
     pub zoom_level_lod_color: u32,
@@ -173,12 +163,8 @@ impl Default for WorldConfig {
             shade: true,
             shade_water: true,
             shade_altitude: true,
-            smooth_rendering: false,
-            smooth_overlays: true,
-            tile_map_background: "BLACK".into(),
             show_nonexistent_regions: true,
             structure_icon_size: 32,
-            structure_icon_border_size: 1,
             render_header_only_zoom_level: 16,
             zoom_level_lod_color: 0xFF00_A300
                 | ((0.64 * 255.0) as u32) << 8

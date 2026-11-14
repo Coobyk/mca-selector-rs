@@ -5,7 +5,6 @@
 //! them back as BE i32/i64 without a decoding pass, like upstream's
 //! `rawArrays(true)` reader.
 
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{self, Write};
 use std::sync::OnceLock;
 
@@ -22,62 +21,6 @@ pub const TAG_LIST: u8 = 9;
 pub const TAG_COMPOUND: u8 = 10;
 pub const TAG_INT_ARRAY: u8 = 11;
 pub const TAG_LONG_ARRAY: u8 = 12;
-
-/// FxHash-family hasher for compound keys. NBT keys are short, trusted
-/// strings hashed on every parse insert and every render-time `get` —
-/// SipHash's DoS resistance isn't needed for local world data.
-#[derive(Default)]
-pub struct FxHasher {
-    hash: u64,
-}
-
-const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-
-impl FxHasher {
-    #[inline]
-    fn add(&mut self, w: u64) {
-        self.hash = (self.hash.rotate_left(5) ^ w).wrapping_mul(FX_SEED);
-    }
-}
-
-impl Hasher for FxHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        // extra multiply so the high bits hashbrown uses for SIMD tags
-        // carry entropy even for short keys
-        self.hash.wrapping_mul(FX_SEED)
-    }
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        let mut b = bytes;
-        while b.len() >= 8 {
-            self.add(u64::from_ne_bytes(b[..8].try_into().unwrap()));
-            b = &b[8..];
-        }
-        if b.len() >= 4 {
-            self.add(u64::from(u32::from_ne_bytes(b[..4].try_into().unwrap())));
-            b = &b[4..];
-        }
-        for &x in b {
-            self.add(u64::from(x));
-        }
-    }
-    #[inline]
-    fn write_u8(&mut self, n: u8) {
-        self.add(u64::from(n));
-    }
-    #[inline]
-    fn write_u64(&mut self, n: u64) {
-        self.add(n);
-    }
-    #[inline]
-    fn write_usize(&mut self, n: usize) {
-        self.add(n as u64);
-    }
-}
-
-/// BuildHasher for [`FxHasher`].
-pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 /// Insertion-ordered string → tag map: a flat Vec, not a hash map. NBT
 /// compounds are tiny (palette entries have 1-3 keys, the chunk root ~25)
@@ -215,13 +158,6 @@ impl Compound {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-    pub fn reserve(&mut self, n: usize) {
-        self.entries.reserve(n);
-    }
-
     #[inline]
     fn find(&self, key: &str) -> Option<usize> {
         self.entries.iter().position(|(k, _)| k.as_str() == key)
@@ -234,20 +170,6 @@ impl Compound {
     pub fn get_mut<Q: AsRef<str> + ?Sized>(&mut self, key: &Q) -> Option<&mut Tag> {
         let i = self.find(key.as_ref())?;
         Some(self.entries[i].1.resolve_mut())
-    }
-    pub fn get_index(&self, index: usize) -> Option<(&String, &Tag)> {
-        self.entries.get(index).map(|(k, s)| (k, s.resolve()))
-    }
-    pub fn get_index_mut(&mut self, index: usize) -> Option<(&String, &mut Tag)> {
-        self.entries
-            .get_mut(index)
-            .map(|(k, s)| (&*k, s.resolve_mut()))
-    }
-    pub fn first(&self) -> Option<(&String, &Tag)> {
-        self.get_index(0)
-    }
-    pub fn last(&self) -> Option<(&String, &Tag)> {
-        self.get_index(self.len().saturating_sub(1))
     }
     pub fn contains_key<Q: AsRef<str> + ?Sized>(&self, key: &Q) -> bool {
         self.find(key.as_ref()).is_some()
@@ -293,19 +215,6 @@ impl Compound {
         self.find(key.as_ref())
             .map(|i| self.entries.remove(i).1.into_tag())
     }
-    /// order-preserving remove (same as shift_remove).
-    pub fn remove<Q: AsRef<str> + ?Sized>(&mut self, key: &Q) -> Option<Tag> {
-        self.shift_remove(key)
-    }
-    pub fn pop(&mut self) -> Option<(String, Tag)> {
-        self.entries.pop().map(|(k, s)| (k, s.into_tag()))
-    }
-    pub fn retain<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&String, &mut Tag) -> bool,
-    {
-        self.entries.retain_mut(|(k, s)| f(k, s.resolve_mut()));
-    }
     pub fn entry(&mut self, key: String) -> Entry<'_> {
         match self.find(&key) {
             Some(index) => Entry::Occupied(OccupiedEntry { map: self, index }),
@@ -316,17 +225,11 @@ impl Compound {
     pub fn iter(&self) -> Iter<'_> {
         Iter { inner: self.entries.iter() }
     }
-    pub fn iter_mut(&mut self) -> IterMut<'_> {
-        IterMut { inner: self.entries.iter_mut() }
-    }
     pub fn keys(&self) -> Keys<'_> {
         Keys { inner: self.entries.iter() }
     }
     pub fn values(&self) -> Values<'_> {
         Values { inner: self.entries.iter() }
-    }
-    pub fn values_mut(&mut self) -> ValuesMut<'_> {
-        ValuesMut { inner: self.entries.iter_mut() }
     }
 }
 
@@ -357,58 +260,21 @@ pub struct VacantEntry<'a> {
 }
 
 impl<'a> Entry<'a> {
-    pub fn or_insert(self, default: Tag) -> &'a mut Tag {
-        self.or_insert_with(|| default)
-    }
     pub fn or_insert_with<F: FnOnce() -> Tag>(self, f: F) -> &'a mut Tag {
         match self {
             Entry::Occupied(o) => o.into_mut(),
             Entry::Vacant(v) => v.insert(f()),
         }
     }
-    pub fn and_modify<F: FnOnce(&mut Tag)>(self, f: F) -> Self {
-        match self {
-            Entry::Occupied(mut o) => {
-                f(o.get_mut());
-                Entry::Occupied(o)
-            }
-            e @ Entry::Vacant(_) => e,
-        }
-    }
-    pub fn key(&self) -> &String {
-        match self {
-            Entry::Occupied(o) => o.key(),
-            Entry::Vacant(v) => &v.key,
-        }
-    }
 }
 
 impl<'a> OccupiedEntry<'a> {
-    pub fn key(&self) -> &String {
-        &self.map.entries[self.index].0
-    }
-    pub fn get(&self) -> &Tag {
-        self.map.entries[self.index].1.resolve()
-    }
-    pub fn get_mut(&mut self) -> &mut Tag {
-        self.map.entries[self.index].1.resolve_mut()
-    }
     pub fn into_mut(self) -> &'a mut Tag {
         self.map.entries[self.index].1.resolve_mut()
-    }
-    /// replace the value, returning the old one.
-    pub fn insert(&mut self, v: Tag) -> Tag {
-        std::mem::replace(&mut self.map.entries[self.index].1, Slot::Tag(v)).into_tag()
-    }
-    pub fn remove(self) -> Tag {
-        self.map.entries.remove(self.index).1.into_tag()
     }
 }
 
 impl<'a> VacantEntry<'a> {
-    pub fn key(&self) -> &String {
-        &self.key
-    }
     pub fn insert(self, v: Tag) -> &'a mut Tag {
         self.map.entries.push((self.key, Slot::Tag(v)));
         self.map.entries.last_mut().unwrap().1.resolve_mut()
@@ -450,30 +316,6 @@ impl Clone for Iter<'_> {
         Iter { inner: self.inner.clone() }
     }
 }
-
-pub struct IterMut<'a> {
-    inner: std::slice::IterMut<'a, (String, Slot)>,
-}
-impl<'a> Iterator for IterMut<'a> {
-    type Item = (&'a String, &'a mut Tag);
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, s)| (&*k, s.resolve_mut()))
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-impl DoubleEndedIterator for IterMut<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|(k, s)| (&*k, s.resolve_mut()))
-    }
-}
-impl ExactSizeIterator for IterMut<'_> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-impl std::iter::FusedIterator for IterMut<'_> {}
 
 pub struct Keys<'a> {
     inner: std::slice::Iter<'a, (String, Slot)>,
@@ -525,53 +367,13 @@ impl ExactSizeIterator for Values<'_> {
 }
 impl std::iter::FusedIterator for Values<'_> {}
 
-pub struct ValuesMut<'a> {
-    inner: std::slice::IterMut<'a, (String, Slot)>,
-}
-impl<'a> Iterator for ValuesMut<'a> {
-    type Item = &'a mut Tag;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(_, s)| s.resolve_mut())
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+/// `compound["key"]` — the assert-friendly accessor tests use.
+impl std::ops::Index<&str> for Compound {
+    type Output = Tag;
+    fn index(&self, key: &str) -> &Tag {
+        self.get(key).expect("compound key not found")
     }
 }
-impl DoubleEndedIterator for ValuesMut<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|(_, s)| s.resolve_mut())
-    }
-}
-impl ExactSizeIterator for ValuesMut<'_> {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-impl std::iter::FusedIterator for ValuesMut<'_> {}
-
-pub struct IntoIter {
-    inner: std::vec::IntoIter<(String, Slot)>,
-}
-impl Iterator for IntoIter {
-    type Item = (String, Tag);
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, s)| (k, s.into_tag()))
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-impl DoubleEndedIterator for IntoIter {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next_back().map(|(k, s)| (k, s.into_tag()))
-    }
-}
-impl ExactSizeIterator for IntoIter {
-    fn len(&self) -> usize {
-        self.inner.len()
-    }
-}
-impl std::iter::FusedIterator for IntoIter {}
 
 impl<'a> IntoIterator for &'a Compound {
     type Item = (&'a String, &'a Tag);
@@ -580,85 +382,6 @@ impl<'a> IntoIterator for &'a Compound {
         self.iter()
     }
 }
-impl<'a> IntoIterator for &'a mut Compound {
-    type Item = (&'a String, &'a mut Tag);
-    type IntoIter = IterMut<'a>;
-    fn into_iter(self) -> IterMut<'a> {
-        self.iter_mut()
-    }
-}
-impl IntoIterator for Compound {
-    type Item = (String, Tag);
-    type IntoIter = IntoIter;
-    fn into_iter(self) -> IntoIter {
-        IntoIter { inner: self.entries.into_iter() }
-    }
-}
-
-impl FromIterator<(String, Tag)> for Compound {
-    fn from_iter<I: IntoIterator<Item = (String, Tag)>>(it: I) -> Self {
-        let mut c = Compound::new();
-        c.extend(it);
-        c
-    }
-}
-impl Extend<(String, Tag)> for Compound {
-    fn extend<I: IntoIterator<Item = (String, Tag)>>(&mut self, it: I) {
-        for (k, v) in it {
-            self.insert(k, v);
-        }
-    }
-}
-impl From<Vec<(String, Tag)>> for Compound {
-    fn from(v: Vec<(String, Tag)>) -> Self {
-        v.into_iter().collect()
-    }
-}
-
-// -- Index impls (IndexMap allows map["key"] and map[i]) ---------------------
-
-impl std::ops::Index<&str> for Compound {
-    type Output = Tag;
-    fn index(&self, key: &str) -> &Tag {
-        self.get(key).expect("compound key not found")
-    }
-}
-impl std::ops::Index<&String> for Compound {
-    type Output = Tag;
-    fn index(&self, key: &String) -> &Tag {
-        self.get(key.as_str()).expect("compound key not found")
-    }
-}
-impl std::ops::Index<String> for Compound {
-    type Output = Tag;
-    fn index(&self, key: String) -> &Tag {
-        self.get(&key).expect("compound key not found")
-    }
-}
-impl std::ops::Index<usize> for Compound {
-    type Output = Tag;
-    fn index(&self, i: usize) -> &Tag {
-        self.get_index(i).map(|(_, v)| v).expect("compound index out of bounds")
-    }
-}
-impl std::ops::IndexMut<&str> for Compound {
-    fn index_mut(&mut self, key: &str) -> &mut Tag {
-        self.get_mut(key).expect("compound key not found")
-    }
-}
-impl std::ops::IndexMut<String> for Compound {
-    fn index_mut(&mut self, key: String) -> &mut Tag {
-        self.get_mut(&key).expect("compound key not found")
-    }
-}
-impl std::ops::IndexMut<usize> for Compound {
-    fn index_mut(&mut self, i: usize) -> &mut Tag {
-        self.get_index_mut(i)
-            .map(|(_, v)| v)
-            .expect("compound index out of bounds")
-    }
-}
-
 /// Root entries that stay eagerly parsed under `load(true)` (render mode):
 /// everything the renderers and structure/overlay reads touch
 /// unconditionally. All other compound/list subtrees on the chunk root
@@ -756,12 +479,7 @@ impl Tag {
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Tag::ByteArray(b) => Some(b),
-            Tag::IntArray(v) => {
-                // shouldn't happen in raw mode, but keep safe
-                let _ = v;
-                None
-            }
-            Tag::LongArray(_) => None,
+            Tag::IntArray(_) | Tag::LongArray(_) => None,
             _ => None,
         }
     }
@@ -785,7 +503,7 @@ pub fn long_from_opt(c: Option<&Compound>, key: &str) -> Option<i64> {
     c.and_then(|c| c.get(key)).and_then(|t| t.as_i64())
 }
 
-pub fn string_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<&'a str> {
+fn string_from<'a>(c: Option<&'a Compound>, key: &str) -> Option<&'a str> {
     c.and_then(|c| c.get(key)).and_then(|t| t.as_string())
 }
 pub fn string_or<'a>(c: Option<&'a Compound>, key: &str, def: &'a str) -> &'a str {
@@ -812,16 +530,6 @@ pub fn data_version(root: Option<&Compound>) -> i32 {
     int_from(Some(root), "DataVersion", 100)
 }
 
-/// Read a BE i64 out of a raw byte slice (raw long[] data).
-#[inline]
-pub fn raw_i64_or(data: &[u8], idx: usize, def: i64) -> i64 {
-    let o = idx * 8;
-    if o + 8 <= data.len() {
-        i64::from_be_bytes(data[o..o + 8].try_into().unwrap())
-    } else {
-        def
-    }
-}
 
 #[inline]
 pub fn raw_i32_or(data: &[u8], idx: usize, def: i32) -> i32 {
@@ -848,18 +556,26 @@ fn eof() -> io::Error {
 /// region-load path and for standalone .dat files.
 pub(crate) struct SliceReader<'a> {
     s: &'a [u8],
-    pub raw_arrays: bool,
+    raw_arrays: bool,
     /// render-load mode: names of root-compound entries to parse eagerly.
     /// Unlisted compound/list subtrees on the root are stored as raw
     /// payload spans (see `Compound::insert_lazy`) and parsed on first
     /// access instead of at load.
-    pub lazy_keep: Option<&'static [&'static str]>,
+    lazy_keep: Option<&'static [&'static str]>,
     depth: usize,
 }
 
 impl<'a> SliceReader<'a> {
     pub fn new(s: &'a [u8]) -> Self {
         SliceReader { s, raw_arrays: false, lazy_keep: None, depth: 0 }
+    }
+    pub(crate) fn raw_arrays(mut self, on: bool) -> Self {
+        self.raw_arrays = on;
+        self
+    }
+    pub(crate) fn lazy_keep(mut self, keep: &'static [&'static str]) -> Self {
+        self.lazy_keep = Some(keep);
+        self
     }
 
     /// advance the cursor by `n`, returning the skipped-over bytes
@@ -1072,25 +788,12 @@ impl<'a> SliceReader<'a> {
     }
 }
 
-/// gzip-or-plain NBT blob -> root compound (player .dat files).
-pub(crate) fn read_compressed(bytes: &[u8]) -> Option<Compound> {
-    let raw = if bytes.starts_with(&[0x1f, 0x8b]) {
-        crate::mca::decompress(crate::mca::CompressionType::Gzip, bytes).ok()?
-    } else {
-        bytes.to_vec()
-    };
-    match SliceReader::new(&raw).read().ok()? {
-        Tag::Compound(c) => Some(c),
-        _ => None,
-    }
-}
 
 /// Serialize a compound borrowed as the root tag — same byte layout as
 /// `write_nbt(w, name, &Tag::Compound(c))` without owning a Tag.
-pub fn write_root_compound<W: Write>(w: &mut W, name: &str, c: &Compound) -> io::Result<()> {
+pub fn write_root_compound<W: Write>(w: &mut W, c: &Compound) -> io::Result<()> {
     w.write_all(&[TAG_COMPOUND])?;
-    w.write_all(&(name.len() as u16).to_be_bytes())?;
-    w.write_all(name.as_bytes())?;
+    w.write_all(&0u16.to_be_bytes())?;
     write_compound_entries(w, c)
 }
 
@@ -1490,7 +1193,7 @@ impl<'a> SnbtParser<'a> {
 }
 
 /// parse a scalar SNBT token: typed suffix (b/s/l/f/d) or inferred int/double/string.
-pub fn snbt_scalar(tok: &str) -> Result<Tag, String> {
+fn snbt_scalar(tok: &str) -> Result<Tag, String> {
     if tok.is_empty() {
         return Err("empty value".into());
     }
@@ -1554,7 +1257,7 @@ fn utf8_len(b: u8) -> usize {
 /// split "a.b[0].c" into path segments: names and [index] list access.
 /// Inside brackets the content is literal — `.` stays part of the segment
 /// and `]` is addressable as `\]` (e.g. `x[a.b]` reads key "a.b").
-fn path_segments(path: &str) -> Vec<String> {
+pub fn path_segments(path: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut chars = path.chars().peekable();
@@ -1770,7 +1473,7 @@ mod snbt_tests {
         root.insert("upgrade_data".into(), Tag::Compound(ud));
 
         let mut buf = Vec::new();
-        write_root_compound(&mut buf, "", &root).unwrap();
+        write_root_compound(&mut buf, &root).unwrap();
 
         // raw_arrays stays false so the lazified LongArray round-trips as a
         // real long[]; render mode would set both flags (LazyTag carries the
@@ -1786,7 +1489,7 @@ mod snbt_tests {
         assert_eq!(parsed.get("block_entities"), root.get("block_entities"));
         // reserializing a lazy tree yields byte-identical output
         let mut buf2 = Vec::new();
-        write_root_compound(&mut buf2, "", &parsed).unwrap();
+        write_root_compound(&mut buf2, &parsed).unwrap();
         assert_eq!(buf2, buf);
     }
 }

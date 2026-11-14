@@ -3,10 +3,9 @@
 
 use base64::Engine;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BitSet {
-    pub words: Vec<u64>,
-    pub len: usize,
+    words: Vec<u64>,
 }
 
 impl BitSet {
@@ -19,16 +18,9 @@ impl BitSet {
             self.words.resize(w + 1, 0);
         }
         self.words[w] |= 1u64 << (i & 63);
-        if i >= self.len {
-            self.len = i + 1;
-        }
-    }
-    pub fn get(&self, i: usize) -> bool {
-        let w = i >> 6;
-        w < self.words.len() && (self.words[w] >> (i & 63)) & 1 == 1
     }
     /// BitSet.valueOf(byte[]).
-    pub fn from_bytes(b: &[u8]) -> Self {
+    fn from_bytes(b: &[u8]) -> Self {
         let mut s = BitSet::new();
         for i in 0..b.len() * 8 {
             if (b[i >> 3] >> (i & 7)) & 1 == 1 {

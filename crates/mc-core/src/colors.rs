@@ -7,7 +7,6 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-pub const TRANSPARENT: u8 = 0b0000_0001;
 pub const GRASS_TINT: u8 = 0b0000_0010;
 pub const FOLIAGE_TINT: u8 = 0b0000_0100;
 pub const WATER: u8 = 0b0000_1000;
@@ -41,7 +40,7 @@ impl StateColors {
                 .unwrap_or(*default),
         }
     }
-    pub fn iter_entries(&self) -> Vec<(Option<BitSet>, BlockColor)> {
+    fn iter_entries(&self) -> Vec<(Option<BitSet>, BlockColor)> {
         match self {
             StateColors::Single(c) => vec![(None, *c)],
             StateColors::States { states, .. } => {
@@ -263,7 +262,7 @@ fn parse_block_color(v: &serde_json::Value) -> BlockColor {
     }
 }
 
-pub fn load_color_config(json: &str) -> ColorConfig {
+fn load_color_config(json: &str) -> ColorConfig {
     let raw: RawColorConfig = serde_json::from_str(json).expect("invalid color config json");
     let states = BlockStates { states: raw.states };
     let mut colors: FxMap<String, StateColors> = FxMap::default();
@@ -374,12 +373,9 @@ fn create_tint_cache(colors: &FxMap<String, StateColors>, tints: &BiomeColors) -
 #[derive(Deserialize)]
 pub struct ColorProperties {
     pub air: FxSet<String>,
-    pub transparent: FxSet<String>,
-    pub grass_tint: FxSet<String>,
-    pub foliage_tint: FxSet<String>,
-    pub dry_foliage_tint: FxSet<String>,
-    pub water: FxSet<String>,
-    pub foliage: FxSet<String>,
+    transparent: FxSet<String>,
+    water: FxSet<String>,
+    foliage: FxSet<String>,
     /// name -> aggregated flag byte, folded from the sets above by
     /// color_properties() — the renderers' per-palette-entry resolution
     /// becomes a single map probe. Bit positions match version.rs's F_*
@@ -390,10 +386,10 @@ pub struct ColorProperties {
 }
 
 // flag-byte bits stored in ColorProperties.flags
-pub const FLAG_TRANSPARENT: u8 = 0b0001;
-pub const FLAG_WATER: u8 = 0b0010;
-pub const FLAG_FOLIAGE: u8 = 0b1000;
-pub const FLAG_AIR: u8 = 0b1_0000;
+const FLAG_TRANSPARENT: u8 = 0b0001;
+const FLAG_WATER: u8 = 0b0010;
+const FLAG_FOLIAGE: u8 = 0b1000;
+pub(crate) const FLAG_AIR: u8 = 0b1_0000;
 
 pub fn color_properties() -> &'static ColorProperties {
     static P: OnceLock<ColorProperties> = OnceLock::new();

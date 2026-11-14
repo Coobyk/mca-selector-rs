@@ -19,7 +19,6 @@ impl MainView {
         cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
             match rx.await {
                 Ok(Ok(Some(paths))) => {
-                    eprintln!("[mca] file picker returned {paths:?}");
                     if let Some(p) = paths.into_iter().next() {
                         let _ = this.update(&mut *cx, |v, cx| v.open_world_at(p, cx));
                     }
@@ -27,7 +26,6 @@ impl MainView {
                 // a portal/picker failure used to drop silently — File >
                 // Open World then appears to do nothing at all.
                 Ok(Err(e)) => {
-                    eprintln!("[mca] file picker error: {e}");
                     let _ = this.update(&mut *cx, |v, cx| {
                         v.dialog = Some(Dialog::Error {
                             msg: format!("could not open file picker:\n{e}"),
@@ -35,8 +33,7 @@ impl MainView {
                         cx.notify();
                     });
                 }
-                other => {
-                    eprintln!("[mca] file picker cancelled/other: {other:?}");
+                _other => {
                 }
             }
         })
@@ -76,10 +73,8 @@ impl MainView {
     }
 
     pub fn open_world_at(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        eprintln!("[mca] open_world_at {}", dir.display());
         // upstream: confirm before discarding an unsaved selection
         if self.map.unsaved_selection {
-            eprintln!("[mca] unsaved selection -> confirm dialog");
             let d = dir.clone();
             self.dialog = Some(Dialog::Confirm {
                 msg: "There is an unsaved selection. Open the world anyway?".into(),
@@ -95,7 +90,6 @@ impl MainView {
         // itself counts if it holds a valid region folder), open the sole
         // one directly, or show the SelectWorldDialog picker.
         let dims = files::detect_dimension_directories(&dir);
-        eprintln!("[mca] dims detected ({}): {:?}", dims.len(), dims);
         if dims.is_empty() {
             self.dialog = Some(Dialog::Error {
                 msg: format!("no dimensions found in {}", dir.display()),
@@ -110,10 +104,8 @@ impl MainView {
     }
 
     pub(crate) fn do_open(&mut self, root: PathBuf, dims: Vec<PathBuf>, cx: &mut Context<Self>) {
-        eprintln!("[mca] do_open {} dims={}", root.display(), dims.len());
         let dirs = files::detect_world_directories(&root);
         if dirs.region.is_none() {
-            eprintln!("[mca] do_open: no region folder -> error dialog");
             self.dialog = Some(Dialog::Error {
                 msg: format!("Could not find region folder in {}", root.display()),
             });
@@ -132,11 +124,6 @@ impl MainView {
             w.cfg.render_height = w.cfg.render_height.clamp(hmin, hmax);
         }
         self.map.regions = files::scan_region_files(ws.region_dir());
-        eprintln!(
-            "[mca] world set: region_dir={} regions={}",
-            ws.region_dir().display(),
-            self.map.regions.len()
-        );
         // upstream keeps the camera across opens — but if the current view
         // shows none of this world's regions it looks like nothing opened.
         // Center on the mean loaded region only in that case.
@@ -158,7 +145,6 @@ impl MainView {
             self.map
                 .go_to((sx / n) as i32 * 512 + 256, (sz / n) as i32 * 512 + 256);
         }
-        eprintln!("[mca] do_open done: overlaps={overlaps} offset={:?} scale={}", self.map.offset, self.map.scale);
         // `disabled` is derived from config::WORLD — setting the world above
         // enables the map.
         self.request_update();

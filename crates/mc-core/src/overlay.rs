@@ -46,10 +46,10 @@ impl OverlayType {
 
     /// all overlay types in upstream OverlayType.values() order
     /// (SlimeChunks/SkyLight/BlockLight are extensions past upstream's 10).
-    pub const VALUES: [OverlayType; 13] = [
+    pub const VALUES: [OverlayType; 12] = [
         Self::InhabitedTime, Self::Timestamp, Self::LastUpdate,
         Self::EntityAmount, Self::TileEntityAmount, Self::DataVersion,
-        Self::AverageHeight, Self::BlockAmount, Self::Path, Self::Script,
+        Self::AverageHeight, Self::BlockAmount, Self::Path,
         Self::SlimeChunks, Self::SkyLight, Self::BlockLight,
     ];
 
@@ -333,7 +333,7 @@ pub fn region_overlay_data(
 
 /// Java's ChunkGenerator.isSlimeChunk: per-chunk LCG seeded from world
 /// seed + coords, `nextInt(10) == 0`.
-pub fn slime_chunk(world_seed: i64, cx: i32, cz: i32) -> bool {
+fn slime_chunk(world_seed: i64, cx: i32, cz: i32) -> bool {
     let s = world_seed
         .wrapping_add(cx.wrapping_mul(cx).wrapping_mul(4987142) as i64)
         .wrapping_add(cx.wrapping_mul(5947611) as i64)
@@ -517,7 +517,7 @@ fn parse_block_names(raw: &str) -> Vec<String> {
 }
 
 /// java.awt.Color.HSBtoRGB — returns 0xFFRRGGBB.
-pub fn hsb_to_rgb(hue: f32, saturation: f32, brightness: f32) -> u32 {
+fn hsb_to_rgb(hue: f32, saturation: f32, brightness: f32) -> u32 {
     let (rr, gg, bb) = if saturation == 0.0 {
         (brightness, brightness, brightness)
     } else {
@@ -544,7 +544,8 @@ pub fn hsb_to_rgb(hue: f32, saturation: f32, brightness: f32) -> u32 {
 
 /// parse a single overlay spec line: `Type min max [data]`
 /// e.g. `InhabitedTime 0 1000`, `Blocks 0 500 minecraft:stone`, `Custom 0 10 region/sections.size`
-pub fn parse_overlay_line(line: &str) -> Result<Overlay, String> {
+#[cfg(test)]
+fn parse_overlay_line(line: &str) -> Result<Overlay, String> {
     let line = line.trim();
     if line.is_empty() {
         return Err("empty".into());
