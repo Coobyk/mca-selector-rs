@@ -49,10 +49,59 @@ jobs:
           name: ${{ matrix.artifact }}
           path: target/release/${{ matrix.bin }}
 
-  aur:
-    name: publish to AUR
+  release:
+    name: publish nightly release
     needs: build
     if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      pkgver: ${{ steps.meta.outputs.pkgver }}
+      sha256: ${{ steps.meta.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - id: meta
+        run: |
+          mkdir -p release
+          mv dist/mca-selector-linux-x86_64/mca-selector release/mca-selector-linux-x86_64
+          mv dist/mca-selector-macos-aarch64/mca-selector release/mca-selector-macos-aarch64
+          mv dist/mca-selector-windows-x86_64.exe/mca-selector.exe release/mca-selector-windows-x86_64.exe
+          echo "pkgver=0.1.0.r$(git rev-list --count HEAD).g$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum release/mca-selector-linux-x86_64 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Move nightly tag to this commit
+        run: |
+          git tag -f nightly "$GITHUB_SHA"
+          git push -f origin refs/tags/nightly
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release upload nightly release/* --clobber
+          else
+            gh release create nightly --prerelease \
+              --title "nightly — latest main" \
+              --notes "Rolling prebuilt binaries of the latest main commit. Installed by the mca-selector-rs-bin AUR package." \
+              release/*
+          fi
+
+  aur:
+    name: publish to AUR
+    needs: release
+    if: github.ref == 'refs/heads/main'
+    concurrency:
+      group: aur-publish
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
@@ -76,24 +125,36 @@ jobs:
           echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/id_ed25519 -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$HOME/.ssh/known_hosts" >> "$GITHUB_ENV"
 
       - name: Generate .SRCINFO
+        env:
+          PKGVER: ${{ needs.release.outputs.pkgver }}
+          SHA256: ${{ needs.release.outputs.sha256 }}
         run: |
           useradd -m builder
           chown -R builder:builder "$GITHUB_WORKSPACE"
           su builder -c 'cd "$GITHUB_WORKSPACE/aur" && makepkg --printsrcinfo' > aur/.SRCINFO
+          mkdir -p /tmp/bin-pkg
+          sed -e "s/__PKGVER__/$PKGVER/" -e "s/__SHA256__/$SHA256/" \
+              aur/bin/PKGBUILD.template > /tmp/bin-pkg/PKGBUILD
+          chmod -R a+rX /tmp/bin-pkg
+          su builder -c 'cd /tmp/bin-pkg && makepkg --printsrcinfo' > /tmp/bin-pkg/.SRCINFO
 
       - name: Publish to AUR
-        env:
-          AUR_PACKAGE: mca-selector-rs-git
         run: |
           git config --global user.name "mca-selector-rs-ci"
           git config --global user.email "mail@coobyk.com"
-          git clone "ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git" /tmp/aur-repo
-          cp aur/PKGBUILD aur/.SRCINFO /tmp/aur-repo/
-          cd /tmp/aur-repo
-          git add PKGBUILD .SRCINFO
-          if git diff --cached --quiet; then
-            echo "AUR already up to date"
-          else
-            git commit -m "Update to ${GITHUB_SHA:0:7}"
-            git push
-          fi
+          publish() {
+            pkg="$1"; srcdir="$2"
+            git clone "ssh://aur@aur.archlinux.org/${pkg}.git" "/tmp/aur-${pkg}"
+            cp "${srcdir}/PKGBUILD" "${srcdir}/.SRCINFO" "/tmp/aur-${pkg}/"
+            cd "/tmp/aur-${pkg}"
+            git add PKGBUILD .SRCINFO
+            if git diff --cached --quiet; then
+              echo "$pkg already up to date"
+            else
+              git commit -m "Update to ${GITHUB_SHA:0:7}"
+              git push
+            fi
+            cd "$GITHUB_WORKSPACE"
+          }
+          publish mca-selector-rs-git aur
+          publish mca-selector-rs-bin /tmp/bin-pkg
