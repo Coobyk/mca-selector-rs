@@ -686,7 +686,8 @@ impl MainView {
                             .child(text_el(format!("{}", draft.process_threads), 12.))
                             .child(button("+", cx, |v, _w, cx| {
                                 if let Some(Dialog::Settings { draft }) = &mut v.dialog {
-                                    draft.process_threads = (draft.process_threads + 1).min(256);
+                                    let max = config::num_cpus() as i32;
+                                    draft.process_threads = (draft.process_threads + 1).min(max);
                                 }
                                 cx.notify();
                             })),

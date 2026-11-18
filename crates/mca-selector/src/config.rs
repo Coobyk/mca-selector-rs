@@ -66,7 +66,7 @@ pub struct GlobalConfig {
     pub structure_icons: BTreeMap<String, bool>,
 }
 
-fn num_cpus() -> usize {
+pub(crate) fn num_cpus() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
 }
 
