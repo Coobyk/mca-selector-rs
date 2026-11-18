@@ -674,7 +674,23 @@ impl MainView {
                     .child(text_el(format!("Region selection color: rgba({:.2},{:.2},{:.2},{:.2})", draft.region_selection_color.r, draft.region_selection_color.g, draft.region_selection_color.b, draft.region_selection_color.a), 12.))
                     .child(text_el(format!("Chunk selection color: rgba({:.2},{:.2},{:.2},{:.2})", draft.chunk_selection_color.r, draft.chunk_selection_color.g, draft.chunk_selection_color.b, draft.chunk_selection_color.a), 12.))
                     .child(text_el(format!("Paste chunks color: rgba({:.2},{:.2},{:.2},{:.2})", draft.paste_chunks_color.r, draft.paste_chunks_color.g, draft.paste_chunks_color.b, draft.paste_chunks_color.a), 12.))
-                    .child(text_el(format!("Process threads: {}", draft.process_threads), 12.))
+                    .child(
+                        h_flex().gap_1()
+                            .child(text_el("Process threads:", 12.))
+                            .child(button("-", cx, |v, _w, cx| {
+                                if let Some(Dialog::Settings { draft }) = &mut v.dialog {
+                                    draft.process_threads = (draft.process_threads - 1).max(1);
+                                }
+                                cx.notify();
+                            }))
+                            .child(text_el(format!("{}", draft.process_threads), 12.))
+                            .child(button("+", cx, |v, _w, cx| {
+                                if let Some(Dialog::Settings { draft }) = &mut v.dialog {
+                                    draft.process_threads = (draft.process_threads + 1).min(256);
+                                }
+                                cx.notify();
+                            })),
+                    )
                     .child(text_el(format!("Minecraft saves dir: {}", draft.mc_saves_dir), 12.))
                     .child(
                         h_flex().gap_1().flex_wrap()
@@ -708,7 +724,9 @@ impl MainView {
                             .child(button(crate::lang::t("dialog.save"), cx, |v, _w, cx| {
                                 if let Some(Dialog::Settings { draft }) = v.dialog.take() {
                                     let lang = draft.language.clone();
+                                    let threads = draft.process_threads as usize;
                                     config::set_global(draft);
+                                    mc_core::jobs::set_process_threads(threads);
                                     crate::lang::init(&lang);
                                     cx.set_menus(crate::menus(cx));
                                     v.map.mark_all_tiles_obsolete();

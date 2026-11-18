@@ -115,13 +115,34 @@ impl Ord for HeapEntry {
 pub const MAX_DYNAMIC_PRIO: i64 = 9_999_999;
 
 static QUEUE: std::sync::OnceLock<Queue> = std::sync::OnceLock::new();
-static PROCESS_THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static SPAWNED: std::sync::Once = std::sync::Once::new();
+/// running general-lane workers / requested count. A 0 target means "not
+/// configured yet" — pools() substitutes the cpu-derived default.
+static WORKER_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WORKER_TARGET: AtomicUsize = AtomicUsize::new(0);
+static POOL_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// app-configured process pool size (upstream Config.processThreads); must be
-/// called before first pools() use.
+/// app-configured process pool size (upstream Config.processThreads). Safe to
+/// call at runtime: spawns workers up to the new target and wakes surplus
+/// ones so they retire — shrinking is not instant because a worker only
+/// checks between jobs.
 pub fn set_process_threads(n: usize) {
-    let _ = PROCESS_THREADS.set(n.max(1));
+    WORKER_TARGET.store(n.max(1), Ordering::Relaxed);
+    if POOL_STARTED.load(Ordering::Relaxed) {
+        sync_worker_target(pools());
+    }
+}
+
+/// Grow the general pool up to WORKER_TARGET; when over target, wake all
+/// workers so the surplus retire (they check at the top of the loop).
+fn sync_worker_target(q: &'static Queue) {
+    while WORKER_COUNT.load(Ordering::Relaxed) < WORKER_TARGET.load(Ordering::Relaxed) {
+        WORKER_COUNT.fetch_add(1, Ordering::Relaxed);
+        spawn_worker(q, "processPool", Lane::Any);
+    }
+    if WORKER_COUNT.load(Ordering::Relaxed) > WORKER_TARGET.load(Ordering::Relaxed) {
+        q.cv.notify_all();
+    }
 }
 
 pub fn pools() -> &'static Queue {
@@ -138,11 +159,10 @@ pub fn pools() -> &'static Queue {
         // linearly with cores on big machines. `process_threads` config
         // overrides this via set_process_threads().
         let default_threads = cpus.saturating_sub(2).max(4);
-        let n = PROCESS_THREADS
-            .get()
-            .copied()
-            .unwrap_or(default_threads)
-            .max(1);
+        let configured = WORKER_TARGET.load(Ordering::Relaxed);
+        let n = if configured == 0 { default_threads } else { configured };
+        WORKER_TARGET.store(n, Ordering::Relaxed);
+        WORKER_COUNT.store(n, Ordering::Relaxed);
         for _ in 0..n {
             spawn_worker(q, "processPool", Lane::Any);
         }
@@ -150,6 +170,10 @@ pub fn pools() -> &'static Queue {
         // count, so `process_threads` still means "bulk worker count" and
         // the reservation costs nothing when the queue is calm.
         spawn_worker(q, "processPool-fast", Lane::FastOnly);
+        POOL_STARTED.store(true, Ordering::Relaxed);
+        // a set_process_threads() call that landed between target store and
+        // POOL_STARTED saw !started and only stored — pick up the deficit.
+        sync_worker_target(q);
     });
     q
 }
@@ -171,6 +195,18 @@ fn spawn_worker(q: &'static Queue, name: &str, lane: Lane) {
     thread::Builder::new()
         .name(name)
         .spawn(move || loop {
+            // general workers retire when over the configured target —
+            // FastOnly is the always-on express worker, never retired.
+            if matches!(lane, Lane::Any) {
+                let cur = WORKER_COUNT.load(Ordering::Relaxed);
+                if cur > WORKER_TARGET.load(Ordering::Relaxed)
+                    && WORKER_COUNT
+                        .compare_exchange(cur, cur - 1, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    return;
+                }
+            }
             let job = {
                 let mut g = q.inner.lock();
                 loop {
@@ -310,5 +346,28 @@ pub fn current_progress() -> Option<Arc<Progress>> {
 pub fn cancel_progress() {
     if let Some(p) = CURRENT.lock().upgrade() {
         p.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_grows_and_shrinks_workers() {
+        pools();
+        let base = WORKER_COUNT.load(Ordering::Relaxed);
+        set_process_threads(base + 2);
+        assert_eq!(WORKER_COUNT.load(Ordering::Relaxed), base + 2);
+        set_process_threads(base);
+        // surplus workers retire between jobs — wake them with one
+        for _ in 0..200 {
+            pools().add_process(Job::new(PRIORITY_LOW, None, || {}));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            if WORKER_COUNT.load(Ordering::Relaxed) == base {
+                return;
+            }
+        }
+        panic!("workers did not shrink to {base}");
     }
 }
