@@ -11,9 +11,9 @@ use flate2::bufread::{GzDecoder, ZlibDecoder};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::io::{Cursor, Read};
+use std::io::Read;
 #[cfg(not(target_arch = "wasm32"))]
-use std::io::{Seek, SeekFrom};
+use std::io::{Cursor, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
@@ -128,47 +128,75 @@ fn mcc_path(mca: &Path, chunk: Point2i) -> PathBuf {
     mca.with_file_name(format!("c.{}.{}.mcc", chunk.x, chunk.z))
 }
 
-/// net.jpountz.lz4.LZ4BlockInputStream framing:
-/// repeated blocks of: compressed_len i32 BE, original_len i32 BE, data.
-/// compressed_len high bit (0x80000000) => raw stored block.
-/// `into` variant decodes each block straight into `out`'s tail instead of
-/// an intermediate Vec per block.
-fn lz4_decompress_blocks_into(data: &[u8], out: &mut Vec<u8>) -> Result<()> {
-    let mut c = Cursor::new(data);
-    let mut hdr = [0u8; 4];
-    loop {
-        match c.read_exact(&mut hdr) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-        let compressed = i32::from_be_bytes(hdr);
-        if compressed == 0 {
-            break;
-        }
-        c.read_exact(&mut hdr)?;
-        let original = i32::from_be_bytes(hdr);
-        if original < 0 {
-            bail!("invalid lz4 block size {original}");
-        }
-        if compressed as u32 & 0x8000_0000 != 0 {
-            let n = (compressed & 0x7FFF_FFFF) as usize;
-            let start = c.position() as usize;
-            out.extend_from_slice(&data[start..start + n]);
-            c.set_position((start + n) as u64);
-        } else {
-            let n = compressed as usize;
-            let start = c.position() as usize;
-            let base = out.len();
-            out.resize(base + original as usize, 0);
-            let written =
-                lz4_flex::block::decompress_into(&data[start..start + n], &mut out[base..])
-                    .context("lz4 block decompress")?;
-            out.truncate(base + written);
-            c.set_position((start + n) as u64);
-        }
+const LZ4_MAGIC: &[u8; 8] = b"LZ4Block";
+const LZ4_HEADER_SIZE: usize = 21;
+const LZ4_RAW: u8 = 0x10;
+const LZ4_COMPRESSED: u8 = 0x20;
+const LZ4_BLOCK_SIZE: usize = 64 * 1024;
+
+fn lz4_checksum(data: &[u8]) -> u32 {
+    // lz4-java's StreamingXXHash32.asChecksum() exposes the low 28 bits.
+    twox_hash::XxHash32::oneshot(0x9747_b28c, data) & 0x0fff_ffff
+}
+
+fn lz4_append_block(payload: &[u8], original: usize, raw: bool, out: &mut Vec<u8>) -> Result<()> {
+    if raw {
+        anyhow::ensure!(payload.len() == original, "invalid raw lz4 block size");
+        out.extend_from_slice(payload);
+    } else {
+        let base = out.len();
+        out.resize(base + original, 0);
+        let written = lz4_flex::block::decompress_into(payload, &mut out[base..])
+            .context("lz4 block decompress")?;
+        anyhow::ensure!(written == original, "incorrect lz4 block size");
     }
     Ok(())
+}
+
+fn lz4_decompress_blocks_into(mut data: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    if !data.starts_with(LZ4_MAGIC) {
+        return lz4_decompress_legacy(data, out);
+    }
+    loop {
+        let (header, rest) = data.split_at_checked(LZ4_HEADER_SIZE).context("truncated lz4 header")?;
+        anyhow::ensure!(header.starts_with(LZ4_MAGIC), "invalid lz4 block magic");
+        let token = header[8];
+        let method = token & 0xf0;
+        anyhow::ensure!(matches!(method, LZ4_RAW | LZ4_COMPRESSED), "invalid lz4 block method");
+        let compressed = u32::from_le_bytes(header[9..13].try_into().unwrap()) as usize;
+        let original = u32::from_le_bytes(header[13..17].try_into().unwrap()) as usize;
+        let checksum = u32::from_le_bytes(header[17..21].try_into().unwrap());
+        if compressed == 0 && original == 0 {
+            anyhow::ensure!(checksum == 0, "invalid lz4 end marker");
+            return Ok(());
+        }
+        anyhow::ensure!(compressed != 0 && original != 0 && original <= 1 << (10 + (token & 0xf)),
+            "invalid lz4 block size");
+        let (payload, remaining) = rest.split_at_checked(compressed).context("truncated lz4 block")?;
+        let base = out.len();
+        lz4_append_block(payload, original, method == LZ4_RAW, out)?;
+        anyhow::ensure!(lz4_checksum(&out[base..]) == checksum, "incorrect lz4 checksum");
+        data = remaining;
+    }
+}
+
+// Older Rust builds wrote big-endian lengths instead of Java's block header.
+fn lz4_decompress_legacy(mut data: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    loop {
+        let (size, rest) = data.split_at_checked(4).context("truncated legacy lz4 header")?;
+        let size = u32::from_be_bytes(size.try_into().unwrap());
+        if size == 0 {
+            return Ok(());
+        }
+        let (original, rest) = rest.split_at_checked(4).context("truncated legacy lz4 header")?;
+        let original = u32::from_be_bytes(original.try_into().unwrap()) as usize;
+        let len = (size & 0x7fff_ffff) as usize;
+        anyhow::ensure!(len != 0 && original != 0 && original <= LZ4_BLOCK_SIZE,
+            "invalid legacy lz4 block size");
+        let (payload, remaining) = rest.split_at_checked(len).context("truncated legacy lz4 block")?;
+        lz4_append_block(payload, original, size & 0x8000_0000 != 0, out)?;
+        data = remaining;
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -181,21 +209,24 @@ fn lz4_decompress_blocks(data: &[u8]) -> Result<Vec<u8>> {
 /// lz4 block output framing for saving (LZ4BlockOutputStream, 64KiB blocks).
 #[cfg(not(target_arch = "wasm32"))]
 fn lz4_compress_blocks(data: &[u8]) -> Result<Vec<u8>> {
-    const BLOCK: usize = 64 * 1024;
     let mut out = Vec::new();
-    for chunk in data.chunks(BLOCK) {
+    let mut write = |method, payload: &[u8], original: &[u8]| {
+        out.extend_from_slice(LZ4_MAGIC);
+        out.push(method | 6); // log2(64 KiB) - 10
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(original.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(if original.is_empty() { 0 } else { lz4_checksum(original) }).to_le_bytes());
+        out.extend_from_slice(payload);
+    };
+    for chunk in data.chunks(LZ4_BLOCK_SIZE) {
         let c = lz4_flex::block::compress(chunk);
         if c.len() >= chunk.len() {
-            out.extend_from_slice(&((chunk.len() as i32) | i32::MIN).to_be_bytes());
-            out.extend_from_slice(&(chunk.len() as i32).to_be_bytes());
-            out.extend_from_slice(chunk);
+            write(LZ4_RAW, chunk, chunk);
         } else {
-            out.extend_from_slice(&(c.len() as i32).to_be_bytes());
-            out.extend_from_slice(&(chunk.len() as i32).to_be_bytes());
-            out.extend_from_slice(&c);
+            write(LZ4_COMPRESSED, &c, chunk);
         }
     }
-    out.extend_from_slice(&0i32.to_be_bytes());
+    write(LZ4_RAW, &[], &[]);
     Ok(out)
 }
 
@@ -969,6 +1000,25 @@ pub struct WorldDirectories {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn reads_java_lz4_blocks() {
+        // lz4-java 1.8.0 LZ4BlockOutputStream with 64-byte blocks.
+        let blocks = b"LZ4Block\x20\x0c\0\0\0\x40\0\0\0\x9b\x35\x30\x04\x2f\x0a\0\x01\0\x26\x50\0\0\0\0\0\
+                       LZ4Block\x10\x04\0\0\0\x04\0\0\0\x10\x7f\xce\x07\0\0\0\0\
+                       LZ4Block\x10\0\0\0\0\0\0\0\0\0\0\0\0";
+        let mut expected = [0; 68];
+        expected[0] = 10;
+        assert_eq!(decompress(CompressionType::Lz4, blocks).unwrap(), expected);
+        let mut corrupt = *blocks;
+        corrupt[17] ^= 1;
+        assert!(decompress(CompressionType::Lz4, &corrupt).is_err());
+        let legacy = b"\x80\0\0\x04\0\0\0\x04\x0a\0\0\0\0\0\0\0";
+        assert_eq!(decompress(CompressionType::Lz4, legacy).unwrap(), [10, 0, 0, 0]);
+        let encoded = compress(CompressionType::Lz4, &expected).unwrap();
+        assert!(encoded.starts_with(LZ4_MAGIC));
+        assert_eq!(decompress(CompressionType::Lz4, &encoded).unwrap(), expected);
+    }
 
     #[test]
     fn in_memory_region_filter_preserves_timestamps_and_external_payloads() {
