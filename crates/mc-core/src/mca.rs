@@ -1,14 +1,21 @@
 //! Port of io.mca: region file loading (MCAFile/Chunk/RegionChunk/Region).
 
-use crate::nbt::{self, Compound, SliceReader, Tag};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::nbt;
+use crate::nbt::{Compound, SliceReader, Tag};
 use crate::point::Point2i;
+use crate::selection::ChunkSet;
 use anyhow::{bail, Context as _, Result};
 use flate2::bufread::{GzDecoder, ZlibDecoder};
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::io::{Cursor, Read};
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
 pub const HEADER_SIZE: usize = 8192;
@@ -104,6 +111,19 @@ impl CompressionType {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn read_sidecar(file: &Path, loc: Point2i) -> Result<Cow<'static, [u8]>> {
+    let mcc = mcc_path(file, loc);
+    match std::fs::read(&mcc) {
+        Ok(bytes) => Ok(Cow::Owned(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("mcc file {} does not exist", mcc.display())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn mcc_path(mca: &Path, chunk: Point2i) -> PathBuf {
     mca.with_file_name(format!("c.{}.{}.mcc", chunk.x, chunk.z))
 }
@@ -151,6 +171,7 @@ fn lz4_decompress_blocks_into(data: &[u8], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn lz4_decompress_blocks(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len().saturating_mul(3).max(4096));
     lz4_decompress_blocks_into(data, &mut out)?;
@@ -158,6 +179,7 @@ fn lz4_decompress_blocks(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// lz4 block output framing for saving (LZ4BlockOutputStream, 64KiB blocks).
+#[cfg(not(target_arch = "wasm32"))]
 fn lz4_compress_blocks(data: &[u8]) -> Result<Vec<u8>> {
     const BLOCK: usize = 64 * 1024;
     let mut out = Vec::new();
@@ -177,6 +199,7 @@ fn lz4_compress_blocks(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn decompress(compression: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
     Ok(match compression.base() {
         CompressionType::Gzip => {
@@ -235,6 +258,7 @@ thread_local! {
 
 
 
+#[cfg(not(target_arch = "wasm32"))]
 fn compress(compression: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
     Ok(match compression.base() {
         CompressionType::Gzip => {
@@ -308,9 +332,58 @@ fn header_tables(hdr: &[u8; HEADER_SIZE]) -> ([i32; 1024], [u8; 1024], [i32; 102
     (offsets, sectors, timestamps)
 }
 
+/// Read occupied slots from an Anvil header without decoding any chunks.
+pub fn region_chunk_set(data: &[u8]) -> Result<ChunkSet> {
+    anyhow::ensure!(data.len() >= HEADER_SIZE, "truncated region header");
+    let mut chunks = ChunkSet::new();
+    for i in 0..1024 {
+        if offset_at(data, i) != 0 {
+            chunks.set(i);
+        }
+    }
+    Ok(chunks)
+}
+
+/// Copy retained chunk records and timestamps, without decoding their NBT.
+/// The returned set identifies retained records that need their .mcc sidecars.
+pub fn filter_region_bytes(data: &[u8], keep: &ChunkSet) -> Result<(Vec<u8>, ChunkSet)> {
+    anyhow::ensure!(data.len() >= HEADER_SIZE, "truncated region header");
+    let mut output = vec![0; HEADER_SIZE];
+    let mut external = ChunkSet::new();
+    for i in keep.iter() {
+        let entry = i * 4;
+        let offset = offset_at(data, i) as usize;
+        if offset == 0 {
+            continue;
+        }
+        let sectors = data[entry + 3];
+        let start = offset.checked_mul(4096).context("chunk offset out of bounds")?;
+        let len = sectors as usize * 4096;
+        let end = start.checked_add(len).context("chunk offset out of bounds")?;
+        anyhow::ensure!(start >= HEADER_SIZE && sectors != 0 && end <= data.len(),
+            "invalid sector range for chunk slot {i}");
+        let record = &data[start..end];
+        let payload_len = u32::from_be_bytes(record[..4].try_into().unwrap()) as usize;
+        anyhow::ensure!(payload_len > 0 && payload_len <= len - 4,
+            "invalid record length for chunk slot {i}");
+        if record[4] & 0x80 != 0 {
+            external.set(i);
+        }
+        let new_offset = output.len() / 4096;
+        anyhow::ensure!(new_offset <= 0xff_ffff, "region offset exceeds three bytes");
+        output[entry..entry + 3].copy_from_slice(&(new_offset as u32).to_be_bytes()[1..]);
+        output[entry + 3] = sectors;
+        let timestamp = 4096 + entry;
+        output[timestamp..timestamp + 4].copy_from_slice(&data[timestamp..timestamp + 4]);
+        output.extend_from_slice(record);
+    }
+    Ok((output, external))
+}
+
 /// read one chunk's `[len i32][type u8][payload]` record at sector-offset
 /// `pos` — synthesizes the buffer layout `parse_chunk` expects without
 /// pulling the whole region file into memory.
+#[cfg(not(target_arch = "wasm32"))]
 fn read_chunk_record(f: &mut std::fs::File, pos: usize) -> Result<Vec<u8>> {
     let file_len = f.metadata()?.len() as usize;
     f.seek(SeekFrom::Start(pos as u64))?;
@@ -333,21 +406,26 @@ fn read_chunk_record(f: &mut std::fs::File, pos: usize) -> Result<Vec<u8>> {
 /// evicted oldest-first. Parsed `McaFile`s can't be shared — jobs consume
 /// owned files and `chunk.data` is mutated by callers — but the raw image is
 /// immutable, so `Arc<Vec<u8>>` handouts are cheap and safe.
+#[cfg(not(target_arch = "wasm32"))]
 struct RawFileCache {
     map: std::collections::HashMap<PathBuf, RawFileEntry>,
     order: std::collections::VecDeque<PathBuf>,
     bytes: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct RawFileEntry {
     mtime_ms: i64,
     len: u64,
     data: Arc<Vec<u8>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 const RAW_CACHE_MAX_ENTRIES: usize = 24;
+#[cfg(not(target_arch = "wasm32"))]
 const RAW_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn raw_file_cache() -> &'static parking_lot::Mutex<RawFileCache> {
     static C: std::sync::OnceLock<parking_lot::Mutex<RawFileCache>> = std::sync::OnceLock::new();
     C.get_or_init(|| {
@@ -360,6 +438,7 @@ fn raw_file_cache() -> &'static parking_lot::Mutex<RawFileCache> {
 }
 
 /// drop any cached image for `path` (called after writes/renames).
+#[cfg(not(target_arch = "wasm32"))]
 fn invalidate_file_cache(path: &Path) {
     let mut c = raw_file_cache().lock();
     if let Some(e) = c.map.remove(path) {
@@ -403,6 +482,7 @@ impl McaFile {
     /// instead of re-reading several MB per job. Entries are validated by
     /// (mtime, len) so any rewrite automatically misses, and are dropped
     /// explicitly by the write paths below.
+    #[cfg(not(target_arch = "wasm32"))]
     fn read_file(&self) -> Result<Arc<Vec<u8>>> {
         let stamp = std::fs::metadata(&self.file).ok().and_then(|m| {
             let ms = m
@@ -450,6 +530,7 @@ impl McaFile {
     /// loadOffsets: read just the 8KiB header (offsets + sectors + timestamps)
     /// instead of the whole (multi-MB) region file — the Border filter's
     /// neighbor probes only need the header tables.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_offsets(&mut self) -> Result<()> {
         let mut hdr = [0u8; HEADER_SIZE];
         let mut f = std::fs::File::open(&self.file)?;
@@ -469,15 +550,40 @@ impl McaFile {
     /// load(raw): reads header then every chunk's NBT.
     /// `raw` => arrays parse as raw bytes (fast path used by the renderer)
     /// and marks the file unserializable (`raw_mode`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load(&mut self, raw: bool) -> Result<()> {
         let data = self.read_file()?;
+        self.load_bytes(&data, raw, &read_sidecar)
+    }
+
+    /// Parse a region image. Sidecar keys are absolute chunk coordinates.
+    pub fn from_bytes(
+        file: PathBuf,
+        data: &[u8],
+        raw: bool,
+        sidecars: &std::collections::HashMap<Point2i, Vec<u8>>,
+    ) -> Result<Self> {
+        anyhow::ensure!(data.len() >= HEADER_SIZE, "truncated region header");
+        let mut region = Self::new(file)?;
+        region.load_bytes(data, raw, &|_, loc| {
+            sidecars.get(&loc).map(|bytes| Cow::Borrowed(bytes.as_slice()))
+                .with_context(|| format!("missing sidecar c.{}.{}.mcc", loc.x, loc.z))
+        })?;
+        Ok(region)
+    }
+
+    fn load_bytes<'a>(
+        &mut self,
+        data: &[u8],
+        raw: bool,
+        sidecar: &(impl Fn(&Path, Point2i) -> Result<Cow<'a, [u8]>> + Sync),
+    ) -> Result<()> {
         self.raw_mode = raw;
         if data.len() <= HEADER_SIZE {
             return Ok(());
         }
         self.parse_header(data[..HEADER_SIZE].try_into().unwrap());
         let origin = self.location.region_to_chunk();
-        let data: &[u8] = data.as_slice();
         let offsets = &self.offsets;
         let timestamps = &self.timestamps;
         let file = &self.file;
@@ -486,8 +592,8 @@ impl McaFile {
                 return None;
             }
             let loc = origin.add_p(Point2i::from_chunk_index(i as i32));
-            let pos = offsets[i] as usize * 4096;
-            match Self::parse_chunk(data, pos, loc, file, raw) {
+            let pos = (offsets[i] as usize).checked_mul(4096)?;
+            match Self::parse_chunk(data, pos, loc, file, raw, sidecar) {
                 Ok(mut c) => {
                     c.timestamp = timestamps[i];
                     Some(c)
@@ -501,33 +607,37 @@ impl McaFile {
         // Nearly-empty regions stay sequential — the process-pool workers
         // already saturate all cores, so cross-thread dispatch of a handful
         // of tiny chunk tasks is pure overhead.
-        const PAR_CHUNK_THRESHOLD: usize = 64;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            const PAR_CHUNK_THRESHOLD: usize = 64;
         // cap splitting at ~32-chunk tasks: 1024 single-chunk tasks mostly
         // buy scheduling overhead at chunk-parse cost granularity.
-        const PAR_MIN_BATCH: usize = 32;
-        let present = offsets.iter().filter(|&&o| o != 0).count();
-        self.chunks = if present >= PAR_CHUNK_THRESHOLD {
-            (0..1024)
-                .into_par_iter()
-                .with_min_len(PAR_MIN_BATCH)
-                .map(parse)
-                .collect()
-        } else {
-            (0..1024).map(parse).collect()
-        };
+            const PAR_MIN_BATCH: usize = 32;
+            let present = offsets.iter().filter(|&&o| o != 0).count();
+            if present >= PAR_CHUNK_THRESHOLD {
+                self.chunks = (0..1024)
+                    .into_par_iter()
+                    .with_min_len(PAR_MIN_BATCH)
+                    .map(parse)
+                    .collect();
+                return Ok(());
+            }
+        }
+        self.chunks = (0..1024).map(parse).collect();
         Ok(())
     }
 
     /// Parse the `[len i32][type u8][payload]` record starting at `pos`.
     /// A non-compound root yields a Chunk with data=None (never Ok(None)).
-    fn parse_chunk(
+    fn parse_chunk<'a>(
         data: &[u8],
         pos: usize,
         loc: Point2i,
         file: &Path,
         raw: bool,
+        sidecar: &impl Fn(&Path, Point2i) -> Result<Cow<'a, [u8]>>,
     ) -> Result<Chunk> {
-        if pos + 5 > data.len() {
+        if data.len().saturating_sub(pos) < 5 {
             bail!("chunk offset out of bounds");
         }
         let length = i32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
@@ -535,18 +645,9 @@ impl McaFile {
         // borrow the payload straight out of the file image — decoders read
         // from the slice and uncompressed chunks parse in place (no copies).
         let payload: Cow<'_, [u8]> = if compression.is_external() {
-            let mcc = mcc_path(file, loc);
-            // one syscall instead of exists()+read; missing file keeps the
-            // same bail message as before.
-            match std::fs::read(&mcc) {
-                Ok(b) => Cow::Owned(b),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    bail!("mcc file {} does not exist", mcc.display())
-                }
-                Err(e) => return Err(e.into()),
-            }
+            sidecar(file, loc)?
         } else {
-            let end = (pos + 5 + length.saturating_sub(1)).min(data.len());
+            let end = (pos + 5).saturating_add(length.saturating_sub(1)).min(data.len());
             Cow::Borrowed(&data[pos + 5..end])
         };
         // decompress into the per-thread scratch buffer and parse — the
@@ -577,6 +678,7 @@ impl McaFile {
         Ok(chunk)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_single_chunk(&self, chunk: Point2i, raw: bool) -> Result<Option<Chunk>> {
         let rel = chunk.as_relative_chunk();
         let idx = rel.as_chunk_index();
@@ -595,7 +697,7 @@ impl McaFile {
         }
         let pos = offsets[idx] as usize * 4096;
         let data = read_chunk_record(&mut f, pos)?;
-        let mut c = Self::parse_chunk(&data, 0, abs, &self.file, raw)?;
+        let mut c = Self::parse_chunk(&data, 0, abs, &self.file, raw, &read_sidecar)?;
         c.timestamp = timestamps[idx];
         Ok(Some(c))
     }
@@ -604,6 +706,7 @@ impl McaFile {
     /// strips need a region's edge chunks without paying for a full
     /// decompress: one file open, the 8KiB header, then each chunk's own
     /// sectors (same read path as load_single_chunk).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_sparse(&mut self, indices: &[usize], raw: bool) -> Result<()> {
         let mut f = std::fs::File::open(&self.file)?;
         let mut hdr = [0u8; HEADER_SIZE];
@@ -619,7 +722,7 @@ impl McaFile {
             let pos = self.offsets[i] as usize * 4096;
             let loc = origin.add_p(Point2i::from_chunk_index(i as i32));
             let Ok(data) = read_chunk_record(&mut f, pos) else { continue };
-            if let Ok(mut c) = Self::parse_chunk(&data, 0, loc, &self.file, raw) {
+            if let Ok(mut c) = Self::parse_chunk(&data, 0, loc, &self.file, raw, &read_sidecar) {
                 c.timestamp = self.timestamps[i];
                 chunks[i] = Some(c);
             }
@@ -654,6 +757,7 @@ impl McaFile {
 
     /// Refuse to serialize a raw-loaded file: its arrays are undecoded byte
     /// blobs that would write back as corrupted ByteArrays (silent data loss).
+    #[cfg(not(target_arch = "wasm32"))]
     fn ensure_serializable(&self) -> Result<()> {
         if self.raw_mode {
             bail!(
@@ -666,6 +770,7 @@ impl McaFile {
 
     /// save(raf): writes all chunks sequentially starting at sector 2.
     /// Returns false if no chunks were written.
+    #[cfg(not(target_arch = "wasm32"))]
     fn save_to<W: std::io::Write + std::io::Seek>(&self, w: &mut W) -> Result<bool> {
         self.ensure_serializable()?;
         use std::io::SeekFrom;
@@ -712,6 +817,7 @@ impl McaFile {
     }
 
     /// saveWithTempFile
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save_with_temp_file(&self, dest: &Path) -> Result<bool> {
         self.ensure_serializable()?;
         let tmp = dest.with_extension("mca.tmp");
@@ -738,6 +844,7 @@ impl McaFile {
     }
 
     /// deFragment: copy raw sectors of present chunks into a compacted file.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn defragment(&self, dest: &Path) -> Result<()> {
         // copies sectors, not NBT — but a raw-loaded file must never reach a
         // write path, so the same guard applies. (load_offsets users never
@@ -801,6 +908,7 @@ impl McaFile {
     /// RegionMCAFile.getStructures: chunk -> structure names via
     /// `chunk::structure_starts` (upstream ChunkFilter.parseStructureStarts;
     /// references + POI are upstream-cached separately).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn structures(&self) -> crate::cache::StructuresData {
         let mut out = crate::cache::StructuresData::default();
         for chunk in self.chunks.iter().flatten() {
@@ -816,6 +924,7 @@ impl McaFile {
 }
 
 /// write a single chunk at the writer's current position (length + type + data).
+#[cfg(not(target_arch = "wasm32"))]
 fn write_chunk_data<W: std::io::Write>(
     w: &mut W,
     chunk: &Chunk,
@@ -856,10 +965,36 @@ pub struct WorldDirectories {
     pub entities: Option<PathBuf>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn in_memory_region_filter_preserves_timestamps_and_external_payloads() {
+        let mut data = vec![0u8; HEADER_SIZE + 8192];
+        let payload = [10, 0, 0, 0]; // empty compound
+        data[..8].copy_from_slice(&[0, 0, 2, 1, 0, 0, 3, 1]);
+        data[4096..4104].copy_from_slice(&[0, 0, 0, 42, 0, 0, 0, 99]);
+        data[8192..8201].copy_from_slice(&[0, 0, 0, 5, 3, 10, 0, 0, 0]);
+        data[12288..12293].copy_from_slice(&[0, 0, 0, 1, 0x83]);
+        let sidecars = [(Point2i::new(-31, 64), payload.to_vec())].into();
+        let file = PathBuf::from("r.-1.2.mca");
+        let original = McaFile::from_bytes(file.clone(), &data, false, &sidecars).unwrap();
+        assert_eq!(original.chunks[0].as_ref().unwrap().timestamp, 42);
+        assert_eq!(original.chunks[1].as_ref().unwrap().timestamp, 99);
+
+        let mut keep = region_chunk_set(&data).unwrap();
+        keep.clear(0);
+        let (filtered, external) = filter_region_bytes(&data, &keep).unwrap();
+        assert_eq!(external, keep);
+        assert_eq!(region_chunk_set(&filtered).unwrap(), keep);
+        assert_eq!(filtered.len(), 12288);
+        let result = McaFile::from_bytes(file, &filtered, false, &sidecars).unwrap();
+        assert!(result.chunks[0].is_none());
+        assert_eq!(result.chunks[1].as_ref().unwrap().timestamp, 99);
+        assert!(filter_region_bytes(&data[..data.len() - 1], &keep).is_err());
+    }
 
     /// regression: load_offsets must fill sectors[] and timestamps[] too —
     /// when it only filled offsets[], defragment() read sectors==0 for every
@@ -889,6 +1024,7 @@ mod tests {
 }
 
 /// gzip-or-plain NBT blob -> root compound (player .dat files).
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn read_compressed(bytes: &[u8]) -> Option<nbt::Compound> {
     let raw = if bytes.starts_with(&[0x1f, 0x8b]) {
         decompress(CompressionType::Gzip, bytes).ok()?

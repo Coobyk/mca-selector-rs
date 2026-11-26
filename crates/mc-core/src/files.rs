@@ -1,8 +1,11 @@
 //! Port of io.FileHelper + config directory resolution (Config.BASE_*).
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::mca::WorldDirectories;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::nbt::Tag;
 use crate::point::Point2i;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
 pub fn parse_mca_file_name(name: &str) -> Option<Point2i> {
@@ -27,6 +30,7 @@ pub fn png_file_name(r: Point2i) -> String {
 }
 
 /// Java UUID.nameUUIDFromBytes (MD5, version 3, IETF variant).
+#[cfg(not(target_arch = "wasm32"))]
 fn name_uuid(bytes: &[u8]) -> String {
     use md5::{Digest, Md5};
     let mut d = Md5::digest(bytes).to_vec();
@@ -38,10 +42,12 @@ fn name_uuid(bytes: &[u8]) -> String {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn world_uuid(region_dir: &Path) -> String {
     name_uuid(region_dir.to_string_lossy().as_bytes()).replace('-', "")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn home_dir() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| ".".into())
 }
@@ -49,6 +55,7 @@ fn home_dir() -> PathBuf {
 /// BASE_CACHE_DIR (linux branch: XDG_CACHE_HOME/mcaselector or ~/.cache/mcaselector)
 /// Memoized: cache helpers call this once per file op; avoids a create_dir_all
 /// syscall each time. Env vars are process-stable, so caching is safe.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn base_cache_dir() -> PathBuf {
     static P: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     P.get_or_init(|| {
@@ -63,6 +70,7 @@ pub fn base_cache_dir() -> PathBuf {
 }
 
 /// BASE_CONFIG_FILE dir (XDG_CONFIG_HOME/mcaselector or ~/.mcaselector/mcaselector)
+#[cfg(not(target_arch = "wasm32"))]
 pub fn base_config_dir() -> PathBuf {
     static P: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     P.get_or_init(|| {
@@ -79,17 +87,20 @@ pub fn base_config_dir() -> PathBuf {
 
 
 /// world cache dir: base_cache_dir/<world-uuid>
+#[cfg(not(target_arch = "wasm32"))]
 pub fn world_cache_dir(region_dir: &Path) -> PathBuf {
     base_cache_dir().join(world_uuid(region_dir))
 }
 
 /// per-zoom-level png cache: world_cache/<zoom>/r.x.z.png
+#[cfg(not(target_arch = "wasm32"))]
 pub fn png_cache_path(world_cache: &Path, zoom: i32, r: Point2i) -> PathBuf {
     // one join+format (2 allocs) instead of zoom.to_string()+two joins (~4);
     // called ~8x per tile request while probing the png pyramid.
     world_cache.join(format!("{}/{}", zoom, png_file_name(r)))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn has_mca_files(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|rd| {
@@ -100,11 +111,13 @@ fn has_mca_files(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn is_valid_dimension(dir: &Path) -> bool {
     dir.join("region").is_dir() && has_mca_files(&dir.join("region"))
 }
 
 /// detectWorldDirectories: region dir must contain mca files.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn detect_world_directories(dir: &Path) -> WorldDirectories {
     let mut w = WorldDirectories::default();
     let region = dir.join("region");
@@ -123,6 +136,7 @@ pub fn detect_world_directories(dir: &Path) -> WorldDirectories {
 }
 
 /// detectDimensionDirectories — dimension candidates under a world root.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn detect_dimension_directories(dir: &Path) -> Vec<PathBuf> {
     let mut result = Vec::new();
     for sub in [
@@ -164,8 +178,10 @@ pub fn detect_dimension_directories(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// pre-1.13 saves keep the nether/end dims directly under the world root
+#[cfg(not(target_arch = "wasm32"))]
 const LEGACY_DIMS: [&str; 2] = ["DIM-1", "DIM1"];
 
+#[cfg(not(target_arch = "wasm32"))]
 fn is_dim_folder(name: &str) -> bool {
     // ^DIM-?\d+$
     if let Some(rest) = name.strip_prefix("DIM") {
@@ -175,6 +191,7 @@ fn is_dim_folder(name: &str) -> bool {
     false
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn detect_datapack_dimensions(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth >= 4 {
         return;
@@ -205,6 +222,7 @@ fn detect_datapack_dimensions(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) 
 /// World seed from the nearest level.dat (walk up from the region dir —
 /// dim dirs sit at world/dimensions/ns/name, plain saves at world/).
 /// Modern layout: Data.WorldGenSettings.seed; pre-1.16: Data.RandomSeed.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn world_seed(region_dir: &Path) -> Option<i64> {
     for dir in region_dir.ancestors().take(6) {
         let p = dir.join("level.dat");
@@ -229,11 +247,13 @@ pub fn world_seed(region_dir: &Path) -> Option<i64> {
 
 /// backups root for a file inside a dimension dir:
 /// `<dimension-root>/mca-selector-backups`.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn backup_root_for(path: &Path) -> Option<PathBuf> {
     path.parent()?.parent().map(|d| d.join("mca-selector-backups"))
 }
 
 /// per-operation stamp — one backup set per batch job.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn backup_stamp() -> String {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -262,6 +282,7 @@ pub fn backup_stamp() -> String {
 /// through temp+rename, so the old inode survives) with a copy fallback.
 /// Files that don't exist yet are recorded in `created.txt` so a restore
 /// can delete files the operation made. Returns the backup path.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn backup_file(path: &Path, stamp: &str) -> Option<PathBuf> {
     let dir = backup_root_for(path)?.join(stamp);
     if path.is_file() {
@@ -286,6 +307,7 @@ pub fn backup_file(path: &Path, stamp: &str) -> Option<PathBuf> {
 }
 
 /// every backup stamp dir under a dimension root, oldest first.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn list_backups(dimension_root: &Path) -> Vec<PathBuf> {
     let root = dimension_root.join("mca-selector-backups");
     let mut v: Vec<PathBuf> = std::fs::read_dir(&root)
@@ -302,6 +324,7 @@ pub fn list_backups(dimension_root: &Path) -> Vec<PathBuf> {
 
 /// restore one backup set: copy every backed-up file back over its origin
 /// and delete files the operation created. Returns (restored, deleted).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn restore_backup(dir: &Path) -> std::io::Result<(usize, usize)> {
     let Some(dim) = dir.parent().and_then(|p| p.parent()).map(|d| d.to_path_buf()) else {
         return Ok((0, 0));
@@ -340,6 +363,7 @@ pub fn restore_backup(dir: &Path) -> std::io::Result<(usize, usize)> {
 }
 
 /// scan region dir for r.*.mca files > header size -> region coords set.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn scan_region_files(region_dir: &Path) -> std::collections::HashSet<i64> {
     let mut set = std::collections::HashSet::new();
     if let Ok(rd) = std::fs::read_dir(region_dir) {

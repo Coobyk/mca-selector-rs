@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
-rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 flate2.workspace = true
@@ -18,6 +17,9 @@ base64.workspace = true
 md-5.workspace = true
 parking_lot.workspace = true
 indexmap.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon.workspace = true
 
 [dev-dependencies]
 image.workspace = true

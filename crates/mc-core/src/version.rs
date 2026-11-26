@@ -1452,7 +1452,7 @@ const MEMO_SLOTS: usize = 4096;
 struct RgbMemo {
     gen: u32,
     tags: Box<[u32; MEMO_SLOTS]>,
-    keys: Box<[(usize, usize); MEMO_SLOTS]>,
+    keys: Box<[(usize, u64); MEMO_SLOTS]>,
     vals: Box<[u32; MEMO_SLOTS]>,
 }
 impl RgbMemo {
@@ -1476,15 +1476,15 @@ impl RgbMemo {
     #[inline]
     fn get(&mut self, cm: &ColorMap, e: &PalEntry<'_>, cv: &CellVal, bk: BiomeKey) -> u32 {
         let bk_key = match bk {
-            BiomeKey::Name(s) => (s.as_ptr() as usize) ^ (s.len() << 20),
-            BiomeKey::Idx(i) => (i as usize) << 40 | 1,
+            BiomeKey::Name(s) => (s.as_ptr() as usize as u64) ^ ((s.len() as u64) << 20),
+            BiomeKey::Idx(i) => (i as u64) << 40 | 1,
         };
         let key = (e as *const PalEntry<'_> as usize, bk_key);
         // two multiplies fold both words; the high bits carry the entropy.
         let h = (key.0 as u64)
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             .rotate_left(23)
-            ^ (key.1 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+            ^ key.1.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
         let i = (((h >> 32) ^ h) as usize) & (MEMO_SLOTS - 1);
         if self.tags[i] == self.gen && self.keys[i] == key {
             return self.vals[i];

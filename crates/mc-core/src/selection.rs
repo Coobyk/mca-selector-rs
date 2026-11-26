@@ -460,6 +460,7 @@ impl Selection {
         Some((min?, max?))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save_csv(&self, path: &std::path::Path) -> std::io::Result<()> {
         let mut out = String::new();
         if self.inverted {
@@ -482,6 +483,7 @@ impl Selection {
         std::fs::write(path, out)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn read_csv(path: &std::path::Path) -> std::io::Result<Selection> {
         let text = std::fs::read_to_string(path)?;
         let mut sel = Selection::new();
@@ -520,6 +522,7 @@ impl Selection {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn bad_line(num: usize) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
