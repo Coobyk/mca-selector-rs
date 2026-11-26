@@ -5,6 +5,9 @@ const stage = $("stage");
 const picker = $("folder");
 const dimSelect = $("dimension");
 const number = new Intl.NumberFormat();
+const noun = (n, singular) => singular + (n === 1 ? "" : "s");
+const quantity = (n, singular) => number.format(n) + " " + noun(n, singular);
+const maxZoom = 96;
 const key = (x, z) => x + "," + z;
 const has = (mask, i) => (mask[i >> 3] & (1 << (i & 7))) !== 0;
 const bit = (mask, i, on) => {
@@ -16,6 +19,7 @@ const bitmaps = new Map();
 const broken = new Set();
 const view = {x: 0, z: 0, zoom: 1};
 let worker, dim, pending, gesture, frame, packing = false, space = false, tool = "chunks";
+let fitted = false;
 let request = 0, count = 0, width = 0, height = 0;
 
 function status(message, error = false) {
@@ -29,11 +33,12 @@ function schedule() {
 
 function fit() {
   if (!dim) return;
-  const {minX, maxX, minZ, maxZ} = dim;
+  fitted = true;
+  if (!width || !height) return;
+  const {minX, maxX, minZ, maxZ} = dim.terrainBounds ?? dim.bounds;
   view.x = (minX + maxX) / 2;
   view.z = (minZ + maxZ) / 2;
-  view.zoom = Math.min(width / (maxX - minX), height / (maxZ - minZ)) * .88;
-  view.zoom = Math.min(view.zoom, 16);
+  view.zoom = Math.min(maxZoom, Math.min(width / (maxX - minX), height / (maxZ - minZ)) * .88);
   schedule();
 }
 
@@ -41,7 +46,7 @@ function changeDimension() {
   dim = dimensions.get(dimSelect.value);
   gesture = null;
   $("coords").textContent = "X — : Z —";
-  status(number.format(dim.regions.size) + " regions indexed · " + dim.label);
+  status(quantity(dim.regions.size, "region") + " indexed · " + dim.label);
   fit();
   updateCount();
 }
@@ -56,6 +61,7 @@ function updateCount() {
     }
   }
   $("count").textContent = number.format(count);
+  $("count-label").textContent = noun(count, "chunk") + " selected";
   $("clear").disabled = !count;
   $("export").disabled = !count || packing;
   $("delete").disabled = !count || packing;
@@ -70,6 +76,7 @@ function open(entries) {
   dimensions.clear();
   dim = pending = gesture = null;
   packing = false;
+  fitted = false;
   dimSelect.replaceChildren(new Option("—", ""));
   for (const id of ["dimension", "zoom-in", "zoom-out", "fit"]) $(id).disabled = true;
   $("world-name").textContent = "Indexing world…";
@@ -96,20 +103,15 @@ function open(entries) {
 function onmessage(message) {
   switch (message.type) {
     case "indexing":
-      status("Indexing · " + number.format(message.loaded) + " regions");
+      status("Indexing · " + quantity(message.loaded, "region"));
       break;
     case "world":
       $("world-name").textContent = message.worldName;
       for (const data of message.dimensions) {
-        const dimension = {...data, minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity,
-          regions: new Map(), selection: new Map()};
+        const dimension = {...data, regions: new Map(), selection: new Map(), terrain: new Map()};
         for (const region of data.regions) {
           const id = key(region.x, region.z);
           dimension.regions.set(id, {...region, id});
-          dimension.minX = Math.min(dimension.minX, region.x * 32);
-          dimension.maxX = Math.max(dimension.maxX, (region.x + 1) * 32);
-          dimension.minZ = Math.min(dimension.minZ, region.z * 32);
-          dimension.maxZ = Math.max(dimension.maxZ, (region.z + 1) * 32);
         }
         dimensions.set(data.path, dimension);
       }
@@ -117,10 +119,29 @@ function onmessage(message) {
       for (const id of ["dimension", "zoom-in", "zoom-out", "fit"]) $(id).disabled = false;
       canvas.classList.add("ready");
       changeDimension();
-      if (message.skipped) status("World ready · " + message.skipped + " invalid regions skipped.", true);
+      if (message.skipped) status("World ready · " + number.format(message.skipped) +
+        " invalid " + noun(message.skipped, "region") + " skipped.", true);
       break;
     case "tile": {
       if (pending === message.request) pending = null;
+      const dimension = dimensions.get(message.dimension);
+      if (!dimension.terrain.has(message.id)) {
+        dimension.terrain.set(message.id, message.bounds);
+        if (dimension.terrain.size === dimension.regions.size) {
+          const bounds = {minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity};
+          for (const tile of dimension.terrain.values()) {
+            if (!tile) continue;
+            bounds.minX = Math.min(bounds.minX, tile.minX);
+            bounds.maxX = Math.max(bounds.maxX, tile.maxX);
+            bounds.minZ = Math.min(bounds.minZ, tile.minZ);
+            bounds.maxZ = Math.max(bounds.maxZ, tile.maxZ);
+          }
+          if (bounds.minX < bounds.maxX) {
+            dimension.terrainBounds = bounds;
+            if (dim === dimension && fitted && !gesture) fit();
+          }
+        }
+      }
       const id = message.dimension + "|" + message.id;
       bitmaps.get(id)?.bitmap.close();
       bitmaps.delete(id);
@@ -280,8 +301,9 @@ function select(g) {
 
 function zoom(x, z, change) {
   if (!dim) return;
+  fitted = false;
   const wx = worldX(x), wz = worldZ(z);
-  view.zoom = Math.max(.0001, Math.min(96, view.zoom * change));
+  view.zoom = Math.max(.0001, Math.min(maxZoom, view.zoom * change));
   view.x += wx - worldX(x);
   view.z += wz - worldZ(z);
   schedule();
@@ -308,6 +330,7 @@ canvas.addEventListener("pointermove", event => {
   const [mx, mz] = mapPoint(event);
   if (gesture?.id === event.pointerId) {
     if (gesture.pan) {
+      fitted = false;
       view.x -= (mx - gesture.mx) / view.zoom;
       view.z -= (mz - gesture.mz) / view.zoom;
       gesture.mx = mx;
@@ -345,6 +368,7 @@ window.addEventListener("keydown", event => {
     space = true;
     event.preventDefault();
   } else if (event.key.startsWith("Arrow")) {
+    fitted = false;
     const step = 48 / view.zoom;
     if (event.key === "ArrowLeft") view.x -= step;
     if (event.key === "ArrowRight") view.x += step;
@@ -361,7 +385,8 @@ window.addEventListener("blur", () => { space = false; });
 new ResizeObserver(([{contentRect}]) => {
   width = contentRect.width;
   height = contentRect.height;
-  schedule();
+  if (fitted) fit();
+  else schedule();
 }).observe(stage);
 
 for (const button of document.querySelectorAll("[data-open]")) button.onclick = () => picker.click();
@@ -384,7 +409,8 @@ $("clear").onclick = () => { dim.selection.clear(); updateCount(); };
 
 function archive(remove) {
   if (!dim || !count || packing) return;
-  if (remove && !window.confirm("Delete " + number.format(count) + " selected chunks in a downloadable copy? Your original files won't change.")) return;
+  if (remove && !window.confirm("Delete " + quantity(count, "selected chunk") +
+      " in a downloadable copy? Your original files won't change.")) return;
   packing = true;
   status("Preparing ZIP…");
   updateCount();

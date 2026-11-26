@@ -27,6 +27,17 @@ function split(path) {
   return [names[0], names.slice(1).join("/")];
 }
 
+function extendBounds(bounds, regionX, regionZ, mask) {
+  for (let i = 0; i < 1024; i++) {
+    if (!has(mask, i)) continue;
+    const x = regionX * 32 + (i & 31), z = regionZ * 32 + (i >> 5);
+    bounds.minX = Math.min(bounds.minX, x);
+    bounds.maxX = Math.max(bounds.maxX, x + 1);
+    bounds.minZ = Math.min(bounds.minZ, z);
+    bounds.maxZ = Math.max(bounds.maxZ, z + 1);
+  }
+}
+
 async function openWorld(entries) {
   for (const [path, file] of entries) {
     const parts = split(path);
@@ -64,9 +75,12 @@ async function openWorld(entries) {
       if (!mask.some(Boolean)) continue;
       if (!dimensions.has(dimPath)) {
         const [label, kind] = dimInfo(dimPath);
-        dimensions.set(dimPath, {path: dimPath, label, kind, regions: new Map()});
+        const bounds = {minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity};
+        dimensions.set(dimPath, {path: dimPath, label, kind, bounds, regions: new Map()});
       }
-      dimensions.get(dimPath).regions.set(key(x, z), {x, z, mask, directory, name, file});
+      const dim = dimensions.get(dimPath);
+      extendBounds(dim.bounds, x, z, mask);
+      dim.regions.set(key(x, z), {x, z, mask, directory, name, file});
       loaded++;
       if (loaded % 32 === 0) self.postMessage({type: "indexing", loaded});
     } catch {
@@ -77,7 +91,7 @@ async function openWorld(entries) {
   self.postMessage({
     type: "world", worldName, skipped,
     dimensions: [...dimensions.values()].sort((a, b) => a.path.localeCompare(b.path)).map(dim => ({
-      path: dim.path, label: dim.label,
+      path: dim.path, label: dim.label, bounds: dim.bounds,
       regions: [...dim.regions.values()].map(({x, z, mask}) => ({x, z, mask})),
     })),
   });
@@ -90,8 +104,27 @@ async function tile(message) {
   const external = sidecars.get(region.directory + "/" + id) ?? [];
   const payloads = await Promise.all(external.map(async ({x, z, file}) => [x, z, await read(file)]));
   const pixels = render_region(region.name, await read(region.file), dim.kind, scale, payloads);
+  if (region.terrain === undefined) {
+    const {data, width, height} = pixels;
+    let x0 = width, x1 = 0, z0 = height, z1 = 0;
+    for (let z = 0; z < height; z++) {
+      for (let x = 0; x < width; x++) {
+        if (!data[(z * width + x) * 4 + 3]) continue;
+        x0 = Math.min(x0, x);
+        x1 = Math.max(x1, x + 1);
+        z0 = Math.min(z0, z);
+        z1 = Math.max(z1, z + 1);
+      }
+    }
+    region.terrain = x0 < x1 ? {
+      minX: region.x * 32 + Math.floor(x0 * 32 / width),
+      maxX: region.x * 32 + Math.ceil(x1 * 32 / width),
+      minZ: region.z * 32 + Math.floor(z0 * 32 / height),
+      maxZ: region.z * 32 + Math.ceil(z1 * 32 / height),
+    } : null;
+  }
   const bitmap = await createImageBitmap(pixels);
-  self.postMessage({type: "tile", request, dimension, id, scale, bitmap}, [bitmap]);
+  self.postMessage({type: "tile", request, dimension, id, scale, bitmap, bounds: region.terrain}, [bitmap]);
 }
 
 async function archive(message) {
