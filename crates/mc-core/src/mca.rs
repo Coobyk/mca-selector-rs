@@ -391,11 +391,12 @@ pub fn filter_region_bytes(data: &[u8], keep: &ChunkSet) -> Result<(Vec<u8>, Chu
         let start = offset.checked_mul(4096).context("chunk offset out of bounds")?;
         let len = sectors as usize * 4096;
         let end = start.checked_add(len).context("chunk offset out of bounds")?;
-        anyhow::ensure!(start >= HEADER_SIZE && sectors != 0 && end <= data.len(),
+        anyhow::ensure!(start >= HEADER_SIZE && sectors != 0,
             "invalid sector range for chunk slot {i}");
-        let record = &data[start..end];
+        let record = data.get(start..end.min(data.len())).filter(|r| r.len() >= 5)
+            .with_context(|| format!("truncated record for chunk slot {i}"))?;
         let payload_len = u32::from_be_bytes(record[..4].try_into().unwrap()) as usize;
-        anyhow::ensure!(payload_len > 0 && payload_len <= len - 4,
+        anyhow::ensure!(payload_len > 0 && payload_len <= record.len() - 4,
             "invalid record length for chunk slot {i}");
         if record[4] & 0x80 != 0 {
             external.set(i);
@@ -407,6 +408,7 @@ pub fn filter_region_bytes(data: &[u8], keep: &ChunkSet) -> Result<(Vec<u8>, Chu
         let timestamp = 4096 + entry;
         output[timestamp..timestamp + 4].copy_from_slice(&data[timestamp..timestamp + 4]);
         output.extend_from_slice(record);
+        output.resize(output.len() + len - record.len(), 0);
     }
     Ok((output, external))
 }
@@ -1043,7 +1045,11 @@ mod tests {
         let result = McaFile::from_bytes(file, &filtered, false, &sidecars).unwrap();
         assert!(result.chunks[0].is_none());
         assert_eq!(result.chunks[1].as_ref().unwrap().timestamp, 99);
-        assert!(filter_region_bytes(&data[..data.len() - 1], &keep).is_err());
+        let short = &data[..12293];
+        assert!(McaFile::from_bytes(PathBuf::from("r.-1.2.mca"), short, false, &sidecars)
+            .unwrap().chunks[1].is_some());
+        assert_eq!(filter_region_bytes(short, &keep).unwrap(), (filtered, external));
+        assert!(filter_region_bytes(&short[..short.len() - 1], &keep).is_err());
     }
 
     /// regression: load_offsets must fill sectors[] and timestamps[] too —
