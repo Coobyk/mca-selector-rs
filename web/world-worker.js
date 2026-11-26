@@ -16,8 +16,11 @@ function dimInfo(path) {
   if (!path) return ["Overworld", "overworld"];
   if (path === "DIM-1") return ["The Nether", "nether"];
   if (path === "DIM1") return ["The End", "end"];
+  const name = path.split("/").at(-1).toLowerCase();
+  const kind = name.includes("nether") || name === "dim-1" ? "nether" :
+    name.includes("end") || name === "dim1" ? "end" : "overworld";
   const custom = /^dimensions\/([^/]+)\/(.+)$/.exec(path);
-  return [custom ? custom[1] + ":" + custom[2] : path, "overworld"];
+  return [custom ? custom[1] + ":" + custom[2] : path, kind];
 }
 
 function split(path) {
