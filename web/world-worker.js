@@ -133,13 +133,14 @@ async function tile(message) {
 async function archive(message) {
   const {dimension, selection, remove} = message;
   const dim = dimensions.get(dimension);
-  const replacements = new Map();
+  const excluded = new Set();
   const prefix = dimension ? dimension + "/" : "";
   const zip = new Zip();
   const folder = worldName + (remove ? "-edited" : "-selection");
   const add = async (path, contents) => {
-    const bytes = contents instanceof Blob ? await read(contents) : contents;
-    zip.add(folder + "/" + path, contents, zip_crc32(bytes));
+    const blob = contents instanceof Blob;
+    const bytes = blob ? await read(contents) : contents;
+    zip.add(folder + "/" + path, blob ? contents : new Blob([bytes]), zip_crc32(bytes));
   };
   let done = 0;
   const total = selection.length + (remove ? files.size : 0);
@@ -152,8 +153,8 @@ async function archive(message) {
       if (!file) continue;
       const keep = remove ? selected.map(byte => byte ^ 255) : selected;
       const [bytes, external] = keep_chunks(await read(file), keep);
-      if (remove) replacements.set(path, bytes.length > 8192 ? bytes : null);
-      else if (bytes.length > 8192) await add(path, bytes);
+      if (remove) excluded.add(path);
+      if (bytes.length > 8192) await add(path, bytes);
       const available = new Map((sidecars.get(directory + "/" + id) ?? []).map(sidecar =>
         [key(sidecar.x, sidecar.z), sidecar]));
       for (let i = 0; i < 1024; i++) {
@@ -166,7 +167,7 @@ async function archive(message) {
       if (remove) {
         for (const sidecar of available.values()) {
           const i = (sidecar.x - x * 32) + (sidecar.z - z * 32) * 32;
-          if (has(selected, i)) replacements.set(sidecar.path, null);
+          if (has(selected, i)) excluded.add(sidecar.path);
         }
       }
     }
@@ -174,8 +175,7 @@ async function archive(message) {
   }
   for (const [path, file] of files) {
     if (remove) {
-      const contents = replacements.has(path) ? replacements.get(path) : file;
-      if (path !== "session.lock" && contents) await add(path, contents);
+      if (path !== "session.lock" && !excluded.has(path)) await add(path, file);
       if (++done % 16 === 0) self.postMessage({type: "packing", done, total});
     } else if (path === "level.dat" || path === "icon.png" || path.startsWith("datapacks/")) {
       await add(path, file);
