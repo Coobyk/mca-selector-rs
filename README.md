@@ -48,6 +48,31 @@ dialog (`MCA_EXPORT_DIR` sets its default).
   colors and tile rendering. No GUI dependencies; fully unit tested.
 - `crates/mca-selector` — the GPUI application: map canvas, selection,
   chrome, background tile loading.
+- `crates/mca-selector-web` — WebAssembly bindings for `mc-core`, used by
+  the browser editor in `web/`.
+
+## Browser build
+
+With stable Rust and [wasm-pack](https://drager.github.io/wasm-pack/) 0.15.1:
+
+```sh
+rustup target add wasm32-unknown-unknown
+bash web/build.sh
+python3 -m http.server 8000 --directory dist
+```
+
+Open [localhost:8000/app/](http://localhost:8000/app/), then choose the root
+of a Java Edition save with `level.dat` and Anvil region files. Choose a
+dimension and select populated chunks or regions. Export downloads a new
+world ZIP containing the selection; **Delete in copy** downloads the world
+without those chunks. Unzip the download before opening it. Files are read
+in a Web Worker, never uploaded or modified in place. ZIP downloads are
+limited to 4 GiB and 65,535 files.
+
+The build output is `dist/app/`. To publish, add that directory to the
+existing Pages upload bundle without replacing its root landing page;
+serve `/app/` with a trailing slash for relative asset URLs. The GitHub
+workflow builds an artifact only; it does not deploy.
 
 ## Status
 

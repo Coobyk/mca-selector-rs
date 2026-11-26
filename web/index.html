@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0c0c0c">
+  <meta name="description" content="View, select and export Minecraft Java Edition chunks in your browser.">
+  <link rel="stylesheet" href="./style.css">
+  <title>MCA Selector — Web Editor</title>
+</head>
+<body>
+  <header class="header">
+    <a href="../" class="brand"><span class="brand-mark" aria-hidden="true">◩</span> MCA SELECTOR</a>
+    <span class="edition">WEB EDITOR</span>
+    <span class="privacy"><span aria-hidden="true"></span> LOCAL PROCESSING</span>
+    <button class="accent" data-open>Open world</button>
+    <input id="folder" type="file" webkitdirectory multiple hidden>
+  </header>
+  <main>
+    <aside class="sidebar" aria-label="World and selection tools">
+      <section>
+        <div class="eyebrow">01 / SOURCE</div>
+        <h1>World</h1>
+        <p id="world-name">No world loaded</p>
+        <label for="dimension">Dimension</label>
+        <select id="dimension" disabled><option>—</option></select>
+      </section>
+      <section>
+        <div class="eyebrow">02 / EDIT</div>
+        <h2>Selection</h2>
+        <div class="counter"><strong id="count">0</strong><span id="count-label">chunks selected</span></div>
+        <div id="tools" class="tool-group" aria-label="Map tool">
+          <button data-tool="chunks" aria-pressed="true">Chunks</button>
+          <button data-tool="regions" aria-pressed="false">Regions</button>
+          <button data-tool="pan" aria-pressed="false">Pan</button>
+        </div>
+        <p class="hint">Click or drag to select. Alt removes.<br>Hold Space to pan; scroll to zoom.</p>
+        <button class="quiet" id="clear" disabled>Clear selection</button>
+      </section>
+      <section>
+        <div class="eyebrow">03 / OUTPUT</div>
+        <h2>Download</h2>
+        <button class="accent full" id="export" disabled>Export selection <span aria-hidden="true">↓</span></button>
+        <button class="full" id="delete" disabled>Delete in copy <span aria-hidden="true">↓</span></button>
+        <p class="hint">ZIP downloads only. Your original world stays untouched.</p>
+      </section>
+    </aside>
+    <section class="map-pane" aria-label="World map">
+      <div class="map-bar">
+        <span><b>MAP</b> <span class="map-kind">/ TOP-DOWN</span></span>
+        <div class="view-buttons" aria-label="Map view controls">
+          <button id="zoom-out" title="Zoom out" aria-label="Zoom out" disabled>−</button>
+          <button id="zoom-in" title="Zoom in" aria-label="Zoom in" disabled>+</button>
+          <button id="fit" title="Fit dimension to map" disabled>Fit</button>
+        </div>
+      </div>
+      <div class="stage" id="stage">
+        <canvas id="map" aria-label="Minecraft chunk map. Use arrow keys to pan, plus and minus to zoom." tabindex="0"></canvas>
+        <div class="welcome" id="welcome">
+          <span class="eyebrow">MINECRAFT JAVA EDITION</span>
+          <h2>Open a world.</h2>
+          <p>Choose a save folder with <code>level.dat</code> and Anvil region files. It stays in this browser.</p>
+          <button class="accent" data-open>Choose world folder <span aria-hidden="true">↗</span></button>
+        </div>
+        <div class="north" aria-hidden="true"><span>↑</span>N</div>
+      </div>
+      <footer class="status-bar">
+        <p id="status" role="status">Waiting for a world folder.</p>
+        <span id="coords" aria-label="Chunk coordinates">X — : Z —</span>
+      </footer>
+    </section>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

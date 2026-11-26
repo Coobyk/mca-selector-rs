@@ -3248,6 +3248,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "twox-hash",
 ]
 
 [[package]]
@@ -3266,6 +3267,17 @@ dependencies = [
  "serde_json",
  "smallvec",
  "smol",
+]
+
+[[package]]
+name = "mca-selector-web"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "js-sys",
+ "mc-core",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

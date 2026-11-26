@@ -1,0 +1,25 @@
+name: Build web app
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.1 --locked
+      - name: Build static app
+        run: bash web/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mca-selector-web
+          path: dist/

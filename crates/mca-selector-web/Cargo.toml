@@ -1,0 +1,17 @@
+[package]
+name = "mca-selector-web"
+description = "Browser bindings for MCA Selector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+mc-core = { path = "../mc-core" }
+crc32fast = "1"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["ImageData"] }

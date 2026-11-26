@@ -3,7 +3,28 @@
 use crate::mca::McaFile;
 use crate::nbt;
 use crate::version::{self, RenderOut};
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn tile_chunks<T: Send>(slice: &mut [T], size: usize) -> impl IndexedParallelIterator<Item = &mut [T]> {
+    slice.par_chunks_mut(size)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn tile_chunks<T>(slice: &mut [T], size: usize) -> impl Iterator<Item = &mut [T]> {
+    slice.chunks_mut(size)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn any_drawn(bands: impl ParallelIterator<Item = bool>) -> bool {
+    bands.reduce(|| false, |a, b| a || b)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn any_drawn(bands: impl Iterator<Item = bool>) -> bool {
+    bands.fold(false, |a, b| a || b)
+}
 
 pub const TILE_SIZE: usize = 512;
 pub const CHUNK_SIZE: usize = 16;
@@ -270,20 +291,17 @@ fn draw_bands(
 ) -> bool {
     let band = chunk_size * size;
     if water_pixels.is_empty() {
-        pixel_buffer
-            .par_chunks_mut(band)
-            .zip(terrain_heights.par_chunks_mut(band))
+        any_drawn(tile_chunks(pixel_buffer, band)
+            .zip(tile_chunks(terrain_heights, band))
             .enumerate()
             .map(|(crz, (pb, th))| {
                 draw_band(mca, crz, scale, cfg, corrupted, chunk_size, size, pb, th, None, None)
-            })
-            .reduce(|| false, |a, b| a || b)
+            }))
     } else {
-        pixel_buffer
-            .par_chunks_mut(band)
-            .zip(terrain_heights.par_chunks_mut(band))
-            .zip(water_pixels.par_chunks_mut(band))
-            .zip(water_heights.par_chunks_mut(band))
+        any_drawn(tile_chunks(pixel_buffer, band)
+            .zip(tile_chunks(terrain_heights, band))
+            .zip(tile_chunks(water_pixels, band))
+            .zip(tile_chunks(water_heights, band))
             .enumerate()
             .map(|(crz, (((pb, th), wp), wh))| {
                 draw_band(
@@ -299,8 +317,7 @@ fn draw_bands(
                     Some(wp),
                     Some(wh),
                 )
-            })
-            .reduce(|| false, |a, b| a || b)
+            }))
     }
 }
 
@@ -563,7 +580,7 @@ fn flat_shade(px: &mut [u32], heights: &[i16], scale: i32, m: &MarginStrips) {
         return;
     }
     let n = (size * size).min(px.len());
-    px[..n].par_chunks_mut(size).enumerate().for_each(|(z, prow)| {
+    tile_chunks(&mut px[..n], size).enumerate().for_each(|(z, prow)| {
         let hrow = &heights[z * size..(z + 1) * size];
         let hup = if z == 0 {
             hrow
@@ -614,8 +631,7 @@ fn shade(
     // the pass trivially parallel with identical per-pixel math. Only the
     // first size*size pixels form rows (for odd scales pixels can be
     // larger); the tail stays untouched exactly like the sequential loop.
-    px[..size * size]
-        .par_chunks_mut(size)
+    tile_chunks(&mut px[..size * size], size)
         .enumerate()
         .for_each(|(z, prow)| {
             // row slices: bounds checks hoisted out of the per-pixel loop.
@@ -695,8 +711,7 @@ fn xaero_shade(
         DimKind::End => ([1.0f32, 1.0, 1.0], 256.0f32),
     };
     let max_direct = 0.666_666_7f32;
-    px[..size * size]
-        .par_chunks_mut(size)
+    tile_chunks(&mut px[..size * size], size)
         .enumerate()
         .for_each(|(z, prow)| {
             let hrow = &terrain[z * size..(z + 1) * size];
@@ -858,4 +873,3 @@ pub fn scale_down(img: &[u32], from_size: usize, to_size: usize) -> Vec<u32> {
     }
     out
 }
-
