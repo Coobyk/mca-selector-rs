@@ -146,11 +146,6 @@ function onmessage(message) {
       bitmaps.get(id)?.bitmap.close();
       bitmaps.delete(id);
       bitmaps.set(id, {bitmap: message.bitmap, scale: message.scale});
-      if (bitmaps.size > 96) {
-        const oldest = bitmaps.keys().next().value;
-        bitmaps.get(oldest).bitmap.close();
-        bitmaps.delete(oldest);
-      }
       schedule();
       break;
     }
@@ -217,20 +212,34 @@ function draw() {
     const x = screenX(region.x * 32), z = screenZ(region.z * 32);
     if (x < width && z < height && x + tileSize > 0 && z + tileSize > 0) visible.push(region);
   }
-  const priority = [...visible].sort((a, b) =>
-    Math.hypot(a.x * 32 + 16 - view.x, a.z * 32 + 16 - view.z) -
-    Math.hypot(b.x * 32 + 16 - view.x, b.z * 32 + 16 - view.z)).slice(0, 80);
-  for (const region of priority) {
+  const visibleIds = new Set();
+  let nearest, distance = Infinity;
+  for (const region of visible) {
     const id = dim.path + "|" + region.id;
+    visibleIds.add(id);
     const cached = bitmaps.get(id);
     if (cached) {
       bitmaps.delete(id);
       bitmaps.set(id, cached);
     }
     if (!pending && !packing && cached?.scale !== scale && !broken.has(id + "|" + scale)) {
-      pending = ++request;
-      worker.postMessage({type: "tile", request, dimension: dim.path, id: region.id, scale});
+      const d = (region.x * 32 + 16 - view.x) ** 2 + (region.z * 32 + 16 - view.z) ** 2;
+      if (d < distance) {
+        nearest = region;
+        distance = d;
+      }
     }
+  }
+  const limit = Math.max(96, visible.length);
+  for (const [id, {bitmap}] of bitmaps) {
+    if (bitmaps.size <= limit) break;
+    if (visibleIds.has(id)) continue;
+    bitmap.close();
+    bitmaps.delete(id);
+  }
+  if (nearest) {
+    pending = ++request;
+    worker.postMessage({type: "tile", request, dimension: dim.path, id: nearest.id, scale});
   }
   for (const region of visible) {
     const x = screenX(region.x * 32), z = screenZ(region.z * 32);
