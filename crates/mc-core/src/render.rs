@@ -195,7 +195,7 @@ pub fn generate_image(
     let chunk_size = CHUNK_SIZE / scale as usize;
     // at scale 32 a chunk spans half a pixel (chunk_size=0): the per-chunk
     // loops collapse onto pixel 0 and emit an empty image. Render at scale
-    // 16 and box-average down instead — keeps real terrain at max zoom-out.
+    // 16 and nearest-sample down instead — keeps real terrain at max zoom-out.
     if chunk_size == 0 {
         let fine = generate_image(mca, scale / 2, cfg, corrupted, margins)?;
         return Some(scale_down(&fine, TILE_SIZE / (scale / 2) as usize, size));
@@ -842,8 +842,8 @@ pub fn lod_image(chunk_set: &crate::selection::ChunkSet, color: u32) -> Vec<u32>
     pixels
 }
 
-/// scaleDownFXImage — box-average downscale of a square argb buffer
-/// (Xaero's branch textures are recursive 2x2 box averages).
+/// Nearest-neighbor downscale of a square argb buffer. Zoomed map tiles are
+/// intentionally pixel-sharp rather than box-filtered.
 pub fn scale_down(img: &[u32], from_size: usize, to_size: usize) -> Vec<u32> {
     let factor = from_size / to_size;
     let mut out = vec![0u32; to_size * to_size];
@@ -853,23 +853,23 @@ pub fn scale_down(img: &[u32], from_size: usize, to_size: usize) -> Vec<u32> {
         return out;
     }
     for (y, row) in out.chunks_exact_mut(to_size).enumerate() {
+        let sy = (y * factor + factor / 2).min(from_size - 1);
         for (x, p) in row.iter_mut().enumerate() {
-            let mut a = 0u32;
-            let mut r = 0u32;
-            let mut g = 0u32;
-            let mut b = 0u32;
-            for dy in 0..factor {
-                let base = (y * factor + dy) * from_size + x * factor;
-                for v in &img[base..base + factor] {
-                    a += v >> 24 & 0xFF;
-                    r += v >> 16 & 0xFF;
-                    g += v >> 8 & 0xFF;
-                    b += v & 0xFF;
-                }
-            }
-            let n = (factor * factor) as u32;
-            *p = (a / n) << 24 | (r / n) << 16 | (g / n) << 8 | (b / n);
+            let sx = (x * factor + factor / 2).min(from_size - 1);
+            *p = img[sy * from_size + sx];
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scale_down;
+
+    #[test]
+    fn scale_down_uses_nearest_neighbor() {
+        let img: Vec<u32> = (0..16).map(|i| 0xFF00_0000 | i).collect();
+        let out = scale_down(&img, 4, 2);
+        assert_eq!(out, vec![img[5], img[7], img[13], img[15]]);
+    }
 }

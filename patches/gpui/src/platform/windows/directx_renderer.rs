@@ -87,7 +87,7 @@ struct DirectXRenderPipelines {
 
 struct DirectXGlobalElements {
     global_params_buffer: [Option<ID3D11Buffer>; 1],
-    sampler: [Option<ID3D11SamplerState>; 1],
+    sampler: [Option<ID3D11SamplerState>; 2],
 }
 
 struct DirectComposition {
@@ -825,22 +825,30 @@ impl DirectXGlobalElements {
             [buffer]
         };
 
+        let sampler_desc = |filter| D3D11_SAMPLER_DESC {
+            Filter: filter,
+            AddressU: D3D11_TEXTURE_ADDRESS_WRAP,
+            AddressV: D3D11_TEXTURE_ADDRESS_WRAP,
+            AddressW: D3D11_TEXTURE_ADDRESS_WRAP,
+            MipLODBias: 0.0,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D11_COMPARISON_ALWAYS,
+            BorderColor: [0.0; 4],
+            MinLOD: 0.0,
+            MaxLOD: D3D11_FLOAT32_MAX,
+        };
         let sampler = unsafe {
-            let desc = D3D11_SAMPLER_DESC {
-                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-                AddressU: D3D11_TEXTURE_ADDRESS_WRAP,
-                AddressV: D3D11_TEXTURE_ADDRESS_WRAP,
-                AddressW: D3D11_TEXTURE_ADDRESS_WRAP,
-                MipLODBias: 0.0,
-                MaxAnisotropy: 1,
-                ComparisonFunc: D3D11_COMPARISON_ALWAYS,
-                BorderColor: [0.0; 4],
-                MinLOD: 0.0,
-                MaxLOD: D3D11_FLOAT32_MAX,
-            };
-            let mut output = None;
-            device.CreateSamplerState(&desc, Some(&mut output))?;
-            [output]
+            let mut linear = None;
+            device.CreateSamplerState(
+                &sampler_desc(D3D11_FILTER_MIN_MAG_MIP_LINEAR),
+                Some(&mut linear),
+            )?;
+            let mut point = None;
+            device.CreateSamplerState(
+                &sampler_desc(D3D11_FILTER_MIN_MAG_MIP_POINT),
+                Some(&mut point),
+            )?;
+            [linear, point]
         };
 
         Ok(Self {

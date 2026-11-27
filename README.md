@@ -18,6 +18,25 @@ style chunk rendering.
 - Dark chrome after the original: menu bar, toolbar, status bar with block /
   chunk / region coordinates, selection count and zoom level.
 
+## Downloads
+
+Every push to `main` updates the rolling
+[nightly release](https://github.com/Coobyk/mca-selector-rs/releases/tag/nightly):
+
+- **Linux:** use `mca-selector-linux-x86_64.AppImage` (`chmod +x` may be
+  needed after downloading), or download
+  `mca-selector-linux-x86_64.zip` and run its `install.sh` for user-local
+  desktop integration (`PREFIX=/custom/path ./install.sh` overrides the
+  default `~/.local` prefix). The raw binary remains available for the AUR
+  package.
+- **Windows:** use `mca-selector-windows-x86_64.exe` directly as a portable
+  executable, or download the portable ZIP if you want the README and license
+  bundled with it.
+- **macOS (Apple Silicon):** open `mca-selector-macos-aarch64.dmg` and drag
+  `MCA Selector.app` into `Applications`. The app is ad-hoc signed but not
+  notarized, so the first launch may require right-clicking the app and
+  choosing **Open**.
+
 ## Building
 
 Rust 1.75+ and the usual Linux GUI dependencies are required:

@@ -150,12 +150,10 @@ impl MainView {
 
             // -- selection + paste-ghost pass -----------------------------------
             // upstream draws both for every VISIBLE region — not just tiles
-            // with a finished image. Region state follows TileImage.draw: a
-            // region in the tiles map gets its region/chunk overlay, a region
-            // outside it fills only when the selection is inverted.
+            // with a finished image. Selections are painted as grid-aligned quads
+            // so chunk edges stay aligned at fractional zooms.
             let sel = &map.selection;
             if !sel.is_empty() || map.pasted.is_some() {
-                let region_color = g_cfg.as_ref().map(|g| g.region_selection_color.to_argb()).unwrap_or(0);
                 let region_rect = |rx: i32, rz: i32| -> Option<Bounds<Pixels>> {
                     let ox = (rx as f32 * TILE_SIZE as f32 - map.offset.x) / scale;
                     let oz = (rz as f32 * TILE_SIZE as f32 - map.offset.z) / scale;
@@ -174,20 +172,59 @@ impl MainView {
                     }
                 };
                 if !sel.is_empty() {
+                    // Chunk edges are rounded with exactly the same formula as
+                    // the grid lines. Painting rounded quads instead of scaling
+                    // a 32x32 texture keeps selection edges aligned at fractional zooms.
+                    let line_x = |world_x: i32| ((world_x as f32 - map.offset.x) / scale).round();
+                    let line_z = |world_z: i32| ((world_z as f32 - map.offset.z) / scale).round();
                     let draw_sel = |rx: i32, rz: i32, window: &mut Window| {
-                        let Some(b) = region_rect(rx, rz) else { return };
                         let key = Point2i::new(rx, rz).as_long();
-                        if !map.tiles.contains_key(&key) {
-                            if sel.is_inverted() {
-                                window.paint_quad(fill(b, argb(region_color)));
+                        if !sel.is_any_chunk_in_region_selected(key) {
+                            return;
+                        }
+                        let color = if sel.is_region_selected(key) {
+                            g_cfg.as_ref().map(|g| g.region_selection_color.to_argb()).unwrap_or(0)
+                        } else {
+                            g_cfg.as_ref().map(|g| g.chunk_selection_color.to_argb()).unwrap_or(0)
+                        };
+                        let paint_span = |x0c: usize, x1c: usize, zc: usize, window: &mut Window| {
+                            let x0 = line_x(rx * 512 + x0c as i32 * 16);
+                            let x1 = line_x(rx * 512 + x1c as i32 * 16);
+                            let z0 = line_z(rz * 512 + zc as i32 * 16);
+                            let z1 = line_z(rz * 512 + (zc + 1) as i32 * 16);
+                            if x1 >= 0.0 && z1 >= 0.0 && x0 <= map.width && z0 <= map.height && x1 > x0 && z1 > z0 {
+                                window.paint_quad(fill(
+                                    Bounds {
+                                        origin: point(bounds.origin.x + px(x0), bounds.origin.y + px(z0)),
+                                        size: size(px(x1 - x0), px(z1 - z0)),
+                                    },
+                                    argb(color),
+                                ));
                             }
-                        } else if sel.is_region_selected(key) {
-                            window.paint_quad(fill(b, argb(region_color)));
-                        } else if sel.is_any_chunk_in_region_selected(key) {
-                            if let Some(ov) =
-                                marked_chunks_image(Point2i::new(rx, rz), sel, map.selection_version)
-                            {
-                                let _ = window.paint_image(b, px(0.).into(), ov, 0, false);
+                        };
+                        match sel.selected_chunks(Point2i::new(rx, rz)) {
+                            None => {
+                                for z in 0..32 {
+                                    paint_span(0, 32, z, window);
+                                }
+                            }
+                            Some(cs) => {
+                                let mut run: Option<(usize, usize, usize)> = None;
+                                for i in cs.iter() {
+                                    let x = i % 32;
+                                    let z = i / 32;
+                                    match run {
+                                        Some((sx, ex, sz)) if z == sz && x == ex + 1 => run = Some((sx, x, z)),
+                                        Some((sx, ex, sz)) => {
+                                            paint_span(sx, ex + 1, sz, window);
+                                            run = Some((x, x, z));
+                                        }
+                                        None => run = Some((x, x, z)),
+                                    }
+                                }
+                                if let Some((sx, ex, sz)) = run {
+                                    paint_span(sx, ex + 1, sz, window);
+                                }
                             }
                         }
                     };
@@ -797,41 +834,10 @@ pub(crate) fn nbt_icon(type_id: u8) -> Option<Arc<RenderImage>> {
     Some(r)
 }
 
-/// selection overlay cache: keyed by (region, selection_version)
-static OVERLAY_CACHE: std::sync::LazyLock<std::sync::Mutex<(u64, std::collections::HashMap<i64, Arc<RenderImage>>)>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new((0, std::collections::HashMap::new())));
+
 
 fn paste_argb_image(px: &[u32; 1024]) -> Option<Arc<RenderImage>> {
     crate::tilemap::argb_to_render_image(px, 32)
-}
-
-/// 32x32 chunk-selection overlay for a region with partially selected
-/// chunks (whole-region selection paints a fill quad instead — see the
-/// selection pass in paint_map). Mirrors upstream markedChunksImage.
-fn marked_chunks_image(region: Point2i, sel: &mc_core::selection::Selection, version: u64) -> Option<Arc<RenderImage>> {
-    let key = region.as_long();
-    if !sel.is_any_chunk_in_region_selected(key) || sel.is_region_selected(key) {
-        return None;
-    }
-    let mut cache = OVERLAY_CACHE.lock().unwrap();
-    if cache.0 != version {
-        cache.1.clear();
-        cache.0 = version;
-    }
-    if let Some(i) = cache.1.get(&key) {
-        return Some(i.clone());
-    }
-    let g = config::global();
-    let mut px = [0u32; 32 * 32];
-    if let Some(cs) = sel.selected_chunks(region) {
-        let color = g.chunk_selection_color.to_argb();
-        for i in cs.iter() {
-            px[i] = color;
-        }
-    }
-    let r = crate::tilemap::argb_to_render_image(&px, 32)?;
-    cache.1.insert(key, r.clone());
-    Some(r)
 }
 
 /// upstream TextHelper.abbreviateCoordinate: K/M/B suffix over 100k.
