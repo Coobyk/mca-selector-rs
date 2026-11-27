@@ -3256,6 +3256,7 @@ name = "mca-selector"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "embed-resource",
  "env_logger",
  "gpui",
  "image",
