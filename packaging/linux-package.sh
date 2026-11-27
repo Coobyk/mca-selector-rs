@@ -62,9 +62,12 @@ extract_tool() {
 extract_tool "$tools/linuxdeploy" "$tools/linuxdeploy-root"
 extract_tool "$tools/appimagetool" "$tools/appimagetool-root"
 
+appimage_icon="$work/mca-selector.png"
+cp "$root/packaging/mca-selector-512.png" "$appimage_icon"
+
 "$tools/linuxdeploy-root/AppRun" \
     --appdir "$work/AppDir" \
     --executable "$bin" \
     --desktop-file "$root/packaging/mca-selector.desktop" \
-    --icon-file "$root/packaging/mca-selector-512.png"
+    --icon-file "$appimage_icon"
 ARCH=x86_64 "$tools/appimagetool-root/AppRun" "$work/AppDir" "$out/mca-selector-linux-x86_64.AppImage"
