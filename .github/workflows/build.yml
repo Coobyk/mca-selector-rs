@@ -15,12 +15,18 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: mca-selector-linux-x86_64
+            packages: mca-selector-linux-x86_64-packages
+            package_dir: dist/linux
             bin: mca-selector
           - os: macos-latest
             artifact: mca-selector-macos-aarch64
+            packages: mca-selector-macos-aarch64-packages
+            package_dir: dist/macos
             bin: mca-selector
           - os: windows-latest
             artifact: mca-selector-windows-x86_64.exe
+            packages: mca-selector-windows-x86_64-packages
+            package_dir: dist/windows
             bin: mca-selector.exe
     runs-on: ${{ matrix.os }}
     steps:
@@ -36,7 +42,7 @@ jobs:
             libxcb-xfixes0-dev libxcb-util-dev \
             libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libfontconfig1-dev libasound2-dev \
-            libssl-dev libzstd-dev libvulkan-dev
+            libssl-dev libzstd-dev libvulkan-dev zip
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -44,11 +50,37 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p mca-selector
 
-      - name: Upload artifact
+      - name: Package Linux artifacts
+        if: runner.os == 'Linux'
+        run: bash packaging/linux-package.sh
+
+      - name: Package macOS DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            version="0.1.0"
+          fi
+          bash packaging/macos-dmg.sh target/release/mca-selector dist/macos "$version"
+
+      - name: Package Windows portable ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File packaging/windows-package.ps1 -Binary target/release/mca-selector.exe -OutDir dist/windows
+
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: target/release/${{ matrix.bin }}
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.packages }}
+          path: ${{ matrix.package_dir }}/*
+          if-no-files-found: error
 
   release:
     name: publish nightly release
@@ -75,6 +107,10 @@ jobs:
           mv dist/mca-selector-linux-x86_64/mca-selector release/mca-selector-linux-x86_64
           mv dist/mca-selector-macos-aarch64/mca-selector release/mca-selector-macos-aarch64
           mv dist/mca-selector-windows-x86_64.exe/mca-selector.exe release/mca-selector-windows-x86_64.exe
+          cp dist/mca-selector-linux-x86_64-packages/* release/
+          cp dist/mca-selector-macos-aarch64-packages/* release/
+          cp dist/mca-selector-windows-x86_64-packages/* release/
+          chmod +x release/mca-selector-linux-x86_64 release/mca-selector-linux-x86_64.AppImage
           if [ "$GITHUB_REF_TYPE" = "tag" ]; then
             echo "pkgver=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
@@ -95,7 +131,7 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --notes "Release $GITHUB_REF_NAME — prebuilt binaries for linux/macos/windows." \
+            --notes "Release $GITHUB_REF_NAME — Linux AppImage/ZIP, Windows portable EXE/ZIP, and macOS DMG." \
             --latest \
             release/*
 
@@ -109,7 +145,7 @@ jobs:
           else
             gh release create nightly --prerelease \
               --title "nightly — latest main" \
-              --notes "Rolling prebuilt binaries of the latest main commit. Installed by the mca-selector-rs-bin AUR package." \
+              --notes "Rolling Linux AppImage/ZIP, Windows portable EXE/ZIP, and macOS DMG builds of the latest main commit. The raw Linux binary is installed by the mca-selector-rs-bin AUR package." \
               release/*
           fi
 
