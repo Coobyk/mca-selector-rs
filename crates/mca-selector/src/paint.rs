@@ -150,12 +150,10 @@ impl MainView {
 
             // -- selection + paste-ghost pass -----------------------------------
             // upstream draws both for every VISIBLE region — not just tiles
-            // with a finished image. Region state follows TileImage.draw: a
-            // region in the tiles map gets its region/chunk overlay, a region
-            // outside it fills only when the selection is inverted.
+            // with a finished image. Selection overlays are textures in all
+            // cases so nearest sampling keeps every chunk edge sharp.
             let sel = &map.selection;
             if !sel.is_empty() || map.pasted.is_some() {
-                let region_color = g_cfg.as_ref().map(|g| g.region_selection_color.to_argb()).unwrap_or(0);
                 let region_rect = |rx: i32, rz: i32| -> Option<Bounds<Pixels>> {
                     let ox = (rx as f32 * TILE_SIZE as f32 - map.offset.x) / scale;
                     let oz = (rz as f32 * TILE_SIZE as f32 - map.offset.z) / scale;
@@ -177,13 +175,7 @@ impl MainView {
                     let draw_sel = |rx: i32, rz: i32, window: &mut Window| {
                         let Some(b) = region_rect(rx, rz) else { return };
                         let key = Point2i::new(rx, rz).as_long();
-                        if !map.tiles.contains_key(&key) {
-                            if sel.is_inverted() {
-                                window.paint_quad(fill(b, argb(region_color)));
-                            }
-                        } else if sel.is_region_selected(key) {
-                            window.paint_quad(fill(b, argb(region_color)));
-                        } else if sel.is_any_chunk_in_region_selected(key) {
+                        if sel.is_any_chunk_in_region_selected(key) {
                             if let Some(ov) =
                                 marked_chunks_image(Point2i::new(rx, rz), sel, map.selection_version)
                             {
@@ -805,12 +797,11 @@ fn paste_argb_image(px: &[u32; 1024]) -> Option<Arc<RenderImage>> {
     crate::tilemap::argb_to_render_image(px, 32)
 }
 
-/// 32x32 chunk-selection overlay for a region with partially selected
-/// chunks (whole-region selection paints a fill quad instead — see the
-/// selection pass in paint_map). Mirrors upstream markedChunksImage.
+/// 32x32 chunk-selection overlay for a region. Whole-region selections use
+/// the same nearest-sampled texture path so their edges stay pixel-sharp.
 fn marked_chunks_image(region: Point2i, sel: &mc_core::selection::Selection, version: u64) -> Option<Arc<RenderImage>> {
     let key = region.as_long();
-    if !sel.is_any_chunk_in_region_selected(key) || sel.is_region_selected(key) {
+    if !sel.is_any_chunk_in_region_selected(key) {
         return None;
     }
     let mut cache = OVERLAY_CACHE.lock().unwrap();
@@ -822,12 +813,19 @@ fn marked_chunks_image(region: Point2i, sel: &mc_core::selection::Selection, ver
         return Some(i.clone());
     }
     let g = config::global();
+    let color = if sel.is_region_selected(key) {
+        g.region_selection_color.to_argb()
+    } else {
+        g.chunk_selection_color.to_argb()
+    };
     let mut px = [0u32; 32 * 32];
-    if let Some(cs) = sel.selected_chunks(region) {
-        let color = g.chunk_selection_color.to_argb();
-        for i in cs.iter() {
-            px[i] = color;
+    match sel.selected_chunks(region) {
+        Some(cs) => {
+            for i in cs.iter() {
+                px[i] = color;
+            }
         }
+        None => px.fill(color),
     }
     let r = crate::tilemap::argb_to_render_image(&px, 32)?;
     cache.1.insert(key, r.clone());
