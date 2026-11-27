@@ -29,7 +29,8 @@ package_dir="$work/zip/mca-selector-linux-x86_64"
 mkdir -p "$package_dir"
 cp "$bin" "$package_dir/mca-selector"
 cp "$root/README.md" "$root/LICENSE" "$package_dir/"
-cp "$root/packaging/mca-selector.desktop" "$root/packaging/mca-selector.png" "$package_dir/"
+cp "$root/packaging/mca-selector.desktop" "$package_dir/"
+cp "$root/packaging/mca-selector-512.png" "$package_dir/mca-selector.png"
 cp "$root/packaging/linux-install.sh" "$package_dir/install.sh"
 chmod +x "$package_dir/mca-selector" "$package_dir/install.sh"
 rm -f "$out/mca-selector-linux-x86_64.zip"
@@ -65,5 +66,5 @@ extract_tool "$tools/appimagetool" "$tools/appimagetool-root"
     --appdir "$work/AppDir" \
     --executable "$bin" \
     --desktop-file "$root/packaging/mca-selector.desktop" \
-    --icon-file "$root/packaging/mca-selector.png"
+    --icon-file "$root/packaging/mca-selector-512.png"
 ARCH=x86_64 "$tools/appimagetool-root/AppRun" "$work/AppDir" "$out/mca-selector-linux-x86_64.AppImage"
