@@ -20,8 +20,10 @@ style chunk rendering.
 
 ## Downloads
 
-Every push to `main` updates the rolling
-[nightly release](https://github.com/Coobyk/mca-selector-rs/releases/tag/nightly):
+Every push to `main` publishes a permanent prerelease tagged
+`nightly-YYYYMMDD-<commit>` and also updates the rolling
+[nightly release](https://github.com/Coobyk/mca-selector-rs/releases/tag/nightly)
+used by the auto-updater:
 
 - **Linux:** use `mca-selector-linux-x86_64.AppImage` (`chmod +x` may be
   needed after downloading), or download
