@@ -603,7 +603,7 @@ impl MainView {
             Dialog::About => panel(
                 v_flex().gap_2()
                     .child(text_el(crate::lang::t("dialog.title.about"), 16.))
-                    .child(text_el(concat!("Version: ", env!("CARGO_PKG_VERSION"), " (Rust + GPUI port)"), 12.))
+                    .child(text_el(concat!("Version: ", env!("CARGO_PKG_VERSION"), " (", env!("MCA_GIT_SHA"), ")"), 12.))
                     .child(text_el("License: MIT", 12.))
                     .child(text_el("Copyright: © Coobyk", 12.))
                     .child(text_el("Rust rewrite based on MCA Selector by Querz", 12.))
