@@ -12,6 +12,7 @@ mod paint;
 mod slider;
 mod statusbar;
 mod tilemap;
+mod updater;
 mod view;
 mod world;
 

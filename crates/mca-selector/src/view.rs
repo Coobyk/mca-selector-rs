@@ -130,6 +130,29 @@ impl MainView {
             }
         })
         .detach();
+
+        // startup update check: metadata + the verified replacement binary are
+        // downloaded off the UI thread, then the user chooses whether to restart.
+        cx.spawn(async move |this: WeakEntity<MainView>, cx: &mut AsyncApp| {
+            let result = smol::unblock(crate::updater::check_and_download).await;
+            let Ok(Some(update)) = result else { return };
+            let short: String = update.sha.chars().take(7).collect();
+            let mut update = Some(update);
+            let _ = this.update(&mut *cx, move |v, cx| {
+                let Some(update) = update.take() else { return };
+                v.dialog = Some(Dialog::Confirm {
+                    msg: format!("A new MCA Selector build ({short}) is available. Restart and install it now?"),
+                    action: Box::new(move |v, _w, cx| {
+                        if let Err(e) = crate::updater::install_and_restart(update) {
+                            v.dialog = Some(Dialog::Error { msg: format!("Update failed: {e:#}") });
+                            cx.notify();
+                        }
+                    }),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
         v
     }
 

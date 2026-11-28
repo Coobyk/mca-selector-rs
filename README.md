@@ -37,6 +37,10 @@ Every push to `main` updates the rolling
   notarized, so the first launch may require right-clicking the app and
   choosing **Open**.
 
+Desktop builds check the rolling nightly release on startup. When a newer
+build is available, the app downloads the verified platform binary in the
+background and offers to restart into it.
+
 ## Building
 
 Rust 1.75+ and the usual Linux GUI dependencies are required:

@@ -118,6 +118,30 @@ jobs:
             echo "pkgver=0.1.0.r$(git rev-list --count HEAD).g$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           fi
           echo "sha256=$(sha256sum release/mca-selector-linux-x86_64 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          import hashlib, json, os
+          files = {
+              "windows": "mca-selector-windows-x86_64.exe",
+              "linux": "mca-selector-linux-x86_64",
+              "linux-appimage": "mca-selector-linux-x86_64.AppImage",
+              "macos": "mca-selector-macos-aarch64",
+          }
+          def sha256(path):
+              h = hashlib.sha256()
+              with open(path, "rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+          meta = {
+              "sha": os.environ["GITHUB_SHA"],
+              "assets": {
+                  key: {"file": name, "sha256": sha256(os.path.join("release", name))}
+                  for key, name in files.items()
+              },
+          }
+          with open("release/latest.json", "w", encoding="utf-8") as f:
+              json.dump(meta, f, separators=(",", ":"))
+          PY
 
       - name: Move nightly tag to this commit (main only)
         if: github.ref == 'refs/heads/main'
